@@ -421,6 +421,7 @@ export class HeadstoneEntity extends InteractableEntity {
     );
 
     // Emit corpse click event to show loot interface
+    // NOTE: No loot protection needed - gravestone spawns AFTER respawn (RuneScape-style)
     this.world.emit(EventType.CORPSE_CLICK, {
       corpseId: this.id,
       playerId: data.playerId,
