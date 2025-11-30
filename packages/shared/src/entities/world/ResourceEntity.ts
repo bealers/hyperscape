@@ -185,7 +185,7 @@ export class ResourceEntity extends InteractableEntity {
 
     // Load stump model
     const stumpModelPath =
-      "asset://models/basic-tree-stump/basic-tree-stump.glb";
+      "asset://models/basic-reg-tree-stump/basic-tree-stump.glb";
     try {
       const { scene } = await modelCache.loadModel(stumpModelPath, this.world);
 
