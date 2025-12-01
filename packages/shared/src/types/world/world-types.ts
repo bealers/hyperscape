@@ -178,8 +178,6 @@ export interface WorldArea {
   npcs: NPCLocation[];
   resources: BiomeResource[];
   mobSpawns: MobSpawnPoint[];
-  connections: string[]; // Connected area IDs
-  specialFeatures: string[];
 }
 
 // ============== ZONE SPAWN POINTS ==============
