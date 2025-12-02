@@ -878,7 +878,7 @@ export class TerrainSystem extends System {
         return {
           id: r.id,
           type: r.type,
-          subType: r.type === "tree" ? "normal_tree" : r.type,
+          subType: r.type === "tree" ? "normal" : r.type,
           position: worldPos,
         };
       });
@@ -899,7 +899,7 @@ export class TerrainSystem extends System {
         return {
           id: r.id,
           type: r.type,
-          subType: r.type === "tree" ? "normal_tree" : r.type,
+          subType: r.type === "tree" ? "normal" : r.type,
           position: worldPos,
         };
       });
@@ -1376,6 +1376,12 @@ export class TerrainSystem extends System {
   }
 
   private generateTreesForTile(tile: TerrainTile, biomeData: BiomeData): void {
+    // DISABLED: Procedural tree generation is disabled.
+    // Trees are now exclusively spawned from world-areas.json manifest via ResourceSystem.
+    // To add trees, edit: packages/server/world/assets/manifests/world-areas.json
+    // This prevents random trees from spawning across the world - only manifest-defined trees exist.
+    return;
+
     // Trees generation based on biome type
     // Check both 'tree' and 'trees' for compatibility with JSON data
     const hasTrees =

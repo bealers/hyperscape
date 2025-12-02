@@ -271,11 +271,6 @@ export class ItemEntity extends InteractableEntity {
       modelPath: this.config.modelPath || "",
       iconPath: this.config.iconPath || "",
       healAmount: this.config.healAmount || 0,
-      stats: {
-        attack: this.config.stats.attack || 0,
-        defense: this.config.stats.defense || 0,
-        strength: this.config.stats.strength || 0,
-      },
       bonuses: {
         attack: 0,
         defense: 0,

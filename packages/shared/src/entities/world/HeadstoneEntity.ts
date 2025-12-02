@@ -101,23 +101,6 @@ export class HeadstoneEntity extends InteractableEntity {
     this.lootProtectionUntil = config.headstoneData.lootProtectionUntil || 0;
     this.protectedFor = config.headstoneData.protectedFor;
 
-    console.log(
-      `[HeadstoneEntity] Constructed ${this.id} with ${this.lootItems.length} items:`,
-      this.lootItems
-        .map((item) => `${item.itemId} x${item.quantity}`)
-        .join(", ") || "(none)",
-    );
-
-    if (this.lootProtectionUntil > 0) {
-      const protectionSeconds = Math.ceil(
-        (this.lootProtectionUntil - Date.now()) / 1000,
-      );
-      console.log(
-        `[HeadstoneEntity] Loot protection active for ${protectionSeconds}s, ` +
-          `protected for player: ${this.protectedFor || "owner"}`,
-      );
-    }
-
     // Listen for loot requests on this specific corpse
     this.lootRequestHandler = (data: unknown) => {
       const lootData = data as {
@@ -145,15 +128,6 @@ export class HeadstoneEntity extends InteractableEntity {
     if (this.lootProtectionUntil && now < this.lootProtectionUntil) {
       // Loot is protected
       if (this.protectedFor && this.protectedFor !== playerId) {
-        // Not the protected player
-        const remainingSeconds = Math.ceil(
-          (this.lootProtectionUntil - now) / 1000,
-        );
-        console.log(
-          `[HeadstoneEntity] Loot protection active for ${this.id}, ` +
-            `protected for ${this.protectedFor}, ` +
-            `${playerId} cannot loot yet (${remainingSeconds}s remaining)`,
-        );
         return false;
       }
     }
@@ -194,18 +168,8 @@ export class HeadstoneEntity extends InteractableEntity {
 
       // If item exists and is stackable, we can add to existing stack
       if (existingItem) {
-        // Assume stackable for now - proper check would need item definition
-        console.log(
-          `[HeadstoneEntity] Player ${playerId} inventory full but item ${itemId} is stackable`,
-        );
         return true;
       }
-
-      // Inventory full and item not stackable
-      console.log(
-        `[HeadstoneEntity] Player ${playerId} inventory full (${inventory.items.length}/28), ` +
-          `cannot loot ${itemId}`,
-      );
 
       // Emit UI message to player
       this.world.emit(EventType.UI_MESSAGE, {
@@ -254,11 +218,6 @@ export class HeadstoneEntity extends InteractableEntity {
     quantity: number;
     slot?: number;
   }): Promise<void> {
-    console.log(
-      `[HeadstoneEntity] Processing loot request from ${data.playerId} ` +
-        `for ${data.itemId} x${data.quantity} from ${this.id}`,
-    );
-
     // Step 1: Check loot protection
     if (!this.canPlayerLoot(data.playerId)) {
       this.world.emit(EventType.UI_MESSAGE, {
@@ -275,10 +234,6 @@ export class HeadstoneEntity extends InteractableEntity {
     );
 
     if (itemIndex === -1) {
-      console.log(
-        `[HeadstoneEntity] Item ${data.itemId} not found in ${this.id} ` +
-          `(already looted by another player)`,
-      );
       this.world.emit(EventType.UI_MESSAGE, {
         playerId: data.playerId,
         message: "Item already looted!",
@@ -314,12 +269,6 @@ export class HeadstoneEntity extends InteractableEntity {
     const removed = this.removeItem(data.itemId, quantityToLoot);
 
     if (!removed) {
-      // Another player looted it between our check and remove
-      // This should be rare due to queue, but defensive programming
-      console.log(
-        `[HeadstoneEntity] Item ${data.itemId} removed by another player ` +
-          `during loot operation (race condition prevented)`,
-      );
       this.world.emit(EventType.UI_MESSAGE, {
         playerId: data.playerId,
         message: "Item already looted!",
@@ -339,11 +288,6 @@ export class HeadstoneEntity extends InteractableEntity {
         metadata: null,
       },
     });
-
-    console.log(
-      `[HeadstoneEntity] ✓ ${data.playerId} looted ${data.itemId} x${quantityToLoot} ` +
-        `from ${this.id}`,
-    );
   }
 
   protected async createMesh(): Promise<void> {
@@ -410,16 +354,6 @@ export class HeadstoneEntity extends InteractableEntity {
    * Handle corpse interaction - shows loot interface
    */
   public async handleInteraction(data: EntityInteractionData): Promise<void> {
-    console.log(
-      `[HeadstoneEntity] ${this.id} handleInteraction called by ${data.playerId}`,
-    );
-    console.log(
-      `[HeadstoneEntity] Emitting CORPSE_CLICK with ${this.lootItems.length} items:`,
-      this.lootItems
-        .map((item) => `${item.itemId} x${item.quantity}`)
-        .join(", ") || "(none)",
-    );
-
     const lootData = {
       corpseId: this.id,
       playerId: data.playerId,
@@ -436,9 +370,6 @@ export class HeadstoneEntity extends InteractableEntity {
       const network = this.world.network as any;
       if (network.sendTo) {
         network.sendTo(data.playerId, "corpseLoot", lootData);
-        console.log(
-          `[HeadstoneEntity] Sent corpseLoot packet to ${data.playerId}`,
-        );
       }
     }
   }
@@ -447,36 +378,19 @@ export class HeadstoneEntity extends InteractableEntity {
    * Remove an item from the corpse loot
    */
   public removeItem(itemId: string, quantity: number): boolean {
-    console.log(
-      `[HeadstoneEntity] removeItem called: itemId=${itemId}, quantity=${quantity}, ` +
-        `current items count=${this.lootItems.length}`,
-    );
-
     const itemIndex = this.lootItems.findIndex(
       (item) => item.itemId === itemId,
     );
     if (itemIndex === -1) {
-      console.log(
-        `[HeadstoneEntity] Item ${itemId} not found in lootItems (already removed?)`,
-      );
       return false;
     }
 
     const item = this.lootItems[itemIndex];
-    console.log(
-      `[HeadstoneEntity] Found item at index ${itemIndex}: ${item.itemId} x${item.quantity}`,
-    );
 
     if (item.quantity > quantity) {
       item.quantity -= quantity;
-      console.log(
-        `[HeadstoneEntity] Decreased quantity: ${item.itemId} now has ${item.quantity}`,
-      );
     } else {
       this.lootItems.splice(itemIndex, 1);
-      console.log(
-        `[HeadstoneEntity] Removed item entirely: ${item.itemId}, remaining items: ${this.lootItems.length}`,
-      );
     }
 
     // Update userData
@@ -484,50 +398,23 @@ export class HeadstoneEntity extends InteractableEntity {
       this.mesh.userData.corpseData.itemCount = this.lootItems.length;
     }
 
-    console.log(
-      `[HeadstoneEntity] After removal, lootItems.length = ${this.lootItems.length}`,
-    );
-
     // If no items left, mark for despawn
     if (this.lootItems.length === 0) {
-      console.log(`[HeadstoneEntity] ========== GRAVESTONE EMPTY ==========`);
-      console.log(
-        `[HeadstoneEntity] Emitting CORPSE_EMPTY event for ${this.id}, playerId=${this.config.headstoneData.playerId}`,
-      );
-
       this.world.emit(EventType.CORPSE_EMPTY, {
         corpseId: this.id,
         playerId: this.config.headstoneData.playerId,
       });
 
-      console.log(
-        `[HeadstoneEntity] ${this.id} is empty, despawning in 500ms...`,
-      );
-
       // Despawn almost immediately after all items taken (RuneScape-style)
       setTimeout(() => {
-        console.log(
-          `[HeadstoneEntity] ⏰ Timeout triggered! Removing ${this.id} from world...`,
-        );
-
         // Use EntityManager to properly remove entity (sends entityRemoved packet to clients)
         const entityManager = this.world.getSystem("entity-manager") as any;
         if (entityManager) {
           entityManager.destroyEntity(this.id);
-          console.log(
-            `[HeadstoneEntity] ✓ Called EntityManager.destroyEntity(${this.id})`,
-          );
         } else {
-          console.warn(
-            `[HeadstoneEntity] ⚠️ No EntityManager found, using fallback`,
-          );
           this.world.entities.remove(this.id);
         }
       }, 500);
-    } else {
-      console.log(
-        `[HeadstoneEntity] Gravestone still has ${this.lootItems.length} items remaining`,
-      );
     }
 
     this.markNetworkDirty();
@@ -591,9 +478,6 @@ export class HeadstoneEntity extends InteractableEntity {
 
     // Check if corpse should despawn
     if (this.world.getTime() > this.config.headstoneData.despawnTime) {
-      console.log(
-        `[HeadstoneEntity] ${this.id} reached despawn time, removing from world...`,
-      );
       this.world.entities.remove(this.id);
     }
   }
