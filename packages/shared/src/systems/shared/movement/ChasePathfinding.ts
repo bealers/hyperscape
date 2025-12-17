@@ -18,7 +18,12 @@
  * Diagonal movement requires BOTH adjacent cardinal tiles to be walkable.
  * To move diagonally from (0,0) to (1,1), both (1,0) and (0,1) must be walkable.
  *
+ * Performance Note:
+ * - chaseStep() allocates objects per call (for backwards compatibility)
+ * - ChasePathfinder class provides zero-allocation alternative for hot paths
+ *
  * @see https://oldschool.runescape.wiki/w/Pathfinding
+ * @see MOB_AGGRO_IMPLEMENTATION_PLAN.md Phase 4.1
  */
 
 import type { TileCoord } from "./TileSystem";
@@ -93,4 +98,124 @@ export function chaseStep(
 
   // All directions blocked - chaser is stuck
   return null;
+}
+
+/**
+ * ChasePathfinder - Zero-allocation chase pathfinding
+ *
+ * Class-based alternative to chaseStep() that pre-allocates all temporary
+ * objects to avoid GC pressure in hot paths (tick processing).
+ *
+ * Use this class when processing many NPCs per tick.
+ */
+export class ChasePathfinder {
+  // Pre-allocated tile buffers (maximum 4 candidates: 1 diagonal + 2 cardinals)
+  private readonly _cardinalX: TileCoord = { x: 0, z: 0 };
+  private readonly _cardinalZ: TileCoord = { x: 0, z: 0 };
+  private readonly _diagonal: TileCoord = { x: 0, z: 0 };
+  private readonly _result: TileCoord = { x: 0, z: 0 };
+
+  /**
+   * Calculate the next tile when chasing a target (zero-allocation)
+   *
+   * Same algorithm as chaseStep(), but uses pre-allocated buffers.
+   * Returns a reference to an internal buffer - copy if you need to store it.
+   *
+   * @param current - The chaser's current tile
+   * @param target - The target tile to move toward
+   * @param isWalkable - Function to check if a tile is walkable
+   * @returns The next tile to move to (internal buffer), or null if blocked/at target
+   */
+  chaseStep(
+    current: TileCoord,
+    target: TileCoord,
+    isWalkable: (tile: TileCoord) => boolean,
+  ): TileCoord | null {
+    // Calculate direction to target (-1, 0, or 1 for each axis)
+    const dx = Math.sign(target.x - current.x);
+    const dz = Math.sign(target.z - current.z);
+
+    // If already at target, no movement needed
+    if (dx === 0 && dz === 0) {
+      return null;
+    }
+
+    // Priority 1: Diagonal (if moving on both axes AND corner-cut is valid)
+    if (dx !== 0 && dz !== 0) {
+      // Update pre-allocated tiles
+      this._cardinalX.x = current.x + dx;
+      this._cardinalX.z = current.z;
+      this._cardinalZ.x = current.x;
+      this._cardinalZ.z = current.z + dz;
+      this._diagonal.x = current.x + dx;
+      this._diagonal.z = current.z + dz;
+
+      // Only allow diagonal if both adjacent cardinals AND diagonal are walkable
+      if (
+        isWalkable(this._cardinalX) &&
+        isWalkable(this._cardinalZ) &&
+        isWalkable(this._diagonal)
+      ) {
+        this._result.x = this._diagonal.x;
+        this._result.z = this._diagonal.z;
+        return this._result;
+      }
+    }
+
+    // Priority 2: Cardinal directions (prioritize greater distance axis)
+    const absDx = Math.abs(target.x - current.x);
+    const absDz = Math.abs(target.z - current.z);
+
+    if (absDx >= absDz) {
+      // X axis has greater or equal distance, try it first
+      if (dx !== 0) {
+        this._result.x = current.x + dx;
+        this._result.z = current.z;
+        if (isWalkable(this._result)) {
+          return this._result;
+        }
+      }
+      if (dz !== 0) {
+        this._result.x = current.x;
+        this._result.z = current.z + dz;
+        if (isWalkable(this._result)) {
+          return this._result;
+        }
+      }
+    } else {
+      // Z axis has greater distance, try it first
+      if (dz !== 0) {
+        this._result.x = current.x;
+        this._result.z = current.z + dz;
+        if (isWalkable(this._result)) {
+          return this._result;
+        }
+      }
+      if (dx !== 0) {
+        this._result.x = current.x + dx;
+        this._result.z = current.z;
+        if (isWalkable(this._result)) {
+          return this._result;
+        }
+      }
+    }
+
+    // All directions blocked - chaser is stuck
+    return null;
+  }
+}
+
+// Singleton instance for convenience (stateless except for pre-allocated buffers)
+let _chasePathfinderInstance: ChasePathfinder | null = null;
+
+/**
+ * Get the shared ChasePathfinder instance
+ *
+ * Use this for zero-allocation chase pathfinding in hot paths.
+ */
+export function getChasePathfinder(): ChasePathfinder {
+  if (!_chasePathfinderInstance) {
+    _chasePathfinderInstance = new ChasePathfinder();
+  }
+  return _chasePathfinderInstance;
 }

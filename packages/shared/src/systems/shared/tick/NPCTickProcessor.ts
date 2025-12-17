@@ -158,7 +158,9 @@ export class NPCTickProcessor {
       );
     }
 
-    return { ...this._stats };
+    // Return reference to internal stats object (zero allocation)
+    // Caller should not modify; use getLastStats() for a safe reference
+    return this._stats;
   }
 
   /**

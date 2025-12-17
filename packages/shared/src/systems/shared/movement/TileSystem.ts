@@ -62,12 +62,32 @@ export interface TileFlags {
 /**
  * Convert world coordinates to tile coordinates
  * Uses floor to ensure consistent tile boundaries
+ *
+ * NOTE: This allocates a new object. For hot paths, use worldToTileInto().
  */
 export function worldToTile(worldX: number, worldZ: number): TileCoord {
   return {
     x: Math.floor(worldX / TILE_SIZE),
     z: Math.floor(worldZ / TILE_SIZE),
   };
+}
+
+/**
+ * Convert world coordinates to tile coordinates (zero-allocation)
+ *
+ * Writes to an existing TileCoord object to avoid GC pressure in hot paths.
+ *
+ * @param worldX - World X coordinate
+ * @param worldZ - World Z coordinate
+ * @param out - Pre-allocated TileCoord to write to
+ */
+export function worldToTileInto(
+  worldX: number,
+  worldZ: number,
+  out: TileCoord,
+): void {
+  out.x = Math.floor(worldX / TILE_SIZE);
+  out.z = Math.floor(worldZ / TILE_SIZE);
 }
 
 /**
