@@ -40,6 +40,29 @@ export const COMBAT_CONSTANTS = {
     SLOWEST: 7, // Halberds, 2H swords (4.2s)
   },
 
+  // OSRS-accurate hit delay formulas (Phase 3)
+  // @see https://oldschool.runescape.wiki/w/Hit_delay
+  // Hit delay = ticks from attack to damage appearing on target
+  //
+  // MELEE: 0 ticks (instant - damage appears same tick as attack)
+  // RANGED: 1 + floor((3 + distance) / 6) ticks
+  // MAGIC: 1 + floor((1 + distance) / 3) ticks
+  //
+  // Examples at distance 5:
+  //   Melee: 0 ticks
+  //   Ranged: 1 + floor((3 + 5) / 6) = 1 + 1 = 2 ticks
+  //   Magic: 1 + floor((1 + 5) / 3) = 1 + 2 = 3 ticks
+  HIT_DELAY: {
+    MELEE_BASE: 0, // Melee is instant
+    RANGED_BASE: 1, // Ranged minimum delay
+    RANGED_DISTANCE_OFFSET: 3, // Added to distance before division
+    RANGED_DISTANCE_DIVISOR: 6, // Distance divisor
+    MAGIC_BASE: 1, // Magic minimum delay
+    MAGIC_DISTANCE_OFFSET: 1, // Added to distance before division
+    MAGIC_DISTANCE_DIVISOR: 3, // Distance divisor
+    MAX_HIT_DELAY: 10, // Maximum hit delay in ticks (cap for sanity)
+  },
+
   // Respawn timing in ticks (OSRS-style)
   // @see https://oldschool.runescape.wiki/w/Respawn_rate
   RESPAWN_TICKS_MIN: 25, // 15 seconds - minimum respawn time

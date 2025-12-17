@@ -16,6 +16,7 @@ export {
 
 export * from "./CombatUtils";
 export * from "./CombatValidation";
+export * from "./HitDelayCalculator";
 
 // Export all from EntityUtils except calculateDistance* (to avoid duplicates)
 export {

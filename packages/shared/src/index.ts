@@ -736,6 +736,25 @@ export {
 // Combat constants (tick-based timing, ranges, etc.)
 export { COMBAT_CONSTANTS } from "./constants/CombatConstants";
 
+// Hit delay calculator (OSRS-accurate projectile delays)
+export {
+  calculateHitDelay,
+  calculateMeleeHitDelay,
+  calculateRangedHitDelay,
+  calculateMagicHitDelay,
+  calculateTileDistance,
+  calculateEuclideanDistance,
+  createProjectile,
+  shouldProjectileHit,
+  getProjectileProgress,
+  getHitDelayExamples,
+} from "./utils/game/HitDelayCalculator";
+export type {
+  HitDelayAttackType,
+  ProjectileData,
+  HitDelayResult,
+} from "./utils/game/HitDelayCalculator";
+
 // Distance utilities (OSRS-style Chebyshev)
 export {
   chebyshevDistance,

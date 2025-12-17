@@ -95,10 +95,21 @@ interface PlayerEntityInterface {
 }
 
 /**
+ * Attack type for hit delay calculation
+ */
+export type DamageAttackType = "melee" | "ranged" | "magic";
+
+/**
  * Queued damage for OSRS-style tick scheduling
  *
- * Player → NPC damage is queued for next tick (OSRS asymmetry)
- * NPC → Player damage applies same tick
+ * Includes hit delay support (Phase 3):
+ * - Melee: 0 tick delay (instant)
+ * - Ranged: 1 + floor((3 + distance) / 6) ticks
+ * - Magic: 1 + floor((1 + distance) / 3) ticks
+ *
+ * Also implements damage asymmetry (Phase 1):
+ * - Player → NPC damage: queued for next tick
+ * - NPC → Player damage: applies same tick
  */
 export interface QueuedDamage {
   attackerId: string;
@@ -107,6 +118,12 @@ export interface QueuedDamage {
   applyAtTick: number;
   attackerType: "player" | "mob";
   targetType: "player" | "mob";
+  /** Attack type for hit delay calculation */
+  attackType?: DamageAttackType;
+  /** Distance at time of attack (for ranged/magic delay) */
+  distance?: number;
+  /** Calculated hit delay in ticks */
+  hitDelayTicks?: number;
 }
 
 /**
@@ -501,6 +518,88 @@ export class GameTickProcessor {
    */
   queueDamage(damage: QueuedDamage): void {
     this.damageQueue.push(damage);
+  }
+
+  /**
+   * Queue damage with OSRS-accurate hit delay calculation
+   *
+   * This method calculates the appropriate hit delay based on attack type
+   * and distance, then queues the damage to apply at the correct tick.
+   *
+   * OSRS Hit Delay Formulas:
+   * - Melee: 0 ticks (instant)
+   * - Ranged: 1 + floor((3 + distance) / 6) ticks
+   * - Magic: 1 + floor((1 + distance) / 3) ticks
+   *
+   * Additionally applies the NPC→Player processing asymmetry:
+   * - Player → NPC: +1 tick (queued for next tick)
+   * - NPC → Player: +0 ticks (same tick)
+   *
+   * @param attackerId - Entity performing the attack
+   * @param targetId - Entity receiving damage
+   * @param damage - Amount of damage
+   * @param attackerType - "player" or "mob"
+   * @param targetType - "player" or "mob"
+   * @param attackType - "melee", "ranged", or "magic"
+   * @param distance - Distance to target in tiles (used for ranged/magic delay)
+   * @param currentTick - Current game tick
+   */
+  queueDamageWithDelay(
+    attackerId: string,
+    targetId: string,
+    damage: number,
+    attackerType: "player" | "mob",
+    targetType: "player" | "mob",
+    attackType: DamageAttackType,
+    distance: number,
+    currentTick: number,
+  ): void {
+    // Calculate hit delay based on attack type and distance
+    let hitDelayTicks = 0;
+
+    switch (attackType) {
+      case "melee":
+        // Melee is instant (0 tick delay)
+        hitDelayTicks = 0;
+        break;
+
+      case "ranged":
+        // Ranged: 1 + floor((3 + distance) / 6)
+        hitDelayTicks = 1 + Math.floor((3 + distance) / 6);
+        break;
+
+      case "magic":
+        // Magic: 1 + floor((1 + distance) / 3)
+        hitDelayTicks = 1 + Math.floor((1 + distance) / 3);
+        break;
+    }
+
+    // Cap at maximum delay (10 ticks)
+    hitDelayTicks = Math.min(hitDelayTicks, 10);
+
+    // Apply OSRS damage asymmetry (Phase 1)
+    // Player → NPC damage: +1 tick (queued for next tick)
+    // NPC → Player damage: +0 ticks (same tick)
+    let asymmetryDelay = 0;
+    if (attackerType === "player" && targetType === "mob") {
+      asymmetryDelay = 1; // Player attacking NPC = next tick
+    }
+
+    // Calculate final tick when damage applies
+    const applyAtTick = currentTick + hitDelayTicks + asymmetryDelay;
+
+    // Queue the damage
+    this.damageQueue.push({
+      attackerId,
+      targetId,
+      damage,
+      applyAtTick,
+      attackerType,
+      targetType,
+      attackType,
+      distance,
+      hitDelayTicks,
+    });
   }
 
   /**
