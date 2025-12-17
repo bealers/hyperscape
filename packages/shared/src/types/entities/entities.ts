@@ -187,6 +187,7 @@ export interface MobEntityConfig extends EntityConfig<MobEntityProperties> {
   aggroRange: number;
   combatRange: number;
   wanderRadius: number; // Fixed distance from spawn point (RuneScape-style)
+  leashRange?: number; // Max chase distance from spawn (defaults to 10, OSRS-style two-tier range)
   respawnTime: number;
   xpReward: number;
   lootTable: Array<{

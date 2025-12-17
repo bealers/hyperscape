@@ -1043,6 +1043,7 @@ export class MobEntity extends CombatantEntity {
       getSpawnPoint: () => this._currentSpawnPoint,
       getDistanceFromSpawn: () => this.getDistance2D(this._currentSpawnPoint),
       getWanderRadius: () => this.respawnManager.getSpawnAreaRadius(),
+      getLeashRange: () => this.config.leashRange ?? 10, // OSRS two-tier range: leash > wander
       getCombatRange: () => this.config.combatRange,
 
       // Wander

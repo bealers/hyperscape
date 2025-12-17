@@ -47,7 +47,8 @@ export interface AIStateContext {
   // Spawn & Leashing
   getSpawnPoint(): Position3D;
   getDistanceFromSpawn(): number;
-  getWanderRadius(): number;
+  getWanderRadius(): number; // For wander target generation (5 tiles default)
+  getLeashRange(): number; // For chase boundary (10 tiles default, OSRS two-tier range)
   getCombatRange(): number;
 
   // Wander
