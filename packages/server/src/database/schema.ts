@@ -220,6 +220,7 @@ export const characters = pgTable(
 
     // Combat preferences
     attackStyle: text("attackStyle").default("accurate"),
+    autoRetaliate: integer("autoRetaliate").default(1).notNull(), // 1=ON (default), 0=OFF
 
     lastLogin: bigint("lastLogin", { mode: "number" }).default(0),
 
