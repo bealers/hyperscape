@@ -118,6 +118,8 @@ const names = [
   // Combat packets
   'attackMob',
   'changeAttackStyle',
+  'setAutoRetaliate',
+  'autoRetaliateChanged',
   // Item pickup packets
   'pickupItem',
   // Inventory action packets
