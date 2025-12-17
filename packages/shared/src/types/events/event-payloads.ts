@@ -267,6 +267,21 @@ export interface PlayerXPGainEvent {
   currentLevel: number;
 }
 
+/**
+ * Payload for SKILLS_LEVEL_UP event
+ * Emitted by server (SkillsSystem) and client (useXPOrbState) when a skill levels up.
+ * Note: Server emits this event internally but does NOT send it over WebSocket.
+ * Client emits locally when detecting level-up from XP drop data.
+ */
+export interface SkillsLevelUpEvent {
+  entityId?: string; // Server includes this
+  skill: string;
+  oldLevel: number;
+  newLevel: number;
+  totalLevel?: number; // Server includes this
+  timestamp?: number; // Client adds this
+}
+
 export interface HealthUpdateEvent {
   entityId: string;
   previousHealth: number;
@@ -649,6 +664,9 @@ export interface EventMap {
     playerId: string;
     npcId: string;
   };
+
+  // Skills Events
+  [EventType.SKILLS_LEVEL_UP]: SkillsLevelUpEvent;
 }
 
 /**

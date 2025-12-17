@@ -31,3 +31,6 @@ export {
 
 // Utilities
 export { normalizeSkillName, capitalizeSkill } from "./utils";
+
+// Type guards
+export { isClientAudio, isChat } from "./utils";

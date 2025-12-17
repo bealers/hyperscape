@@ -236,6 +236,16 @@ export function useXPOrbState(world: ClientWorld): UseXPOrbStateResult {
       const prevLevel = previousLevelsRef.current[skillKey];
       if (prevLevel !== undefined && data.newLevel > prevLevel) {
         setLevelUpSkill(skillKey);
+
+        // Emit client-side level-up event (single source of truth)
+        // Note: Server also emits SKILLS_LEVEL_UP but doesn't send over WebSocket
+        world.emit(EventType.SKILLS_LEVEL_UP, {
+          skill: data.skill,
+          oldLevel: prevLevel,
+          newLevel: data.newLevel,
+          timestamp: Date.now(),
+        });
+
         clearTimeout(levelUpTimeout);
         levelUpTimeout = setTimeout(() => {
           setLevelUpSkill(null);

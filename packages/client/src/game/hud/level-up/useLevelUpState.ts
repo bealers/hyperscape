@@ -2,20 +2,19 @@
  * useLevelUpState - State management hook for Level-Up Notifications
  *
  * Handles:
- * - Level-up detection from XP_DROP_RECEIVED events
+ * - Subscribing to SKILLS_LEVEL_UP events (emitted by useXPOrbState)
  * - Queue management for multiple level-ups
  * - Auto-dismiss timing
  *
  * Separated from XPProgressOrb for Single Responsibility Principle (SRP).
- * Both systems independently detect level-ups - orb shows celebration animation,
- * notification shows the popup dialog.
+ * useXPOrbState is the single source of truth for level-up detection.
+ * This hook subscribes to the centralized event to show the popup dialog.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { EventType } from "@hyperscape/shared";
+import type { SkillsLevelUpEvent } from "@hyperscape/shared";
 import type { ClientWorld } from "../../../types";
-import type { XPDropData } from "../xp-orb";
-import { normalizeSkillName } from "./utils";
 
 /** Level-up event data for popup display */
 export interface LevelUpEvent {
@@ -45,53 +44,32 @@ export function useLevelUpState(world: ClientWorld): UseLevelUpStateResult {
     null,
   );
 
-  // Track previous levels to detect level-ups
-  const previousLevelsRef = useRef<Record<string, number>>({});
-
-  // Listen to XP_DROP_RECEIVED and detect level-ups
+  // Subscribe to centralized SKILLS_LEVEL_UP event (emitted by useXPOrbState)
+  // No duplicate level detection needed - single source of truth
   useEffect(() => {
-    const handleXPDrop = (data: unknown) => {
-      // Type guard for XP drop data
-      if (
-        typeof data !== "object" ||
-        data === null ||
-        typeof (data as XPDropData).skill !== "string" ||
-        typeof (data as XPDropData).newLevel !== "number"
-      ) {
-        return;
-      }
-
-      const xpData = data as XPDropData;
-      const skillKey = normalizeSkillName(xpData.skill);
-      const prevLevel = previousLevelsRef.current[skillKey];
-
-      // Detect level-up: previous level exists and new level is higher
-      if (prevLevel !== undefined && xpData.newLevel > prevLevel) {
-        const event: LevelUpEvent = {
-          skill: xpData.skill,
-          oldLevel: prevLevel,
-          newLevel: xpData.newLevel,
-          timestamp: Date.now(),
-        };
-        setLevelUpQueue((prev) => [...prev, event]);
-      }
-
-      // Always update the tracked level
-      previousLevelsRef.current[skillKey] = xpData.newLevel;
+    const handleLevelUp = (data: SkillsLevelUpEvent) => {
+      const event: LevelUpEvent = {
+        skill: data.skill,
+        oldLevel: data.oldLevel,
+        newLevel: data.newLevel,
+        timestamp: data.timestamp ?? Date.now(),
+      };
+      // Use concat for single item - slightly more efficient than spread
+      setLevelUpQueue((prev) => prev.concat(event));
     };
 
-    world.on(EventType.XP_DROP_RECEIVED, handleXPDrop);
+    world.on(EventType.SKILLS_LEVEL_UP, handleLevelUp);
     return () => {
-      world.off(EventType.XP_DROP_RECEIVED, handleXPDrop);
+      world.off(EventType.SKILLS_LEVEL_UP, handleLevelUp);
     };
   }, [world]);
 
   // Process queue - show one level-up at a time
   useEffect(() => {
     if (!currentLevelUp && levelUpQueue.length > 0) {
-      const [next, ...rest] = levelUpQueue;
-      setCurrentLevelUp(next);
-      setLevelUpQueue(rest);
+      // Use slice(1) instead of destructuring to avoid intermediate array
+      setCurrentLevelUp(levelUpQueue[0]);
+      setLevelUpQueue(levelUpQueue.slice(1));
     }
   }, [currentLevelUp, levelUpQueue]);
 
