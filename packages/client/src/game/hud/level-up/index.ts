@@ -4,7 +4,7 @@
  * RuneScape-style level-up popup with:
  * - Visual popup with skill icon and level
  * - CSS fireworks animation (Phase 3)
- * - Placeholder audio fanfare (Phase 2)
+ * - Placeholder audio fanfare (Web Audio API)
  * - Chat message integration (Phase 4)
  * - Skill unlock display (Phase 5)
  */
@@ -18,6 +18,14 @@ export { LevelUpPopup } from "./LevelUpPopup";
 // Hooks
 export { useLevelUpState } from "./useLevelUpState";
 export type { LevelUpEvent, UseLevelUpStateResult } from "./useLevelUpState";
+
+// Audio
+export {
+  playLevelUpSound,
+  playMilestoneLevelUpSound,
+  playLevelUpFanfare,
+  isMilestoneLevel,
+} from "./levelUpAudio";
 
 // Utilities
 export { normalizeSkillName, capitalizeSkill } from "./utils";
