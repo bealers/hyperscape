@@ -24,6 +24,10 @@ import type { TileMovementManager } from "./ServerNetwork/tile-movement";
 import type { MobTileMovementManager } from "./ServerNetwork/mob-tile-movement";
 import type { PendingAttackManager } from "./ServerNetwork/PendingAttackManager";
 import type { BroadcastManager } from "./ServerNetwork/broadcast";
+import type {
+  PlayerScriptQueue,
+  NPCScriptQueue,
+} from "./ServerNetwork/ScriptQueue";
 
 /**
  * Combat system interface for tick processing
@@ -128,9 +132,19 @@ export class GameTickProcessor {
   private pendingAttacks: PendingAttackManager;
   private broadcastManager: BroadcastManager;
 
+  // OSRS-accurate script queues (Phase 2)
+  // Players have Strong/Normal/Weak/Soft priority system
+  // NPCs have single queue type (FIFO)
+  private playerScriptQueue: PlayerScriptQueue | null = null;
+  private npcScriptQueue: NPCScriptQueue | null = null;
+
   // Feature flag to enable/disable new tick processing
   // When false, falls back to legacy per-system tick processing
   private enabled = true;
+
+  // Feature flag for OSRS script queue system (Phase 2)
+  // When true, uses Strong/Normal/Weak/Soft priority system
+  private scriptQueueEnabled = false;
 
   // Damage queue for next-tick application (OSRS asymmetry)
   private damageQueue: QueuedDamage[] = [];
@@ -153,6 +167,8 @@ export class GameTickProcessor {
     mobMovement: MobTileMovementManager;
     pendingAttacks: PendingAttackManager;
     broadcastManager: BroadcastManager;
+    playerScriptQueue?: PlayerScriptQueue;
+    npcScriptQueue?: NPCScriptQueue;
   }) {
     this.world = deps.world;
     this.actionQueue = deps.actionQueue;
@@ -160,6 +176,14 @@ export class GameTickProcessor {
     this.mobMovement = deps.mobMovement;
     this.pendingAttacks = deps.pendingAttacks;
     this.broadcastManager = deps.broadcastManager;
+
+    // Script queues (optional - Phase 2)
+    if (deps.playerScriptQueue) {
+      this.playerScriptQueue = deps.playerScriptQueue;
+    }
+    if (deps.npcScriptQueue) {
+      this.npcScriptQueue = deps.npcScriptQueue;
+    }
 
     // Listen for entity changes to invalidate processing order cache
     this.setupCacheInvalidation();
@@ -211,6 +235,38 @@ export class GameTickProcessor {
    */
   isEnabled(): boolean {
     return this.enabled;
+  }
+
+  /**
+   * Enable or disable OSRS script queue system (Phase 2)
+   * When enabled, uses Strong/Normal/Weak/Soft priority system
+   */
+  setScriptQueueEnabled(enabled: boolean): void {
+    this.scriptQueueEnabled = enabled;
+    console.log(
+      `[GameTickProcessor] ${enabled ? "Enabled" : "Disabled"} OSRS script queue system`,
+    );
+  }
+
+  /**
+   * Check if script queue system is enabled
+   */
+  isScriptQueueEnabled(): boolean {
+    return this.scriptQueueEnabled;
+  }
+
+  /**
+   * Get the player script queue (for external use)
+   */
+  getPlayerScriptQueue(): PlayerScriptQueue | null {
+    return this.playerScriptQueue;
+  }
+
+  /**
+   * Get the NPC script queue (for external use)
+   */
+  getNPCScriptQueue(): NPCScriptQueue | null {
+    return this.npcScriptQueue;
   }
 
   /**
@@ -326,13 +382,25 @@ export class GameTickProcessor {
       // Skip dead mobs
       if ((mob.config?.currentHealth ?? 0) <= 0) continue;
 
-      // 1. Process NPC AI (handles timers, queues internally)
+      // OSRS ORDER FOR NPCs:
+      // 1. Timers execute (BEFORE queues for NPCs!)
+      // 2. Queue scripts execute (single queue type - FIFO)
+      // 3. Movement processing
+      // 4. Combat interactions
+
+      // 1. Process NPC AI (handles timers internally)
       this.processNPCAI(mob, tickNumber);
 
-      // 2. Process NPC movement (tile-based)
+      // 2. Process NPC script queue (Phase 2 - OSRS-accurate)
+      // NPCs have single queue type (no priority system)
+      if (this.scriptQueueEnabled && this.npcScriptQueue) {
+        this.npcScriptQueue.processNPCTick(mobId, tickNumber);
+      }
+
+      // 3. Process NPC movement (tile-based)
       this.mobMovement.processMobTick(mobId, tickNumber);
 
-      // 3. Process NPC combat (attacks against players)
+      // 4. Process NPC combat (attacks against players)
       this.processNPCCombat(mobId, tickNumber);
     }
   }
@@ -386,13 +454,25 @@ export class GameTickProcessor {
       // Skip dead or loading players
       if (player.data?.alive === false || player.data?.isLoading) continue;
 
-      // 1. Process pending attacks (player walking to target)
+      // OSRS ORDER FOR PLAYERS:
+      // 1. Queue scripts execute (Strong > Normal > Weak, then Soft always)
+      // 2. Timers execute (AFTER queues for Players!)
+      // 3. Movement processing
+      // 4. Combat interactions
+
+      // 1. Process player script queue (Phase 2 - OSRS-accurate)
+      // Players have Strong/Normal/Weak/Soft priority system
+      if (this.scriptQueueEnabled && this.playerScriptQueue) {
+        this.playerScriptQueue.processPlayerTick(playerId, tickNumber);
+      }
+
+      // 2. Process pending attacks (player walking to target)
       this.pendingAttacks.processPlayerTick(playerId, tickNumber);
 
-      // 2. Process player movement (tile-based)
+      // 3. Process player movement (tile-based)
       this.tileMovement.processPlayerTick(playerId, tickNumber);
 
-      // 3. Process player combat
+      // 4. Process player combat
       this.processPlayerCombat(playerId, tickNumber);
     }
   }
