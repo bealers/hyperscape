@@ -1,5 +1,5 @@
 /**
- * Chase Pathfinding
+ * Chase Pathfinding (OSRS "Dumb Pathfinder")
  *
  * Simple greedy pathfinding algorithm for NPC chasing behavior.
  * Unlike BFS which searches for optimal paths around obstacles,
@@ -8,11 +8,17 @@
  * This is intentionally simple - NPCs don't navigate around obstacles,
  * which enables "safespotting" gameplay where players can hide behind objects.
  *
- * Algorithm:
+ * OSRS-Accurate Algorithm:
  * 1. Calculate direction to target (normalized to -1, 0, or 1)
- * 2. Try diagonal step if moving on both axes
- * 3. Try cardinal steps (prioritize axis with greater distance)
- * 4. Return first walkable tile, or null if blocked
+ * 2. Try diagonal step FIRST (if moving on both axes AND corner-cut is valid)
+ * 3. If diagonal blocked, try cardinal steps (prioritize axis with greater distance)
+ * 4. Return first walkable tile, or null if blocked (safespotted)
+ *
+ * Corner-Cutting Rule:
+ * Diagonal movement requires BOTH adjacent cardinal tiles to be walkable.
+ * To move diagonally from (0,0) to (1,1), both (1,0) and (0,1) must be walkable.
+ *
+ * @see https://oldschool.runescape.wiki/w/Pathfinding
  */
 
 import type { TileCoord } from "./TileSystem";
@@ -46,9 +52,22 @@ export function chaseStep(
   // Build list of tiles to try, in priority order
   const candidates: TileCoord[] = [];
 
-  // Priority 1: Diagonal (if moving on both axes)
+  // Priority 1: Diagonal (if moving on both axes AND corner-cut is valid)
+  // OSRS corner-cutting rule: Both adjacent cardinal tiles must be walkable
+  // to move diagonally. This prevents cutting through wall corners.
   if (dx !== 0 && dz !== 0) {
-    candidates.push({ x: current.x + dx, z: current.z + dz });
+    const cardinalX: TileCoord = { x: current.x + dx, z: current.z };
+    const cardinalZ: TileCoord = { x: current.x, z: current.z + dz };
+    const diagonal: TileCoord = { x: current.x + dx, z: current.z + dz };
+
+    // Only allow diagonal if both adjacent cardinals AND the diagonal itself are walkable
+    if (
+      isWalkable(cardinalX) &&
+      isWalkable(cardinalZ) &&
+      isWalkable(diagonal)
+    ) {
+      candidates.push(diagonal);
+    }
   }
 
   // Priority 2: Cardinal directions (prioritize greater distance axis)

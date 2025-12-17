@@ -13,7 +13,8 @@ import {
 } from "../MathUtils";
 import {
   worldToTile,
-  tilesAdjacent,
+  tilesWithinMeleeRange,
+  tileChebyshevDistance,
 } from "../../systems/shared/movement/TileSystem";
 
 export interface CombatStats {
@@ -191,23 +192,29 @@ function getDefenseValue(entity: {
  * Check if entity is within attack range
  *
  * OSRS-STYLE:
- * - MELEE: Must be on adjacent tile (Chebyshev distance = 1)
- * - RANGED: Uses world distance (10 units)
+ * - MELEE (range 1): Cardinal tiles only (plus shape) - NO diagonal attacks
+ * - MELEE (range 2+): Includes diagonals (halberd, spear)
+ * - RANGED: Uses tile-based Chebyshev distance
+ *
+ * @see https://oldschool.runescape.wiki/w/Attack_range
  */
 export function isInAttackRange(
   attackerPos: { x: number; y: number; z: number },
   targetPos: { x: number; y: number; z: number },
   attackType: AttackType,
+  meleeRange: number = COMBAT_CONSTANTS.MELEE_RANGE_STANDARD,
 ): boolean {
+  const attackerTile = worldToTile(attackerPos.x, attackerPos.z);
+  const targetTile = worldToTile(targetPos.x, targetPos.z);
+
   if (attackType === AttackType.MELEE) {
-    // OSRS-STYLE: Melee requires adjacent tile
-    const attackerTile = worldToTile(attackerPos.x, attackerPos.z);
-    const targetTile = worldToTile(targetPos.x, targetPos.z);
-    return tilesAdjacent(attackerTile, targetTile);
+    // OSRS: Range 1 melee excludes diagonals (plus shape only)
+    // Range 2+ (halberd) includes diagonals
+    return tilesWithinMeleeRange(attackerTile, targetTile, meleeRange);
   } else {
-    // Ranged uses world distance
-    const distance = calculateDistance3D(attackerPos, targetPos);
-    return distance <= COMBAT_CONSTANTS.RANGED_RANGE;
+    // Ranged uses tile-based Chebyshev distance (OSRS-accurate)
+    const tileDistance = tileChebyshevDistance(attackerTile, targetTile);
+    return tileDistance <= COMBAT_CONSTANTS.RANGED_RANGE && tileDistance > 0;
   }
 }
 

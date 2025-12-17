@@ -13,6 +13,7 @@ import { AGGRO_CONSTANTS } from "../../../constants/CombatConstants";
 import { AggroTarget, Position3D, MobAIStateData } from "../../../types";
 import { calculateDistance } from "../../../utils/game/EntityUtils";
 import { SystemBase } from "..";
+import { TICK_DURATION_MS } from "../movement/TileSystem";
 
 /**
  * Aggression System - GDD Compliant
@@ -138,10 +139,10 @@ export class AggroSystem extends SystemBase {
   }
 
   start(): void {
-    // Start AI update loop with auto-cleanup timer management
+    // Start AI update loop aligned to server tick (OSRS-accurate)
     this.createInterval(() => {
       this.updateMobAI();
-    }, 500); // Update every 500ms for responsive AI
+    }, TICK_DURATION_MS); // 600ms - aligned to server tick
   }
 
   private registerMob(mobData: {

@@ -19,6 +19,7 @@ import type { Position3D } from "../../types";
 import {
   worldToTile,
   tilesWithinRange,
+  tileChebyshevDistance,
 } from "../../systems/shared/movement/TileSystem";
 
 export interface AggroConfig {
@@ -82,13 +83,12 @@ export class AggroManager {
         continue; // Dead player (alive flag), skip
       }
 
-      // Quick distance check (RuneScape-style: first player in range)
-      const dx = playerPos.x - currentPos.x;
-      const dz = playerPos.z - currentPos.z;
-      const distSquared = dx * dx + dz * dz;
-      const aggroRangeSquared = this.config.aggroRange * this.config.aggroRange;
+      // OSRS-accurate: Use tile-based Chebyshev distance (not Euclidean)
+      const mobTile = worldToTile(currentPos.x, currentPos.z);
+      const playerTile = worldToTile(playerPos.x, playerPos.z);
+      const tileDistance = tileChebyshevDistance(mobTile, playerTile);
 
-      if (distSquared <= aggroRangeSquared) {
+      if (tileDistance <= this.config.aggroRange) {
         return {
           id: player.id,
           position: {
@@ -153,12 +153,13 @@ export class AggroManager {
 
   /**
    * Check if target is within aggro range
+   * Uses tile-based Chebyshev distance (OSRS-accurate)
    */
   isInAggroRange(mobPos: Position3D, targetPos: Position3D): boolean {
-    const dx = targetPos.x - mobPos.x;
-    const dz = targetPos.z - mobPos.z;
-    const distSquared = dx * dx + dz * dz;
-    return distSquared <= this.config.aggroRange * this.config.aggroRange;
+    const mobTile = worldToTile(mobPos.x, mobPos.z);
+    const targetTile = worldToTile(targetPos.x, targetPos.z);
+    const tileDistance = tileChebyshevDistance(mobTile, targetTile);
+    return tileDistance <= this.config.aggroRange;
   }
 
   /**
