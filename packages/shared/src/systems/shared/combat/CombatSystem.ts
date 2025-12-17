@@ -114,6 +114,7 @@ export class CombatSystem extends SystemBase {
   private nextAttackTicks = new Map<EntityID, number>(); // Tick when entity can next attack
   private mobSystem?: MobNPCSystem;
   private entityManager?: EntityManager;
+  private playerSystem?: PlayerSystem; // Cached for auto-retaliate checks (hot path optimization)
 
   // Modular services (Phase 5 extraction)
   private stateService: CombatStateService;
@@ -171,6 +172,10 @@ export class CombatSystem extends SystemBase {
 
     // Get mob NPC system - optional but recommended
     this.mobSystem = this.world.getSystem<MobNPCSystem>("mob-npc");
+
+    // Cache PlayerSystem for auto-retaliate checks (hot path optimization)
+    // Optional dependency - combat still works without it (defaults to retaliate)
+    this.playerSystem = this.world.getSystem<PlayerSystem>("player");
 
     // Set up event listeners - required for combat to function
     this.subscribe(
@@ -926,7 +931,7 @@ export class CombatSystem extends SystemBase {
 
     // OSRS Retaliation: Target retaliates after ceil(speed/2) + 1 ticks
     // @see https://oldschool.runescape.wiki/w/Auto_Retaliate
-    // Check if target can retaliate (mobs have retaliates flag, players always can)
+    // Check if target can retaliate (mobs have retaliates flag, players check auto-retaliate setting)
     let canRetaliate = true;
     if (targetType === "mob" && targetEntity) {
       // Check mob's retaliates config - if false, mob won't fight back
@@ -936,6 +941,16 @@ export class CombatSystem extends SystemBase {
       if (mobConfig && mobConfig.retaliates === false) {
         canRetaliate = false;
       }
+    } else if (targetType === "player") {
+      // Check player's auto-retaliate setting
+      // Uses cached reference (no getSystem() call in hot path)
+      // Defaults to true if PlayerSystem unavailable (fail-safe, OSRS default)
+      if (this.playerSystem) {
+        canRetaliate = this.playerSystem.getPlayerAutoRetaliate(
+          String(targetId),
+        );
+      }
+      // Note: If playerSystem is null, canRetaliate stays true (default OSRS behavior)
     }
 
     if (canRetaliate) {
