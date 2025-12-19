@@ -15,6 +15,8 @@
  * - Creates THREE.Sprite for each damage number
  * - Animates with fadeout and upward movement
  * - Auto-removes after animation completes
+ *
+ * @see https://oldschool.runescape.wiki/w/Hitsplat - OSRS hitsplat mechanics and colors
  */
 
 import THREE from "../../extras/three/three";

@@ -11,6 +11,9 @@ import { EventType } from "../../../types/events";
  * - Respawn timers for world mobs
  *
  * NOTE: Player deaths are handled by PlayerDeathSystem (separate file)
+ *
+ * @see https://oldschool.runescape.wiki/w/Respawn_rate - OSRS respawn timing
+ * @see https://oldschool.runescape.wiki/w/Drop - OSRS drop mechanics
  */
 export class MobDeathSystem extends SystemBase {
   private mobRespawnTimers = new Map<string, NodeJS.Timeout>();

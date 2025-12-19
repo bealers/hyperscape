@@ -102,6 +102,10 @@ interface DeathLocationDataWithHeadstone extends DeathLocationData {
  * - Player respawns at Central Haven (0, 0) instantly on button click
  *
  * NOTE: Mob deaths are handled by MobDeathSystem (separate file)
+ *
+ * @see https://oldschool.runescape.wiki/w/Gravestone - OSRS gravestone mechanics
+ * @see https://oldschool.runescape.wiki/w/Death - OSRS death mechanics overview
+ * @see https://oldschool.runescape.wiki/w/Wilderness#Dying_in_the_Wilderness - Wilderness death rules
  */
 export class PlayerDeathSystem extends SystemBase {
   private deathLocations = new Map<string, DeathLocationData>();
