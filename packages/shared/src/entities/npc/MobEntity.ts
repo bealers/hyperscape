@@ -263,6 +263,16 @@ export class MobEntity extends CombatantEntity {
     super(world, combatConfig);
     this.config = config;
 
+    // ===== SYNC ENTITY HEALTH =====
+    // Entity constructor defaults to 100/100 because MobEntityConfig uses flat
+    // currentHealth/maxHealth fields rather than properties.health format.
+    // Sync base class fields with config to ensure getEntityHealth() returns
+    // correct value for first-hit damage capping (Issue: first hit > max HP).
+    this.health = config.currentHealth;
+    this.maxHealth = config.maxHealth;
+    this.data.health = this.health;
+    (this.data as { maxHealth?: number }).maxHealth = this.maxHealth;
+
     // Manifest is source of truth for respawnTime - no minimum enforcement
     if (!this.config.respawnTime) {
       this.config.respawnTime = 15000; // Default 15s if not specified
