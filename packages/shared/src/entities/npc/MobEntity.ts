@@ -295,9 +295,11 @@ export class MobEntity extends CombatantEntity {
    *
    * OSRS Mechanic: Flags removed from old tiles, added to new tiles (in order)
    *
+   * Called by MobTileMovementManager after successful movement.
+   *
    * @see NPC_ENTITY_COLLISION_PLAN.md Phase 2
    */
-  private updateOccupancy(): void {
+  public updateOccupancy(): void {
     // Server-only: occupancy tracking is authoritative
     if (!this.world.isServer) return;
 

@@ -28,11 +28,13 @@ import {
   tilesEqual,
   tilesWithinMeleeRange,
   chaseStep,
+  MobEntity,
 } from "@hyperscape/shared";
 import type {
   TileCoord,
   TileMovementState,
   Position3D,
+  EntityID,
 } from "@hyperscape/shared";
 
 /**
@@ -569,6 +571,19 @@ export class MobTileMovementManager {
           break;
         }
 
+        // OSRS-ACCURATE ENTITY COLLISION: Check if tile is blocked by another NPC
+        // Per OSRS: Pathfinder IGNORES entity collision - it's checked HERE at movement time
+        // If blocked: movement fails, path is RETAINED for retry next tick
+        // This creates the "waiting behind" behavior seen in OSRS
+        if (this.world.entityOccupancy.isBlocked(nextTile, mobId as EntityID)) {
+          if (this.DEBUG_MODE)
+            console.log(
+              `[MobTileMovement] Tile (${nextTile.x},${nextTile.z}) blocked by entity, waiting`,
+            );
+          // Path is RETAINED - will retry next tick (OSRS-accurate)
+          break;
+        }
+
         state.currentTile = { ...nextTile };
         state.pathIndex++;
       }
@@ -593,6 +608,12 @@ export class MobTileMovementManager {
       entity.position.set(worldPos.x, worldPos.y, worldPos.z);
       if (entity.data) {
         entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
+      }
+
+      // Update entity occupancy after movement (OSRS-accurate tile collision)
+      // This updates the EntityOccupancyMap to reflect the mob's new position
+      if (entity instanceof MobEntity) {
+        entity.updateOccupancy();
       }
 
       // Calculate rotation based on movement direction
@@ -757,6 +778,15 @@ export class MobTileMovementManager {
     for (let i = 0; i < state.tilesPerTick; i++) {
       if (state.pathIndex >= state.path.length) break;
       const nextTile = state.path[state.pathIndex];
+
+      // OSRS-ACCURATE ENTITY COLLISION: Check if tile is blocked by another NPC
+      // Per OSRS: Pathfinder IGNORES entity collision - it's checked HERE at movement time
+      // If blocked: movement fails, path is RETAINED for retry next tick
+      if (this.world.entityOccupancy.isBlocked(nextTile, mobId as EntityID)) {
+        // Path is RETAINED - will retry next tick (OSRS-accurate)
+        break;
+      }
+
       state.currentTile = { ...nextTile };
       state.pathIndex++;
     }
@@ -776,6 +806,11 @@ export class MobTileMovementManager {
     entity.position.set(worldPos.x, worldPos.y, worldPos.z);
     if (entity.data) {
       entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
+    }
+
+    // Update entity occupancy after movement (OSRS-accurate tile collision)
+    if (entity instanceof MobEntity) {
+      entity.updateOccupancy();
     }
 
     // Calculate rotation based on movement direction
