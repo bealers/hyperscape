@@ -115,8 +115,11 @@ import {
   TICK_DURATION_MS,
   tileChebyshevDistance,
   getRandomCardinalTile,
+  CARDINAL_DIRECTIONS,
+  type TileCoord,
 } from "../../systems/shared/movement/TileSystem";
-import { attackSpeedSecondsToTicks } from "../../utils/game/CombatCalculations";
+import type { EntityID } from "../../types/core/identifiers";
+import { getNPCSize, getOccupiedTiles } from "./LargeNPCSupport";
 import { getGameRng } from "../../utils/SeededRandom";
 
 // Polyfill ProgressEvent for Node.js server environment
@@ -181,6 +184,153 @@ export class MobEntity extends CombatantEntity {
   // Uses tick-based throttling (aligned with 600ms server ticks) instead of time-based
   private _lastRequestedTargetTile: { x: number; z: number } | null = null;
   private _lastMoveRequestTick: number = -1;
+
+  // ===== ENTITY OCCUPANCY (OSRS-accurate NPC collision) =====
+  // Pre-allocated buffers for zero-allocation hot path operations
+  // @see NPC_ENTITY_COLLISION_PLAN.md
+
+  /** Reusable buffer for occupied tiles (max 5x5 = 25 tiles for large bosses) */
+  private readonly _occupiedTilesBuffer: TileCoord[] = Array.from(
+    { length: 25 },
+    () => ({ x: 0, z: 0 }),
+  );
+
+  /** Reusable buffer for cardinal step-out tiles */
+  private readonly _cardinalBuffer: TileCoord[] = [
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+  ];
+
+  /** Pre-allocated tile for current position */
+  private readonly _currentTile: TileCoord = { x: 0, z: 0 };
+
+  /** Shuffle indices for random cardinal selection (avoids array allocation) */
+  private readonly _shuffleIndices: number[] = [0, 1, 2, 3];
+
+  /** Cached NPC size (avoid repeated lookups) */
+  private _cachedNPCSize: { width: number; depth: number } | null = null;
+
+  /** Track if occupancy is currently registered */
+  private _occupancyRegistered = false;
+
+  // ============================================================================
+  // ENTITY OCCUPANCY METHODS (OSRS-accurate NPC collision)
+  // ============================================================================
+
+  /**
+   * Register this mob's tile occupancy in EntityOccupancyMap
+   *
+   * Called after spawn/respawn to set collision flags on tiles this mob occupies.
+   * Uses pre-allocated buffers to avoid hot path allocations.
+   *
+   * OSRS Mechanic: Flags set when entity spawns/moves TO a tile
+   *
+   * @see NPC_ENTITY_COLLISION_PLAN.md Phase 2
+   */
+  private registerOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    // Cache NPC size on first call (avoids repeated lookups)
+    if (!this._cachedNPCSize) {
+      this._cachedNPCSize = getNPCSize(this.config.mobType);
+    }
+
+    // Get current world position and convert to tile
+    const pos = this.getPosition();
+    this._currentTile.x = Math.floor(pos.x);
+    this._currentTile.z = Math.floor(pos.z);
+
+    // Fill occupied tiles buffer (zero-allocation using pre-allocated buffer)
+    const tileCount = getOccupiedTiles(
+      this._currentTile,
+      this._cachedNPCSize,
+      this._occupiedTilesBuffer,
+    );
+
+    // Check if this mob should ignore collision (bosses, special NPCs)
+    // Default: regular mobs DO block other entities
+    const ignoresCollision =
+      (this.config as { ignoresEntityCollision?: boolean })
+        .ignoresEntityCollision === true;
+
+    // Register with EntityOccupancyMap
+    this.world.entityOccupancy.occupy(
+      this.id as EntityID,
+      this._occupiedTilesBuffer,
+      tileCount,
+      "mob",
+      ignoresCollision,
+    );
+
+    this._occupancyRegistered = true;
+  }
+
+  /**
+   * Remove this mob's tile occupancy from EntityOccupancyMap
+   *
+   * Called when mob dies or despawns to clear collision flags.
+   *
+   * OSRS Mechanic: Flags removed when entity despawns/dies
+   *
+   * @see NPC_ENTITY_COLLISION_PLAN.md Phase 2
+   */
+  private unregisterOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    if (!this._occupancyRegistered) return;
+
+    this.world.entityOccupancy.vacate(this.id as EntityID);
+    this._occupancyRegistered = false;
+  }
+
+  /**
+   * Update this mob's tile occupancy after movement
+   *
+   * Called after successful movement to update collision flags.
+   * Uses atomic move() to avoid race conditions.
+   *
+   * OSRS Mechanic: Flags removed from old tiles, added to new tiles (in order)
+   *
+   * @see NPC_ENTITY_COLLISION_PLAN.md Phase 2
+   */
+  private updateOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    if (!this._occupancyRegistered) {
+      // If not registered, register instead of update
+      this.registerOccupancy();
+      return;
+    }
+
+    // Cache NPC size on first call
+    if (!this._cachedNPCSize) {
+      this._cachedNPCSize = getNPCSize(this.config.mobType);
+    }
+
+    // Get current world position and convert to tile
+    const pos = this.getPosition();
+    this._currentTile.x = Math.floor(pos.x);
+    this._currentTile.z = Math.floor(pos.z);
+
+    // Fill occupied tiles buffer
+    const tileCount = getOccupiedTiles(
+      this._currentTile,
+      this._cachedNPCSize,
+      this._occupiedTilesBuffer,
+    );
+
+    // Atomic move (removes old, adds new)
+    this.world.entityOccupancy.move(
+      this.id as EntityID,
+      this._occupiedTilesBuffer,
+      tileCount,
+    );
+  }
 
   // ===== SPAWN TRACKING =====
   // Track the mob's CURRENT spawn location (changes on respawn)
@@ -363,6 +513,10 @@ export class MobEntity extends CombatantEntity {
       initialSpawnPoint.y,
       initialSpawnPoint.z,
     );
+
+    // Register tile occupancy for OSRS-accurate NPC collision
+    // Called after position is set (server-only, no-op on client)
+    this.registerOccupancy();
 
     this.generatePatrolPoints();
 
@@ -1198,6 +1352,9 @@ export class MobEntity extends CombatantEntity {
     this.node.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
     this.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
 
+    // Register tile occupancy at new spawn location
+    this.registerOccupancy();
+
     // Update userData
     if (this.mesh?.userData) {
       const userData = this.mesh.userData as MeshUserData;
@@ -1812,6 +1969,9 @@ export class MobEntity extends CombatantEntity {
 
   die(): void {
     // ===== COMPONENT-BASED DEATH HANDLING =====
+
+    // Unregister tile occupancy (OSRS: dead NPCs don't block tiles)
+    this.unregisterOccupancy();
 
     // Use Date.now() for consistent millisecond timing (world.getTime() has inconsistent units)
     const currentTime = Date.now();
