@@ -202,6 +202,20 @@ export interface MobEntityConfig extends EntityConfig<MobEntityProperties> {
   targetPlayerId: string | null;
   lastAttackTime: number;
   deathTime: number | null;
+
+  /**
+   * If true, this NPC walks through other NPCs (OSRS boss behavior)
+   *
+   * Used for: GWD generals, Dagannoth Kings, raid bosses, etc.
+   * When true, the NPC's tiles don't block other entities from moving.
+   *
+   * NPC size is determined by getNPCSize(mobType) in LargeNPCSupport.ts
+   * Boss sizes are pre-defined: goblin=1x1, general_graardor=2x2, etc.
+   *
+   * @default false
+   * @see NPC_ENTITY_COLLISION_PLAN.md Phase 7
+   */
+  ignoresEntityCollision?: boolean;
 }
 
 // NPC entity config

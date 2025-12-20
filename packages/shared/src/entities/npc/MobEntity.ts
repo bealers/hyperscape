@@ -252,9 +252,8 @@ export class MobEntity extends CombatantEntity {
 
     // Check if this mob should ignore collision (bosses, special NPCs)
     // Default: regular mobs DO block other entities
-    const ignoresCollision =
-      (this.config as { ignoresEntityCollision?: boolean })
-        .ignoresEntityCollision === true;
+    // @see NPC_ENTITY_COLLISION_PLAN.md Phase 7
+    const ignoresCollision = this.config.ignoresEntityCollision === true;
 
     // Register with EntityOccupancyMap
     this.world.entityOccupancy.occupy(
