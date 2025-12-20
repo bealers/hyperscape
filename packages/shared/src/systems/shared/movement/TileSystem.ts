@@ -13,6 +13,8 @@
  */
 
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
+import type { IEntityOccupancy } from "./EntityOccupancyMap";
+import type { EntityID } from "../../../types/core/identifiers";
 
 /**
  * Core tile system constants
@@ -565,4 +567,177 @@ export function createTileMovementState(
     isRunning: false,
     moveSeq: 0,
   };
+}
+
+// ============================================================================
+// OCCUPANCY-AWARE TILE FUNCTIONS (Zero-Allocation)
+// ============================================================================
+
+/** Pre-allocated buffer for cardinal melee tiles (range 1) */
+const _cardinalMeleeTiles: TileCoord[] = [
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+];
+
+/** Pre-allocated buffer for extended melee tiles (range 2+, max 5x5 = 24 tiles) */
+const _extendedMeleeTiles: TileCoord[] = Array.from({ length: 24 }, () => ({
+  x: 0,
+  z: 0,
+}));
+
+/**
+ * Get cardinal melee tiles (range 1) into pre-allocated buffer
+ *
+ * OSRS melee range 1: Cardinal only (N/S/E/W) - no diagonal attacks
+ * Uses zero-allocation by writing to provided buffer.
+ *
+ * @param targetTile - Target's tile position
+ * @param buffer - Pre-allocated buffer to fill (must have length >= 4)
+ * @returns 4 (always 4 cardinal tiles)
+ */
+export function getCardinalMeleeTilesInto(
+  targetTile: TileCoord,
+  buffer: TileCoord[],
+): number {
+  buffer[0].x = targetTile.x;
+  buffer[0].z = targetTile.z - 1; // South
+  buffer[1].x = targetTile.x;
+  buffer[1].z = targetTile.z + 1; // North
+  buffer[2].x = targetTile.x - 1;
+  buffer[2].z = targetTile.z; // West
+  buffer[3].x = targetTile.x + 1;
+  buffer[3].z = targetTile.z; // East
+  return 4;
+}
+
+/**
+ * Get extended melee tiles (range 2+) into pre-allocated buffer
+ *
+ * For halberd/spear range 2+ weapons that can attack diagonally.
+ * Uses Chebyshev distance - all tiles within range.
+ *
+ * @param targetTile - Target's tile position
+ * @param range - Attack range (2+)
+ * @param buffer - Pre-allocated buffer to fill
+ * @returns Number of tiles filled
+ */
+export function getExtendedMeleeTilesInto(
+  targetTile: TileCoord,
+  range: number,
+  buffer: TileCoord[],
+): number {
+  let index = 0;
+
+  for (let dx = -range; dx <= range && index < buffer.length; dx++) {
+    for (let dz = -range; dz <= range && index < buffer.length; dz++) {
+      // Skip target tile itself
+      if (dx === 0 && dz === 0) continue;
+
+      // Check if within Chebyshev distance
+      if (Math.max(Math.abs(dx), Math.abs(dz)) <= range) {
+        buffer[index].x = targetTile.x + dx;
+        buffer[index].z = targetTile.z + dz;
+        index++;
+      }
+    }
+  }
+
+  return index;
+}
+
+/**
+ * Find best unoccupied combat tile for melee attack (zero-allocation)
+ *
+ * OSRS-accurate: Cardinal tiles only for range 1, diagonal allowed for range 2+.
+ * Checks both terrain walkability AND entity occupancy.
+ *
+ * Uses internal pre-allocated buffers - DO NOT store returned tile reference
+ * beyond the current call frame.
+ *
+ * @param attackerTile - Attacker's current tile
+ * @param targetTile - Target's tile
+ * @param occupancy - Entity occupancy map
+ * @param attackerId - Attacker's ID (excluded from collision check)
+ * @param isWalkable - Function to check terrain walkability
+ * @param range - Attack range (default 1)
+ * @returns Best tile reference (internal buffer) or null if all blocked
+ *
+ * @see NPC_ENTITY_COLLISION_PLAN.md Phase 4
+ */
+export function getBestUnoccupiedMeleeTile(
+  attackerTile: TileCoord,
+  targetTile: TileCoord,
+  occupancy: IEntityOccupancy,
+  attackerId: EntityID,
+  isWalkable: (tile: TileCoord) => boolean,
+  range: number = 1,
+): TileCoord | null {
+  // Get candidate tiles based on range
+  const buffer =
+    range === COMBAT_CONSTANTS.MELEE_RANGE_STANDARD
+      ? _cardinalMeleeTiles
+      : _extendedMeleeTiles;
+  const tileCount =
+    range === COMBAT_CONSTANTS.MELEE_RANGE_STANDARD
+      ? getCardinalMeleeTilesInto(targetTile, buffer)
+      : getExtendedMeleeTilesInto(targetTile, range, buffer);
+
+  // Calculate distances and find best unoccupied tile
+  let bestTile: TileCoord | null = null;
+  let bestDistance = Infinity;
+
+  for (let i = 0; i < tileCount; i++) {
+    const tile = buffer[i];
+
+    // Skip if blocked by another entity (excludes self)
+    if (occupancy.isBlocked(tile, attackerId)) continue;
+
+    // Skip if terrain is unwalkable
+    if (!isWalkable(tile)) continue;
+
+    // Calculate Chebyshev distance from attacker to this tile
+    const distance = Math.max(
+      Math.abs(attackerTile.x - tile.x),
+      Math.abs(attackerTile.z - tile.z),
+    );
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestTile = tile;
+    }
+  }
+
+  return bestTile;
+}
+
+/**
+ * Check if any cardinal tile around target is unoccupied (zero-allocation)
+ *
+ * Fast check to determine if any melee position is available.
+ * Used before committing to path calculation.
+ *
+ * @param targetTile - Target's tile position
+ * @param occupancy - Entity occupancy map
+ * @param excludeEntityId - Entity to exclude from collision check
+ * @param isWalkable - Function to check terrain walkability
+ * @returns true if at least one cardinal tile is available
+ */
+export function hasUnoccupiedCardinalTile(
+  targetTile: TileCoord,
+  occupancy: IEntityOccupancy,
+  excludeEntityId: EntityID,
+  isWalkable: (tile: TileCoord) => boolean,
+): boolean {
+  getCardinalMeleeTilesInto(targetTile, _cardinalMeleeTiles);
+
+  for (let i = 0; i < 4; i++) {
+    const tile = _cardinalMeleeTiles[i];
+    if (!occupancy.isBlocked(tile, excludeEntityId) && isWalkable(tile)) {
+      return true;
+    }
+  }
+
+  return false;
 }
