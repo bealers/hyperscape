@@ -23,5 +23,8 @@ export * from "./RangeSystem";
 // Combat replay and debugging (Phase 7 - EventStore Integration)
 export * from "./CombatReplayService";
 
+// OSRS-style PID shuffle for PvP combat priority (Phase 9 - PvP Fairness)
+export * from "./PidManager";
+
 // NOTE: CombatRequestValidator is SERVER-ONLY (uses Node.js crypto)
 // Import directly: import { CombatRequestValidator } from "@hyperscape/shared/systems/shared/combat/CombatRequestValidator"

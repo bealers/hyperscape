@@ -58,6 +58,8 @@ import {
   PlayerDamageHandler,
   MobDamageHandler,
 } from "./handlers";
+import { PidManager } from "./PidManager";
+import { getGameRng } from "../../../utils/SeededRandom";
 
 // Re-export CombatData from CombatStateService for backwards compatibility
 export type { CombatData } from "./CombatStateService";
@@ -167,6 +169,12 @@ export class CombatSystem extends SystemBase {
   // Eliminates player/mob conditionals in damage application
   private damageHandlers: Map<"player" | "mob", DamageHandler>;
 
+  // PID Manager for OSRS-style combat priority (Phase 9 - PvP Fairness)
+  // Lower PID = higher priority = hits first when attacks happen same tick
+  // PIDs shuffle every 60-150 seconds for fairness
+  // @see https://oldschool.runescape.wiki/w/PID
+  public readonly pidManager: PidManager;
+
   constructor(world: World) {
     super(world, {
       name: "combat",
@@ -201,6 +209,10 @@ export class CombatSystem extends SystemBase {
     this.damageHandlers = new Map();
     this.damageHandlers.set("player", new PlayerDamageHandler(world));
     this.damageHandlers.set("mob", new MobDamageHandler(world));
+
+    // Initialize PID manager for OSRS-style combat priority (Phase 9 - PvP Fairness)
+    // Uses game RNG for deterministic shuffle timing
+    this.pidManager = new PidManager(getGameRng());
   }
 
   async init(): Promise<void> {
@@ -294,10 +306,19 @@ export class CombatSystem extends SystemBase {
       },
     );
 
-    // Listen for player disconnect to clean up combat state
+    // PID Assignment: Assign PID when player joins (Phase 9 - PvP Fairness)
+    // PIDs determine combat priority - lower PID hits first on same tick
+    this.subscribe(EventType.PLAYER_JOINED, (data: { playerId: string }) => {
+      const tickNumber = this.world.currentTick ?? 0;
+      this.pidManager.assignPid(data.playerId as EntityID, tickNumber);
+    });
+
+    // Listen for player disconnect to clean up combat state and remove PID
     // This prevents orphaned combat states when players disconnect mid-combat
     this.subscribe(EventType.PLAYER_LEFT, (data: { playerId: string }) => {
       this.cleanupPlayerDisconnect(data.playerId);
+      // Remove PID when player leaves (Phase 9 - PvP Fairness)
+      this.pidManager.removePid(data.playerId as EntityID);
     });
 
     // Listen for explicit combat stop requests (e.g., player clicking new target)
@@ -1671,6 +1692,10 @@ export class CombatSystem extends SystemBase {
    * Called by TickSystem at COMBAT priority (after movement, before AI)
    */
   public processCombatTick(tickNumber: number): void {
+    // Update PID manager - handles periodic shuffles for PvP fairness (Phase 9)
+    // OSRS shuffles every 60-150 seconds to prevent permanent priority advantage
+    this.pidManager.update(tickNumber);
+
     // Process scheduled emote resets (tick-aligned animation timing)
     // Delegated to AnimationManager for better separation of concerns
     this.animationManager.processEmoteResets(tickNumber);
