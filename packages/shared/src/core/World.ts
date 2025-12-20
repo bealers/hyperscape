@@ -33,6 +33,10 @@ import { ClientActions } from "../systems/client/ClientActions";
 import { Entities, Entities as EntitiesSystem } from "../systems/shared";
 import { EventBus, type EventSubscription } from "../systems/shared";
 import { Events, Events as EventsSystem } from "../systems/shared";
+import {
+  EntityOccupancyMap,
+  type IEntityOccupancy,
+} from "../systems/shared/movement/EntityOccupancyMap";
 import { LODs } from "../systems/shared";
 import { Particles } from "../systems/shared";
 import { Physics, Physics as PhysicsSystem } from "../systems/shared";
@@ -432,6 +436,20 @@ export class World extends EventEmitter {
   // ============================================================================
   // RPG GAME API (Added by SystemLoader when RPG systems are registered)
   // ============================================================================
+
+  /**
+   * Entity occupancy tracking for tile-based collision.
+   * Prevents NPCs from stacking on same tile (OSRS-accurate).
+   *
+   * Key features:
+   * - NPCs set collision flags when occupying tiles
+   * - Collision is checked at movement execution time
+   * - Bosses can ignore collision via `ignoresEntityCollision` flag
+   *
+   * @see NPC_ENTITY_COLLISION_PLAN.md
+   * @see https://osrs-docs.com/docs/mechanics/entity-collision/
+   */
+  entityOccupancy: IEntityOccupancy = new EntityOccupancyMap();
 
   /** Action registry for context-based player actions */
   actionRegistry?: {
@@ -1398,6 +1416,11 @@ export class World extends EventEmitter {
     // Destroy all systems
     for (const system of this.systems) {
       system.destroy();
+    }
+
+    // Clear entity occupancy data
+    if (this.entityOccupancy instanceof EntityOccupancyMap) {
+      this.entityOccupancy.clear();
     }
 
     // Clear system references
