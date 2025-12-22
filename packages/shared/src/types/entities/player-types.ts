@@ -42,6 +42,7 @@ export interface PlayerCombatData {
   combatStyle: "attack" | "strength" | "defense" | "ranged";
   inCombat: boolean;
   combatTarget: string | null;
+  autoRetaliate: boolean; // OSRS-style auto-retaliate setting (default: true)
 }
 
 // Stamina system
@@ -125,6 +126,9 @@ export interface Player {
 
   // Loading state - true while client is loading assets, player immune to aggro/combat
   isLoading?: boolean;
+
+  // Auto-retaliate initialization - top-level for entity creation, used to initialize combat.autoRetaliate
+  autoRetaliate?: boolean;
 }
 
 /**
@@ -186,6 +190,7 @@ export class PlayerMigration {
         combatStyle: "attack",
         inCombat: false,
         combatTarget: null,
+        autoRetaliate: true, // OSRS default: ON
       },
       death: {
         deathLocation: null,
@@ -240,6 +245,7 @@ export class PlayerMigration {
         combatStyle: "attack",
         inCombat: old.inCombat || false,
         combatTarget: old.combatTarget || null,
+        autoRetaliate: true, // OSRS default: ON
       },
       coins: old.coins,
       death: {
@@ -323,6 +329,7 @@ export class PlayerMigration {
         combatStyle: "attack",
         inCombat: false,
         combatTarget: null,
+        autoRetaliate: true, // OSRS default: ON
       },
       death: {
         deathLocation: null,

@@ -58,6 +58,21 @@ export interface CombatFollowTargetPayload {
   targetPosition: { x: number; y: number; z: number };
 }
 
+/**
+ * OSRS-accurate: Player clicked to move (not on target), cancel their attacking combat
+ */
+export interface CombatPlayerDisengagePayload {
+  playerId: string;
+}
+
+/**
+ * OSRS-accurate: Player clicked elsewhere, cancel their pending attack
+ * (e.g., player was walking to mob to attack, but clicked ground instead)
+ */
+export interface PendingAttackCancelPayload {
+  playerId: string;
+}
+
 export interface InventoryItemAddedPayload {
   playerId: string;
   item: InventoryItem;
@@ -280,6 +295,42 @@ export interface SkillsLevelUpEvent {
   newLevel: number;
   totalLevel?: number; // Server includes this
   timestamp?: number; // Client adds this
+}
+
+// ============================================================================
+// AUTO-RETALIATE EVENT PAYLOADS
+// ============================================================================
+
+/**
+ * Request to get player's auto-retaliate setting
+ */
+export interface AutoRetaliateGetEvent {
+  /** Player requesting their setting */
+  playerId: string;
+  /** Optional callback for synchronous response */
+  callback?: (enabled: boolean) => void;
+}
+
+/**
+ * Request to update player's auto-retaliate setting
+ * Server validates before applying (server authority)
+ */
+export interface AutoRetaliateUpdateEvent {
+  /** Player making the request */
+  playerId: string;
+  /** Desired auto-retaliate state */
+  enabled: boolean;
+}
+
+/**
+ * Notification that auto-retaliate setting changed
+ * Sent from server to client after validation
+ */
+export interface AutoRetaliateChangedEvent {
+  /** Player whose setting changed */
+  playerId: string;
+  /** New auto-retaliate state */
+  enabled: boolean;
 }
 
 export interface HealthUpdateEvent {
@@ -667,6 +718,11 @@ export interface EventMap {
 
   // Skills Events
   [EventType.SKILLS_LEVEL_UP]: SkillsLevelUpEvent;
+
+  // Auto-Retaliate Events
+  [EventType.UI_AUTO_RETALIATE_GET]: AutoRetaliateGetEvent;
+  [EventType.UI_AUTO_RETALIATE_UPDATE]: AutoRetaliateUpdateEvent;
+  [EventType.UI_AUTO_RETALIATE_CHANGED]: AutoRetaliateChangedEvent;
 }
 
 /**
@@ -701,6 +757,8 @@ export type EventPayloads = {
   [EventType.PLAYER_XP_GAINED]: PlayerXPGainedPayload;
   [EventType.COMBAT_STARTED]: CombatStartedPayload;
   [EventType.COMBAT_FOLLOW_TARGET]: CombatFollowTargetPayload;
+  [EventType.COMBAT_PLAYER_DISENGAGE]: CombatPlayerDisengagePayload;
+  [EventType.PENDING_ATTACK_CANCEL]: PendingAttackCancelPayload;
   [EventType.INVENTORY_ITEM_ADDED]: InventoryItemAddedPayload;
   [EventType.NPC_DIED]: NPCDiedPayload;
 };

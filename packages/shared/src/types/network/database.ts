@@ -54,6 +54,7 @@ export interface PlayerRow {
   positionY: number;
   positionZ: number;
   attackStyle?: string; // Combat style preference (accurate, aggressive, defensive)
+  autoRetaliate?: number; // Auto-retaliate setting: 1=ON (default), 0=OFF
   lastLogin: number;
   createdAt: number;
   woodcuttingLevel: number;

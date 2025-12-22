@@ -178,6 +178,7 @@ export interface MobEntityConfig extends EntityConfig<MobEntityProperties> {
   attack: number; // Attack level for accuracy calculations (OSRS-style)
   attackPower: number; // Strength-based, determines max hit
   defense: number;
+  defenseBonus: number; // Equipment/armor defense bonus
   attackSpeedTicks: number;
   moveSpeed: number;
   aggressive: boolean; // If true, mob attacks players on sight; if false, only retaliates
@@ -187,6 +188,7 @@ export interface MobEntityConfig extends EntityConfig<MobEntityProperties> {
   aggroRange: number;
   combatRange: number;
   wanderRadius: number; // Fixed distance from spawn point (RuneScape-style)
+  leashRange?: number; // Max chase distance from spawn (defaults to 10, OSRS-style two-tier range)
   respawnTime: number;
   xpReward: number;
   lootTable: Array<{
@@ -200,6 +202,20 @@ export interface MobEntityConfig extends EntityConfig<MobEntityProperties> {
   targetPlayerId: string | null;
   lastAttackTime: number;
   deathTime: number | null;
+
+  /**
+   * If true, this NPC walks through other NPCs (OSRS boss behavior)
+   *
+   * Used for: GWD generals, Dagannoth Kings, raid bosses, etc.
+   * When true, the NPC's tiles don't block other entities from moving.
+   *
+   * NPC size is determined by getNPCSize(mobType) in LargeNPCSupport.ts
+   * Boss sizes are pre-defined: goblin=1x1, general_graardor=2x2, etc.
+   *
+   * @default false
+   * @see NPC_ENTITY_COLLISION_PLAN.md Phase 7
+   */
+  ignoresEntityCollision?: boolean;
 }
 
 // NPC entity config

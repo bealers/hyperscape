@@ -394,6 +394,24 @@ export class EventBridge {
           this.broadcast.sendToPlayer(data.playerId, "attackStyleUpdate", data);
         }
       });
+
+      // Forward auto-retaliate change events to specific player
+      this.world.on(EventType.UI_AUTO_RETALIATE_CHANGED, (payload: unknown) => {
+        const data = payload as { playerId: string; enabled: boolean };
+
+        // Defensive validation before sending to client
+        if (!data.playerId || typeof data.enabled !== "boolean") {
+          console.warn(
+            "[EventBridge] Invalid AUTO_RETALIATE_CHANGED payload:",
+            data,
+          );
+          return;
+        }
+
+        this.broadcast.sendToPlayer(data.playerId, "autoRetaliateChanged", {
+          enabled: data.enabled,
+        });
+      });
     } catch (_err) {
       console.error("[EventBridge] Error setting up UI events:", _err);
     }

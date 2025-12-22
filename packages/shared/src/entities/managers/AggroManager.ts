@@ -1,30 +1,24 @@
 /**
- * AggroManager - Manages mob targeting and aggro behavior
+ * Manages mob target acquisition. Random selection from players in range.
  *
- * Responsibilities:
- * - Target acquisition (scanning for nearby players)
- * - Target validation (checking if target exists and is in range)
- * - Range checking (aggro range vs combat range)
- * - Aggro-on-damage behavior (auto-target attacker)
- * - Target clearing on death/respawn
+ * OSRS-Accurate Aggro Mechanics:
+ * - Hunt Range: Area where NPC detects players (from NPC's CURRENT position)
+ * - Aggression Range: Area where NPC can attack players (from NPC's SPAWN point)
+ * - Both checks must pass for aggro to occur
  *
- * RuneScape-style Aggro Flow:
- * 1. Mob scans for players within aggro range
- * 2. First player found becomes target
- * 3. If attacked while idle, attacker becomes target
- * 4. Target is cleared on death or when out of range
+ * @see https://oldschool.runescape.wiki/w/Aggressiveness
  */
 
 import type { Position3D } from "../../types";
 import {
   worldToTile,
   tilesWithinRange,
+  tileChebyshevDistance,
+  type TileCoord,
 } from "../../systems/shared/movement/TileSystem";
 
 export interface AggroConfig {
-  /** Range at which mob detects and chases players */
   aggroRange: number;
-  /** Range at which mob can attack target (in meters, 1 tile = 1 meter) */
   combatRange: number;
 }
 
@@ -37,13 +31,23 @@ export class AggroManager {
   private currentTarget: string | null = null;
   private config: AggroConfig;
 
+  private readonly _validTargetsBuffer: PlayerTarget[] = [];
+
   constructor(config: AggroConfig) {
     this.config = config;
   }
 
   /**
-   * Find nearby player within aggro range (RuneScape-style)
-   * Returns first player found within range for simplicity
+   * Random selection from valid candidates in range.
+   *
+   * OSRS-Accurate: Two checks must pass for aggro:
+   * 1. Hunt Range: Player within aggroRange of mob's CURRENT position
+   * 2. Aggression Range: Player within aggressionRange of mob's SPAWN point
+   *
+   * @param currentPos - Mob's current world position
+   * @param players - Array of potential targets
+   * @param spawnPoint - Mob's spawn point (for OSRS-accurate aggression range check)
+   * @param aggressionRange - Max distance from spawn where players can be attacked (leashRange + attackRange)
    */
   findNearbyPlayer(
     currentPos: Position3D,
@@ -52,59 +56,113 @@ export class AggroManager {
       position?: Position3D;
       node?: { position?: Position3D };
     }>,
+    spawnPoint?: Position3D,
+    aggressionRange?: number,
   ): PlayerTarget | null {
-    // Early exit if no players
     if (players.length === 0) return null;
-
-    for (const player of players) {
-      // Check both direct position AND node.position for compatibility
-      // Server-side players may have position directly, client-side may use node.position
-      const playerPos = player.position || player.node?.position;
-      if (!playerPos) continue;
-
-      // CRITICAL: Skip dead players (RuneScape-style: mobs don't aggro on corpses)
-      // PlayerEntity has isDead() method and health as a number (not { current, max })
-      const playerObj = player as any;
-      if (typeof playerObj.isDead === "function" && playerObj.isDead()) {
-        continue; // Dead player (has isDead method), skip
-      }
-      if (typeof playerObj.health === "number" && playerObj.health <= 0) {
-        continue; // Dead player (health is 0), skip
-      }
-      // Also check health.current for legacy/network data formats
-      if (
-        playerObj.health?.current !== undefined &&
-        playerObj.health.current <= 0
-      ) {
-        continue; // Dead player (health.current is 0), skip
-      }
-      if (playerObj.alive === false) {
-        continue; // Dead player (alive flag), skip
-      }
-
-      // Quick distance check (RuneScape-style: first player in range)
-      const dx = playerPos.x - currentPos.x;
-      const dz = playerPos.z - currentPos.z;
-      const distSquared = dx * dx + dz * dz;
-      const aggroRangeSquared = this.config.aggroRange * this.config.aggroRange;
-
-      if (distSquared <= aggroRangeSquared) {
-        return {
-          id: player.id,
-          position: {
-            x: playerPos.x,
-            y: playerPos.y,
-            z: playerPos.z,
-          },
-        };
-      }
-    }
-    return null;
+    this.findValidTargets(currentPos, players, spawnPoint, aggressionRange);
+    return this.selectRandomTarget();
   }
 
   /**
-   * Get specific player by ID and return their position
+   * Populates _validTargetsBuffer with players that pass both range checks.
+   *
+   * @param currentPos - Mob's current world position
+   * @param players - Array of potential targets
+   * @param spawnPoint - Mob's spawn point (optional, for aggression range check)
+   * @param aggressionRange - Max distance from spawn (optional, requires spawnPoint)
    */
+  findValidTargets(
+    currentPos: Position3D,
+    players: Array<{
+      id: string;
+      position?: Position3D;
+      node?: { position?: Position3D };
+    }>,
+    spawnPoint?: Position3D,
+    aggressionRange?: number,
+  ): void {
+    this._validTargetsBuffer.length = 0;
+    const mobTile = worldToTile(currentPos.x, currentPos.z);
+
+    // Compute spawn tile if spawn point provided (for OSRS-accurate aggression range)
+    const spawnTile: TileCoord | null = spawnPoint
+      ? worldToTile(spawnPoint.x, spawnPoint.z)
+      : null;
+
+    for (const player of players) {
+      const playerPos = player.position || player.node?.position;
+      if (!playerPos) continue;
+      if (!this.isValidTarget(player)) continue;
+
+      const playerTile = worldToTile(playerPos.x, playerPos.z);
+
+      // Check 1: Hunt Range - player within aggroRange of mob's CURRENT position
+      const huntDistance = tileChebyshevDistance(mobTile, playerTile);
+      if (huntDistance > this.config.aggroRange) continue;
+
+      // Check 2: Aggression Range - player within aggressionRange of mob's SPAWN point
+      // This is OSRS-accurate: "The origin of the aggression range is the static spawn point"
+      if (spawnTile !== null && aggressionRange !== undefined) {
+        const playerSpawnDistance = tileChebyshevDistance(
+          spawnTile,
+          playerTile,
+        );
+        if (playerSpawnDistance > aggressionRange) continue;
+      }
+
+      this._validTargetsBuffer.push({
+        id: player.id,
+        position: { x: playerPos.x, y: playerPos.y, z: playerPos.z },
+      });
+    }
+  }
+
+  selectRandomTarget(): PlayerTarget | null {
+    const count = this._validTargetsBuffer.length;
+    if (count === 0) return null;
+    if (count === 1) return this._validTargetsBuffer[0];
+    return this._validTargetsBuffer[Math.floor(Math.random() * count)];
+  }
+
+  getValidTargetCount(): number {
+    return this._validTargetsBuffer.length;
+  }
+
+  private isValidTarget(player: {
+    id: string;
+    position?: Position3D;
+    node?: { position?: Position3D };
+  }): boolean {
+    const playerObj = player as Record<string, unknown>;
+
+    if (
+      typeof playerObj.isDead === "function" &&
+      (playerObj.isDead as () => boolean)()
+    ) {
+      return false;
+    }
+
+    if (typeof playerObj.health === "number" && playerObj.health <= 0) {
+      return false;
+    }
+
+    const health = playerObj.health as { current?: number } | undefined;
+    if (health?.current !== undefined && health.current <= 0) {
+      return false;
+    }
+
+    if (playerObj.alive === false) {
+      return false;
+    }
+
+    if (playerObj.isLoading === true) {
+      return false;
+    }
+
+    return true;
+  }
+
   getPlayer(
     playerId: string,
     getPlayerFn: (id: string) => {
@@ -116,55 +174,22 @@ export class AggroManager {
     const player = getPlayerFn(playerId);
     if (!player) return null;
 
-    // Check both direct position AND node.position for compatibility
-    // Server-side players may have position directly, client-side may use node.position
     const playerPos = player.position || player.node?.position;
     if (!playerPos) return null;
-
-    // CRITICAL: Return null if player is dead (RuneScape-style: clear target when player dies)
-    // PlayerEntity has isDead() method and health as a number (not { current, max })
-    const playerObj = player as any;
-    if (typeof playerObj.isDead === "function" && playerObj.isDead()) {
-      return null; // Dead player (has isDead method)
-    }
-    if (typeof playerObj.health === "number" && playerObj.health <= 0) {
-      return null; // Dead player (health is 0)
-    }
-    // Also check health.current for legacy/network data formats
-    if (
-      playerObj.health?.current !== undefined &&
-      playerObj.health.current <= 0
-    ) {
-      return null; // Dead player (health.current is 0)
-    }
-    if (playerObj.alive === false) {
-      return null; // Dead player (alive flag)
-    }
+    if (!this.isValidTarget(player)) return null;
 
     return {
       id: player.id,
-      position: {
-        x: playerPos.x,
-        y: playerPos.y,
-        z: playerPos.z,
-      },
+      position: { x: playerPos.x, y: playerPos.y, z: playerPos.z },
     };
   }
 
-  /**
-   * Check if target is within aggro range
-   */
   isInAggroRange(mobPos: Position3D, targetPos: Position3D): boolean {
-    const dx = targetPos.x - mobPos.x;
-    const dz = targetPos.z - mobPos.z;
-    const distSquared = dx * dx + dz * dz;
-    return distSquared <= this.config.aggroRange * this.config.aggroRange;
+    const mobTile = worldToTile(mobPos.x, mobPos.z);
+    const targetTile = worldToTile(targetPos.x, targetPos.z);
+    return tileChebyshevDistance(mobTile, targetTile) <= this.config.aggroRange;
   }
 
-  /**
-   * Check if target is within combat range
-   * Uses combatRange from config (in tiles, minimum 1)
-   */
   isInCombatRange(mobPos: Position3D, targetPos: Position3D): boolean {
     const mobTile = worldToTile(mobPos.x, mobPos.z);
     const targetTile = worldToTile(targetPos.x, targetPos.z);
@@ -172,53 +197,32 @@ export class AggroManager {
     return tilesWithinRange(mobTile, targetTile, rangeTiles);
   }
 
-  /**
-   * Set current target
-   */
   setTarget(playerId: string): void {
     this.currentTarget = playerId;
   }
 
-  /**
-   * Get current target
-   */
   getTarget(): string | null {
     return this.currentTarget;
   }
 
-  /**
-   * Clear current target
-   */
   clearTarget(): void {
     this.currentTarget = null;
   }
 
-  /**
-   * Set target if none is currently set (used for aggro-on-damage)
-   */
   setTargetIfNone(playerId: string): void {
     if (!this.currentTarget) {
       this.currentTarget = playerId;
     }
   }
 
-  /**
-   * Reset to initial state (for cleanup/respawn)
-   */
   reset(): void {
     this.currentTarget = null;
   }
 
-  /**
-   * Get aggro range for external use
-   */
   getAggroRange(): number {
     return this.config.aggroRange;
   }
 
-  /**
-   * Get combat range for external use
-   */
   getCombatRange(): number {
     return this.config.combatRange;
   }

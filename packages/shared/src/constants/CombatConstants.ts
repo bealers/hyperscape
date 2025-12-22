@@ -29,6 +29,7 @@ export const COMBAT_CONSTANTS = {
   LOGOUT_PREVENTION_TICKS: 16, // 9.6s - can't logout after taking damage
   HEALTH_REGEN_COOLDOWN_TICKS: 17, // 10.2s - cooldown after damage before regen starts
   HEALTH_REGEN_INTERVAL_TICKS: 100, // 60s - regenerate 1 HP every 100 ticks
+  AFK_DISABLE_RETALIATE_TICKS: 2000, // 20 minutes - auto-retaliate disabled after 20 min AFK
 
   // Weapon speed tiers in ticks (OSRS-accurate)
   // @see https://oldschool.runescape.wiki/w/Attack_speed
@@ -38,6 +39,62 @@ export const COMBAT_CONSTANTS = {
     MEDIUM: 5, // Longswords, crossbows (3.0s)
     SLOW: 6, // Godswords, battleaxes (3.6s)
     SLOWEST: 7, // Halberds, 2H swords (4.2s)
+  },
+
+  // OSRS-accurate hit delay formulas (Phase 3)
+  // @see https://oldschool.runescape.wiki/w/Hit_delay
+  // Hit delay = ticks from attack to damage appearing on target
+  //
+  // MELEE: 0 ticks (instant - damage appears same tick as attack)
+  // RANGED: 1 + floor((3 + distance) / 6) ticks
+  // MAGIC: 1 + floor((1 + distance) / 3) ticks
+  //
+  // Examples at distance 5:
+  //   Melee: 0 ticks
+  //   Ranged: 1 + floor((3 + 5) / 6) = 1 + 1 = 2 ticks
+  //   Magic: 1 + floor((1 + 5) / 3) = 1 + 2 = 3 ticks
+  HIT_DELAY: {
+    MELEE_BASE: 0, // Melee is instant
+    RANGED_BASE: 1, // Ranged minimum delay
+    RANGED_DISTANCE_OFFSET: 3, // Added to distance before division
+    RANGED_DISTANCE_DIVISOR: 6, // Distance divisor
+    MAGIC_BASE: 1, // Magic minimum delay
+    MAGIC_DISTANCE_OFFSET: 1, // Added to distance before division
+    MAGIC_DISTANCE_DIVISOR: 3, // Distance divisor
+    MAX_HIT_DELAY: 10, // Maximum hit delay in ticks (cap for sanity)
+  },
+
+  // Animation synchronization constants (Phase 4)
+  // @see https://oldschool.runescape.wiki/w/Hitsplat
+  // Damage applies at animation midpoint for visual synchronization
+  //
+  // Animation keyframe structure:
+  // - Frame 0: Wind-up starts (weapon raises)
+  // - Frame 0.5: Weapon connects (DAMAGE APPLIES HERE)
+  // - Frame 1.0: Follow-through completes
+  ANIMATION: {
+    // Ratio of attack animation where damage visually applies
+    // 0.5 = midpoint (weapon connects at center of swing)
+    HIT_FRAME_RATIO: 0.5,
+
+    // Minimum animation duration in ticks (ensures animation plays)
+    MIN_ANIMATION_TICKS: 2,
+
+    // Hitsplat display timing
+    // In OSRS, hitsplats appear the same tick damage is dealt
+    HITSPLAT_DELAY_TICKS: 0,
+
+    // Hitsplat display duration (visible time in ticks)
+    // @see https://oldschool.runescape.wiki/w/Hitsplat
+    // OSRS-accurate: 1-2 ticks (0.6-1.2s), we use 2 for clarity
+    HITSPLAT_DURATION_TICKS: 2,
+
+    // Combat animation types
+    EMOTE_COMBAT: "combat",
+    EMOTE_SWORD_SWING: "sword_swing",
+    EMOTE_RANGED: "ranged",
+    EMOTE_MAGIC: "magic",
+    EMOTE_IDLE: "idle",
   },
 
   // Respawn timing in ticks (OSRS-style)
@@ -57,13 +114,6 @@ export const COMBAT_CONSTANTS = {
   BASE_CONSTANT: 64, // Added to equipment bonuses in formulas
   EFFECTIVE_LEVEL_CONSTANT: 8, // Added to effective levels
   DAMAGE_DIVISOR: 640, // Used in max hit calculation
-
-  // Damage calculations (DEPRECATED - keeping for backward compatibility)
-  DAMAGE_MULTIPLIERS: {
-    MELEE_ATTACK: 0.5, // Deprecated - use OSRS formula
-    RANGED_ATTACK: 0.5, // Deprecated - use OSRS formula
-    DEFENSE_REDUCTION: 0.25, // Deprecated - defense doesn't reduce damage in OSRS
-  },
 
   // Minimum values
   MIN_DAMAGE: 0, // OSRS: Can hit 0 (miss)
@@ -89,11 +139,13 @@ export const AGGRO_CONSTANTS = {
 
   // Mob behavior configurations - loaded dynamically from mobs.json manifest
   // Access via getMobById(mobId).behavior from data/mobs.ts
+  // OSRS-accurate defaults: detectionRange=4 (hunt), leashRange=7 (max range)
+  // @see https://oldschool.runescape.wiki/w/Aggressiveness
   MOB_BEHAVIORS: {
     default: {
       behavior: "passive" as const,
-      detectionRange: 5,
-      leashRange: 10,
+      detectionRange: 4,
+      leashRange: 7,
       levelIgnoreThreshold: 0,
     },
   } as const,

@@ -2,16 +2,7 @@ import { SystemBase } from "..";
 import type { World } from "../../../core/World";
 import { EventType } from "../../../types/events";
 
-/**
- * Mob Death System
- * Handles ONLY mob death mechanics:
- * - Mob despawning on death
- * - Loot dropping
- * - Death animations
- * - Respawn timers for world mobs
- *
- * NOTE: Player deaths are handled by PlayerDeathSystem (separate file)
- */
+/** Handles mob death: despawn, loot drops, animations, respawn timers */
 export class MobDeathSystem extends SystemBase {
   private mobRespawnTimers = new Map<string, NodeJS.Timeout>();
 
@@ -24,7 +15,6 @@ export class MobDeathSystem extends SystemBase {
   }
 
   async init(): Promise<void> {
-    // Listen for ENTITY_DEATH events, filter for mobs only
     this.subscribe(
       EventType.ENTITY_DEATH,
       (data: {
@@ -40,7 +30,6 @@ export class MobDeathSystem extends SystemBase {
     killedBy: string;
     entityType: "player" | "mob";
   }): void {
-    // Only handle mob deaths - player deaths are handled by PlayerDeathSystem
     if (data.entityType !== "mob") {
       return;
     }

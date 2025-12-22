@@ -7,6 +7,7 @@
 
 import type { World } from "../../../core/World";
 import { Emotes } from "../../../data/playerEmotes";
+import { hasServerEmote, isEquipmentSystem } from "../../../utils/typeGuards";
 
 /**
  * Interface for player entity properties accessed for emote management
@@ -23,27 +24,11 @@ interface AnimatablePlayerEntity {
 }
 
 /**
- * Interface for mob entity with optional setServerEmote method
- */
-interface AnimatableMobEntity {
-  setServerEmote?: (emote: string) => void;
-}
-
-/**
  * Data for scheduled emote reset
  */
 interface EmoteResetData {
   tick: number;
   entityType: "player" | "mob";
-}
-
-/**
- * Equipment system interface for weapon checks
- */
-interface EquipmentSystemLike {
-  getPlayerEquipment?: (playerId: string) => {
-    weapon?: { item?: { weaponType?: string; id?: string } };
-  };
 }
 
 export class CombatAnimationManager {
@@ -73,7 +58,7 @@ export class CombatAnimationManager {
       this.setMobCombatEmote(entityId);
     }
 
-    // Issue #340: Hold combat pose until 1 tick before next attack
+    // Hold combat pose until 1 tick before next attack
     // Minimum 2 ticks to ensure animation plays, but scale with attack speed
     const resetTick = currentTick + Math.max(2, attackSpeedTicks - 1);
     this.emoteResetTicks.set(entityId, {
@@ -92,6 +77,23 @@ export class CombatAnimationManager {
         this.resetEmote(entityId, resetData.entityType);
         this.emoteResetTicks.delete(entityId);
       }
+    }
+  }
+
+  /**
+   * Process emote reset for a specific entity
+   *
+   * OSRS-ACCURATE: Called by GameTickProcessor during per-entity processing
+   * This allows emote resets to be processed per-entity rather than globally.
+   *
+   * @param entityId - The entity to check for emote reset
+   * @param currentTick - Current tick number
+   */
+  processEntityEmoteReset(entityId: string, currentTick: number): void {
+    const resetData = this.emoteResetTicks.get(entityId);
+    if (resetData && currentTick >= resetData.tick) {
+      this.resetEmote(entityId, resetData.entityType);
+      this.emoteResetTicks.delete(entityId);
     }
   }
 
@@ -131,11 +133,9 @@ export class CombatAnimationManager {
     let combatEmote = "combat"; // Default to punching
 
     // Get equipment from EquipmentSystem (source of truth)
-    const equipmentSystem = this.world.getSystem("equipment") as
-      | EquipmentSystemLike
-      | undefined;
+    const equipmentSystem = this.world.getSystem("equipment");
 
-    if (equipmentSystem?.getPlayerEquipment) {
+    if (isEquipmentSystem(equipmentSystem)) {
       const equipment = equipmentSystem.getPlayerEquipment(entityId);
 
       if (equipment?.weapon?.item) {
@@ -174,11 +174,9 @@ export class CombatAnimationManager {
   private setMobCombatEmote(entityId: string): void {
     // For mobs, send one-shot combat animation via setServerEmote()
     // Client returns to AI-state-based animation after
-    const mobEntity = this.world.entities.get(entityId) as
-      | AnimatableMobEntity
-      | undefined;
+    const mobEntity = this.world.entities.get(entityId);
 
-    if (mobEntity?.setServerEmote) {
+    if (hasServerEmote(mobEntity)) {
       mobEntity.setServerEmote(Emotes.COMBAT);
     }
   }

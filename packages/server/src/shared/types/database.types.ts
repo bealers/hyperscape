@@ -60,6 +60,7 @@ export interface PlayerRow {
   positionY: number;
   positionZ: number;
   attackStyle?: string; // Combat style preference (accurate, aggressive, defensive)
+  autoRetaliate?: number; // Auto-retaliate preference (1=ON, 0=OFF)
   createdAt: number;
   lastLogin: number;
 }

@@ -321,6 +321,13 @@ export class PlayerEntity extends CombatantEntity {
     if (data.wallet !== undefined) {
       this.data.wallet = data.wallet;
     }
+    // Preserve auto-retaliate preference for client-side access
+    const autoRetaliateValue = (data as { autoRetaliate?: boolean })
+      .autoRetaliate;
+    if (autoRetaliateValue !== undefined) {
+      (this.data as { autoRetaliate?: boolean }).autoRetaliate =
+        autoRetaliateValue;
+    }
 
     // Initialize player-specific properties
     this.playerId = playerData.playerId || data.id;
@@ -375,6 +382,8 @@ export class PlayerEntity extends CombatantEntity {
         combatStyle: "attack",
         inCombat: false,
         combatTarget: null,
+        autoRetaliate:
+          (playerData.autoRetaliate as boolean | undefined) ?? true, // OSRS default: ON, persisted from DB
       },
 
       // Death system

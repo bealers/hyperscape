@@ -7,6 +7,9 @@
 export {
   type CombatStats,
   type DamageResult,
+  type CombatStyle,
+  type StyleBonus,
+  getStyleBonus,
   calculateDamage,
   isInAttackRange,
   calculateDistance3D,
@@ -16,6 +19,7 @@ export {
 
 export * from "./CombatUtils";
 export * from "./CombatValidation";
+export * from "./HitDelayCalculator";
 
 // Export all from EntityUtils except calculateDistance* (to avoid duplicates)
 export {
@@ -28,3 +32,6 @@ export {
 } from "./EntityUtils";
 
 export * from "./ComponentUtils";
+
+// Combat level calculation (OSRS-accurate)
+export * from "./CombatLevelCalculator";

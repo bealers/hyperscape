@@ -1,43 +1,18 @@
-/**
- * EntityIdValidator - Input validation for entity IDs
- *
- * Validates entity IDs to prevent injection attacks and malformed input.
- * Used at the network layer before processing combat requests.
- *
- * Security considerations:
- * - Rejects IDs with special characters that could be used for injection
- * - Limits ID length to prevent buffer overflow attempts
- * - Validates format matches expected patterns
- *
- * @see OWASP Input Validation: https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html
- */
+/** Validates entity IDs to prevent injection attacks and malformed input */
 
-/**
- * Result of entity ID validation
- */
 export interface ValidationResult {
   valid: boolean;
   reason?: string;
   sanitizedId?: string;
 }
 
-/**
- * Configuration for entity ID validation
- */
 export interface EntityIdValidatorConfig {
-  /** Maximum allowed ID length (default: 64) */
   maxLength: number;
-  /** Minimum allowed ID length (default: 1) */
   minLength: number;
-  /** Allowed character pattern (default: alphanumeric + underscore + hyphen) */
   allowedPattern: RegExp;
-  /** Whether to allow UUIDs (default: true) */
   allowUuids: boolean;
 }
 
-/**
- * Default validation configuration
- */
 const DEFAULT_CONFIG: EntityIdValidatorConfig = {
   maxLength: 64,
   minLength: 1,
@@ -45,36 +20,9 @@ const DEFAULT_CONFIG: EntityIdValidatorConfig = {
   allowUuids: true,
 };
 
-/**
- * UUID v4 pattern for validation
- */
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/**
- * Entity ID Validator
- *
- * Validates entity IDs at the network layer to prevent:
- * - SQL injection via entity IDs
- * - Path traversal attacks
- * - Buffer overflow attempts
- * - Script injection (XSS)
- *
- * @example
- * ```typescript
- * const validator = new EntityIdValidator();
- *
- * // Valid IDs
- * validator.validate("player_123");     // { valid: true }
- * validator.validate("mob-goblin-01");  // { valid: true }
- * validator.validate("550e8400-e29b-41d4-a716-446655440000"); // { valid: true } (UUID)
- *
- * // Invalid IDs
- * validator.validate("../../../etc/passwd"); // { valid: false, reason: "invalid_characters" }
- * validator.validate("<script>alert(1)</script>"); // { valid: false, reason: "invalid_characters" }
- * validator.validate(""); // { valid: false, reason: "too_short" }
- * ```
- */
 export class EntityIdValidator {
   private readonly config: EntityIdValidatorConfig;
 
@@ -82,14 +30,7 @@ export class EntityIdValidator {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  /**
-   * Validate an entity ID
-   *
-   * @param id - The entity ID to validate
-   * @returns Validation result with reason if invalid
-   */
   validate(id: unknown): ValidationResult {
-    // Type check - must be a string
     if (typeof id !== "string") {
       return {
         valid: false,

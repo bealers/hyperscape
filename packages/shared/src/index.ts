@@ -65,6 +65,7 @@ export * from "./core";
 // Export entity classes
 export { PlayerLocal } from "./entities/player/PlayerLocal";
 export { PlayerRemote } from "./entities/player/PlayerRemote";
+export { MobEntity } from "./entities/npc/MobEntity";
 export type { EventCallback } from "./entities/Entity";
 
 // Export all types from types/index.ts
@@ -283,6 +284,7 @@ export { glbToNodes } from "./extras/three/glbToNodes";
 export { Emotes } from "./data/playerEmotes";
 export { ControlPriorities } from "./systems/client/ControlPriorities";
 export { downloadFile } from "./utils/downloadFile";
+export * from "./utils/typeGuards";
 export { Curve } from "./extras/animation/Curve";
 export { buttons, propToLabel } from "./extras/ui/buttons";
 // GLTFLoader export disabled due to TypeScript declaration generation issues
@@ -688,6 +690,7 @@ export {
   TILE_DIRECTIONS,
   // Utility functions
   worldToTile,
+  worldToTileInto,
   tileToWorld,
   tileManhattanDistance,
   tileChebyshevDistance,
@@ -699,6 +702,8 @@ export {
   getBestAdjacentTile,
   getBestCombatRangeTile,
   getBestMeleeTile,
+  getBestUnoccupiedMeleeTile,
+  getBestStepOutTile,
   getAdjacentTiles,
   isDiagonal,
   tileKey,
@@ -712,7 +717,11 @@ export type {
   TileFlags,
 } from "./systems/shared/movement/TileSystem";
 export { BFSPathfinder } from "./systems/shared/movement/BFSPathfinder";
-export { chaseStep } from "./systems/shared/movement/ChasePathfinding";
+export {
+  chaseStep,
+  getChasePathfinder,
+  ChasePathfinder,
+} from "./systems/shared/movement/ChasePathfinding";
 export type { WalkabilityChecker } from "./systems/shared/movement/BFSPathfinder";
 export {
   getCachedTimestamp,
@@ -735,6 +744,25 @@ export {
 
 // Combat constants (tick-based timing, ranges, etc.)
 export { COMBAT_CONSTANTS } from "./constants/CombatConstants";
+
+// Hit delay calculator (OSRS-accurate projectile delays)
+export {
+  calculateHitDelay,
+  calculateMeleeHitDelay,
+  calculateRangedHitDelay,
+  calculateMagicHitDelay,
+  calculateTileDistance,
+  calculateEuclideanDistance,
+  createProjectile,
+  shouldProjectileHit,
+  getProjectileProgress,
+  getHitDelayExamples,
+} from "./utils/game/HitDelayCalculator";
+export type {
+  HitDelayAttackType,
+  ProjectileData,
+  HitDelayResult,
+} from "./utils/game/HitDelayCalculator";
 
 // Distance utilities (OSRS-style Chebyshev)
 export {

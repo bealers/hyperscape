@@ -165,3 +165,46 @@ export function handleChangeAttackStyle(
     newStyle: payload.newStyle,
   });
 }
+
+/**
+ * Handle auto-retaliate toggle request from client
+ * Validates input before forwarding to PlayerSystem
+ * PlayerSystem handles rate limiting (500ms cooldown)
+ */
+export function handleSetAutoRetaliate(
+  socket: ServerSocket,
+  data: unknown,
+  world: World,
+): void {
+  const playerEntity = socket.player;
+  if (!playerEntity) {
+    return;
+  }
+
+  // Server authority: use socket.player.id, ignore client-provided playerId
+  const playerId = playerEntity.id;
+
+  // Validate request structure
+  if (!data || typeof data !== "object") {
+    console.warn(
+      `[Combat] Invalid auto-retaliate request format from ${playerId}`,
+    );
+    return;
+  }
+
+  const payload = data as Record<string, unknown>;
+
+  // Validate enabled field is a boolean
+  if (typeof payload.enabled !== "boolean") {
+    console.warn(
+      `[Combat] Invalid auto-retaliate enabled value from ${playerId}: ${typeof payload.enabled}`,
+    );
+    return;
+  }
+
+  // Forward validated request to PlayerSystem (which handles rate limiting)
+  world.emit(EventType.UI_AUTO_RETALIATE_UPDATE, {
+    playerId,
+    enabled: payload.enabled,
+  });
+}

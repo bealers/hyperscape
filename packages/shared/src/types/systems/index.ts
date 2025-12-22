@@ -6,3 +6,4 @@
 export * from "./system-interfaces";
 export * from "./system-types";
 export * from "./physics";
+export * from "./npc-strategies";

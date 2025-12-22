@@ -100,6 +100,13 @@ export class PlayerSystem extends SystemBase {
   private readonly STYLE_CHANGE_COOLDOWN = 0; // No cooldown - instant style switching like RuneScape
   private skillSaveTimers = new Map<string, NodeJS.Timeout>();
 
+  // Auto-retaliate tracking (OSRS-style combat preference)
+  /** Player auto-retaliate settings (Map lookup = O(1), no allocations) */
+  private playerAutoRetaliate = new Map<string, boolean>();
+  /** Rate limiting for toggle spam prevention (OWASP) */
+  private autoRetaliateLastToggle = new Map<string, number>();
+  private readonly AUTO_RETALIATE_COOLDOWN_MS = 500; // Max 2 toggles/second
+
   // Attack styles per GDD - Train one skill exclusively
   private readonly ATTACK_STYLES: Record<string, AttackStyle> = {
     accurate: {
@@ -288,6 +295,18 @@ export class PlayerSystem extends SystemBase {
       ),
     );
 
+    // Auto-retaliate events
+    this.subscribe(EventType.UI_AUTO_RETALIATE_GET, (data) =>
+      this.handleGetAutoRetaliate(
+        data as { playerId: string; callback?: (enabled: boolean) => void },
+      ),
+    );
+    this.subscribe(EventType.UI_AUTO_RETALIATE_UPDATE, (data) =>
+      this.handleAutoRetaliateToggle(
+        data as { playerId: string; enabled: boolean },
+      ),
+    );
+
     // Listen to skills updates to trigger player UI updates
     this.subscribe<{ playerId: string; skills: Skills }>(
       EventType.SKILLS_UPDATED,
@@ -422,15 +441,20 @@ export class PlayerSystem extends SystemBase {
     }
 
     // Note: Skills are already loaded by ServerNetwork and passed to entity spawn
-    // No need to load again - just initialize attack style
-    // Load saved attack style from database if available
+    // No need to load again - just initialize attack style and auto-retaliate
+    // Load saved combat preferences from database if available
     let savedAttackStyle: string | undefined;
+    let savedAutoRetaliate = true; // Default ON (OSRS behavior)
     if (this.databaseSystem) {
       const databaseId = PlayerIdMapper.getDatabaseId(data.playerId);
       const dbData = await this.databaseSystem.getPlayerAsync(databaseId);
       savedAttackStyle = (dbData as { attackStyle?: string })?.attackStyle;
+      // Defensive: treat null/undefined as default (1 = true)
+      savedAutoRetaliate =
+        ((dbData as { autoRetaliate?: number })?.autoRetaliate ?? 1) === 1;
     }
     this.initializePlayerAttackStyle(data.playerId, savedAttackStyle);
+    this.initializePlayerAutoRetaliate(data.playerId, savedAutoRetaliate);
 
     // CRITICAL: Send health data to client NOW (after client is connected and ready)
     // This matches the inventory initialization pattern - send data in PLAYER_REGISTERED
@@ -629,6 +653,10 @@ export class PlayerSystem extends SystemBase {
       this.styleChangeTimers.delete(data.playerId);
     }
     this.playerAttackStyles.delete(data.playerId);
+
+    // Clean up auto-retaliate
+    this.playerAutoRetaliate.delete(data.playerId);
+    this.autoRetaliateLastToggle.delete(data.playerId);
 
     // Unregister userId mapping
     PlayerIdMapper.unregister(data.playerId);
@@ -1774,6 +1802,140 @@ export class PlayerSystem extends SystemBase {
       activeCooldowns: this.styleChangeTimers.size,
       systemLoaded: true,
     };
+  }
+
+  // ============================================================================
+  // AUTO-RETALIATE METHODS
+  // ============================================================================
+
+  /**
+   * Initialize auto-retaliate for a new player
+   */
+  private initializePlayerAutoRetaliate(
+    playerId: string,
+    enabled: boolean,
+  ): void {
+    this.playerAutoRetaliate.set(playerId, enabled);
+
+    // Notify UI of initial state
+    this.emitTypedEvent(EventType.UI_AUTO_RETALIATE_CHANGED, {
+      playerId,
+      enabled,
+    });
+  }
+
+  /**
+   * Handle toggle request with validation and rate limiting
+   *
+   * Security: Server validates before applying (server authority)
+   * OWASP: Input validation + rate limiting
+   */
+  private handleAutoRetaliateToggle(data: {
+    playerId: string;
+    enabled: boolean;
+  }): void {
+    const { playerId, enabled } = data;
+
+    // === INPUT VALIDATION (OWASP) ===
+    // 1. Validate playerId exists in our system
+    if (!this.playerAutoRetaliate.has(playerId)) {
+      this.logger.warn(
+        `Auto-retaliate toggle rejected: unknown player ${playerId}`,
+      );
+      return;
+    }
+
+    // 2. Validate enabled is actually a boolean (prevent type coercion attacks)
+    if (typeof enabled !== "boolean") {
+      this.logger.warn(
+        `Auto-retaliate toggle rejected: invalid enabled type for ${playerId}`,
+      );
+      return;
+    }
+
+    // === RATE LIMITING (Anti-Spam) ===
+    const now = Date.now();
+    const lastToggle = this.autoRetaliateLastToggle.get(playerId) ?? 0;
+    if (now - lastToggle < this.AUTO_RETALIATE_COOLDOWN_MS) {
+      // Silent ignore - don't spam logs for rate limited requests
+      return;
+    }
+    this.autoRetaliateLastToggle.set(playerId, now);
+
+    // === APPLY CHANGE (Server Authority) ===
+    const oldValue = this.playerAutoRetaliate.get(playerId);
+    if (oldValue === enabled) {
+      // No change needed - avoid unnecessary DB writes
+      return;
+    }
+
+    this.playerAutoRetaliate.set(playerId, enabled);
+
+    // Persist to database (server-side only)
+    if (this.world.isServer && this.databaseSystem) {
+      const databaseId = PlayerIdMapper.getDatabaseId(playerId);
+      this.databaseSystem.savePlayer(databaseId, {
+        autoRetaliate: enabled ? 1 : 0,
+      });
+    }
+
+    // Notify UI (broadcasts to client)
+    this.emitTypedEvent(EventType.UI_AUTO_RETALIATE_CHANGED, {
+      playerId,
+      enabled,
+    });
+
+    // Chat message feedback
+    this.emitTypedEvent(EventType.UI_MESSAGE, {
+      playerId,
+      message: `Auto retaliate: ${enabled ? "ON" : "OFF"}`,
+      type: "info",
+    });
+  }
+
+  /**
+   * Handle get request for auto-retaliate state
+   */
+  private handleGetAutoRetaliate(data: {
+    playerId: string;
+    callback?: (enabled: boolean) => void;
+  }): void {
+    // First try server-side Map (populated during enterWorld on server)
+    let enabled = this.playerAutoRetaliate.get(data.playerId);
+
+    // Client-side fallback: read from PlayerLocal.combat.autoRetaliate
+    // The client's Map is not populated, but PlayerLocal has the correct value from entity data
+    if (enabled === undefined && !this.world.isServer) {
+      const localPlayer = this.world.entities?.player;
+      if (localPlayer && localPlayer.id === data.playerId) {
+        // Access combat.autoRetaliate from PlayerLocal
+        const combat = (localPlayer as { combat?: { autoRetaliate?: boolean } })
+          .combat;
+        enabled = combat?.autoRetaliate ?? true;
+      }
+    }
+
+    // Final fallback: default to true (OSRS behavior)
+    enabled = enabled ?? true;
+
+    if (data.callback) {
+      data.callback(enabled);
+    } else {
+      this.emitTypedEvent(EventType.UI_AUTO_RETALIATE_CHANGED, {
+        playerId: data.playerId,
+        enabled,
+      });
+    }
+  }
+
+  /**
+   * Public API for CombatSystem to check auto-retaliate
+   *
+   * Performance: O(1) Map lookup, no allocations
+   * Called in combat hot path - must be fast
+   */
+  getPlayerAutoRetaliate(playerId: string): boolean {
+    return this.playerAutoRetaliate.get(playerId) ?? true;
   }
 
   private handleSkillsUpdate(data: { playerId: string; skills: Skills }): void {

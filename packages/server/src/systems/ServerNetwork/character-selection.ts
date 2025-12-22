@@ -564,8 +564,9 @@ export async function handleEnterWorld(
     ? ([...spawn.quaternion] as [number, number, number, number])
     : [0, 0, 0, 1];
 
-  // Load full character data from DB (position AND skills)
+  // Load full character data from DB (position, skills, AND combat preferences)
   let savedSkills: Record<string, { level: number; xp: number }> | undefined;
+  let savedAutoRetaliate = true; // Default ON (OSRS behavior)
   if (characterId && accountId) {
     try {
       const databaseSystem = world.getSystem("database") as
@@ -621,6 +622,10 @@ export async function handleEnterWorld(
               xp: savedData.cookingXp || 0,
             },
           };
+          // Load auto-retaliate preference (1=ON, 0=OFF, default ON)
+          savedAutoRetaliate =
+            ((savedData as { autoRetaliate?: number }).autoRetaliate ?? 1) ===
+            1;
         }
       }
     } catch {}
@@ -668,6 +673,8 @@ export async function handleEnterWorld(
         roles,
         // CRITICAL: Pass loaded skills so PlayerEntity constructor uses them instead of defaults
         skills: savedSkills,
+        // Combat preference: auto-retaliate (loaded from DB, defaults to ON)
+        autoRetaliate: savedAutoRetaliate,
         // Player loading state - immune to aggro/combat until client sends clientReady
         isLoading: true,
       })

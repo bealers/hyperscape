@@ -1037,6 +1037,36 @@ function setupAPI(world: World, systems: Systems): void {
         world.emit(EventType.UI_ATTACK_STYLE_GET, { playerId, callback });
       },
 
+      // Auto-retaliate actions
+      setAutoRetaliate: (playerId: string, enabled: boolean) => {
+        // On client, send packet to server
+        if (world.isClient && world.network) {
+          (
+            world.network as {
+              send?: (method: string, data: unknown) => void;
+            }
+          ).send?.("setAutoRetaliate", {
+            playerId,
+            enabled,
+          });
+        }
+
+        // On server, emit the event locally (server will validate and apply)
+        if (world.isServer) {
+          world.emit(EventType.UI_AUTO_RETALIATE_UPDATE, {
+            playerId,
+            enabled,
+          });
+        }
+      },
+
+      getAutoRetaliate: (
+        playerId: string,
+        callback: (enabled: boolean) => void,
+      ) => {
+        world.emit(EventType.UI_AUTO_RETALIATE_GET, { playerId, callback });
+      },
+
       // Player spawn actions
       respawnPlayerWithStarter: (playerId: string) => {
         world.emit(EventType.PLAYER_SPAWN_COMPLETE, { playerId });

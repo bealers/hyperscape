@@ -114,6 +114,7 @@ export interface MobEntityData {
   attack: number; // Attack level for accuracy
   attackPower: number; // Strength-based, for max hit
   defense: number;
+  defenseBonus: number; // Equipment/armor defense bonus
   attackSpeedTicks: number; // Game ticks between attacks (1 tick = 600ms)
   xpReward: number;
   aiState: "idle" | "wander" | "chase" | "attack" | "return" | "dead";
@@ -242,6 +243,7 @@ export interface NPCStats {
   attack: number;
   strength: number;
   defense: number;
+  defenseBonus?: number; // Equipment/armor defense bonus (optional for backwards compatibility)
   ranged: number;
   magic: number;
 }
@@ -414,6 +416,7 @@ export interface MobStats {
   attack: number;
   strength: number;
   defense: number;
+  defenseBonus: number; // Equipment/armor defense bonus (0 = unarmored, higher = more armored)
   ranged: number;
 }
 
@@ -529,6 +532,7 @@ export interface MobInstance {
     attack: number;
     strength: number;
     defense: number;
+    defenseBonus: number; // Equipment/armor defense bonus
     ranged: number;
   };
 
@@ -572,6 +576,7 @@ export interface MobSpawnConfig {
     attack: number;
     strength: number;
     defense: number;
+    defenseBonus?: number; // Equipment/armor defense bonus
     ranged: number;
   };
   behavior?: MobBehavior;

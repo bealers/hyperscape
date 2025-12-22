@@ -17,6 +17,7 @@ interface CombatPanelProps {
 // Client-side cache for combat style state (persists across panel opens/closes)
 // This enables instant display when reopening panel (RuneScape pattern)
 const combatStyleCache = new Map<string, string>();
+const autoRetaliateCache = new Map<string, boolean>();
 
 export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
   // Initialize from cache if available, otherwise default to "accurate"
@@ -30,6 +31,22 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
   const [cooldown, setCooldown] = useState<number>(0);
   const [targetName, setTargetName] = useState<string | null>(null);
   const [targetHealth, setTargetHealth] = useState<PlayerHealth | null>(null);
+  // Auto-retaliate state (OSRS default is ON)
+  const [autoRetaliate, setAutoRetaliate] = useState<boolean>(() => {
+    const player = world.entities?.player;
+    const playerId = player?.id;
+    // First check cache (for instant display on panel reopen)
+    if (playerId && autoRetaliateCache.has(playerId)) {
+      return autoRetaliateCache.get(playerId)!;
+    }
+    // Read directly from player entity (set from server data during entity creation)
+    const playerCombat = (player as { combat?: { autoRetaliate?: boolean } })
+      ?.combat;
+    if (typeof playerCombat?.autoRetaliate === "boolean") {
+      return playerCombat.autoRetaliate;
+    }
+    return true; // OSRS default: ON
+  });
 
   // Debug logging for style changes
   useEffect(() => {
@@ -64,6 +81,8 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
           cb: (info: { style: string; cooldown?: number }) => void,
         ) => void;
         changeAttackStyle?: (id: string, style: string) => void;
+        getAutoRetaliate?: (id: string, cb: (enabled: boolean) => void) => void;
+        setAutoRetaliate?: (id: string, enabled: boolean) => void;
       };
     } | null;
 
@@ -83,6 +102,25 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
         }
       },
     );
+
+    // Initialize auto-retaliate state from server
+    actions?.actionMethods?.getAutoRetaliate?.(playerId, (enabled: boolean) => {
+      console.log("[CombatPanel] getAutoRetaliate callback received:", enabled);
+      autoRetaliateCache.set(playerId, enabled);
+      setAutoRetaliate(enabled);
+    });
+
+    // Direct fallback: read from player entity if callback doesn't fire
+    // This ensures we get the correct value even if the event system has issues
+    const player = world.entities?.player;
+    if (player) {
+      const playerCombat = (player as { combat?: { autoRetaliate?: boolean } })
+        ?.combat;
+      if (typeof playerCombat?.autoRetaliate === "boolean") {
+        autoRetaliateCache.set(playerId, playerCombat.autoRetaliate);
+        setAutoRetaliate(playerCombat.autoRetaliate);
+      }
+    }
 
     const onUpdate = (data: unknown) => {
       console.log("[CombatPanel] onUpdate event received:", data);
@@ -136,8 +174,22 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       }
     };
 
+    // Listen for auto-retaliate changes from server
+    const onAutoRetaliateChanged = (data: unknown) => {
+      const d = data as { playerId: string; enabled: boolean };
+      if (d.playerId !== playerId) return;
+      console.log("[CombatPanel] Auto-retaliate changed:", d.enabled);
+      autoRetaliateCache.set(playerId, d.enabled);
+      setAutoRetaliate(d.enabled);
+    };
+
     world.on(EventType.UI_ATTACK_STYLE_UPDATE, onUpdate, undefined);
     world.on(EventType.UI_ATTACK_STYLE_CHANGED, onChanged, undefined);
+    world.on(
+      EventType.UI_AUTO_RETALIATE_CHANGED,
+      onAutoRetaliateChanged,
+      undefined,
+    );
     world.on(EventType.UI_COMBAT_TARGET_CHANGED, onTargetChanged, undefined);
     world.on(
       EventType.UI_COMBAT_TARGET_HEALTH,
@@ -155,6 +207,12 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       world.off(
         EventType.UI_ATTACK_STYLE_CHANGED,
         onChanged,
+        undefined,
+        undefined,
+      );
+      world.off(
+        EventType.UI_AUTO_RETALIATE_CHANGED,
+        onAutoRetaliateChanged,
         undefined,
         undefined,
       );
@@ -199,6 +257,26 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       `[CombatPanel] Calling changeAttackStyle(${playerId}, ${next})`,
     );
     actions.actionMethods.changeAttackStyle(playerId, next);
+  };
+
+  const toggleAutoRetaliate = () => {
+    const playerId = world.entities?.player?.id;
+    if (!playerId) return;
+
+    const actions = world.getSystem("actions") as {
+      actionMethods?: {
+        setAutoRetaliate?: (id: string, enabled: boolean) => void;
+      };
+    } | null;
+
+    if (!actions?.actionMethods?.setAutoRetaliate) {
+      console.error("[CombatPanel] setAutoRetaliate action method not found!");
+      return;
+    }
+
+    const newValue = !autoRetaliate;
+    console.log(`[CombatPanel] Toggling auto-retaliate to: ${newValue}`);
+    actions.actionMethods.setAutoRetaliate(playerId, newValue);
   };
 
   // Melee-only MVP: Always show melee attack styles
@@ -378,6 +456,36 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
           Style change available in {Math.ceil(cooldown / 1000)}s
         </div>
       )}
+
+      {/* Auto Retaliate Toggle (OSRS-style) */}
+      <button
+        onClick={toggleAutoRetaliate}
+        className="mt-1 w-full rounded-md py-1.5 px-2 cursor-pointer transition-all text-[10px] hover:brightness-110 flex items-center justify-between"
+        style={{
+          backgroundColor: autoRetaliate
+            ? "rgba(34, 197, 94, 0.2)"
+            : "rgba(0, 0, 0, 0.35)",
+          borderWidth: "1px",
+          borderStyle: "solid",
+          borderColor: autoRetaliate
+            ? "rgba(34, 197, 94, 0.8)"
+            : "rgba(242, 208, 138, 0.3)",
+          color: autoRetaliate ? "#86efac" : "#d1d5db",
+        }}
+      >
+        <span className="font-semibold">Auto Retaliate</span>
+        <span
+          className="px-1.5 py-0.5 rounded text-[9px] font-bold"
+          style={{
+            backgroundColor: autoRetaliate
+              ? "rgba(34, 197, 94, 0.3)"
+              : "rgba(239, 68, 68, 0.3)",
+            color: autoRetaliate ? "#86efac" : "#fca5a5",
+          }}
+        >
+          {autoRetaliate ? "ON" : "OFF"}
+        </span>
+      </button>
     </div>
   );
 }

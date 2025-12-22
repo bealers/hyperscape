@@ -713,6 +713,7 @@ export class EntityManager extends SystemBase {
       attack: this.getMobAttack(mobType, level),
       attackPower: this.getMobAttackPower(mobType, level),
       defense: this.getMobDefense(mobType, level),
+      defenseBonus: this.getMobDefenseBonus(mobType),
       attackSpeedTicks: this.getMobAttackSpeedTicks(mobType),
       moveSpeed: this.getMobMoveSpeed(mobType),
       aggressive: npcDataFromDB?.combat.aggressive ?? true, // Default to aggressive if not specified
@@ -1001,6 +1002,14 @@ export class EntityManager extends SystemBase {
       return 2 + (level - 1);
     }
     return npcData.stats.defense + (level - npcData.stats.level);
+  }
+
+  private getMobDefenseBonus(mobType: string): number {
+    const npcData = getNPCById(mobType);
+    if (!npcData) {
+      return 0; // Default: no armor bonus
+    }
+    return npcData.stats.defenseBonus ?? 0;
   }
 
   private getMobAttackSpeedTicks(mobType: string): number {

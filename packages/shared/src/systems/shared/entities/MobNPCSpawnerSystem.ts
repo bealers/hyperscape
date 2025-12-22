@@ -323,6 +323,7 @@ export class MobNPCSpawnerSystem extends SystemBase {
       attack: mobData.stats.attack,
       attackPower: mobData.stats.strength,
       defense: mobData.stats.defense,
+      defenseBonus: mobData.stats.defenseBonus ?? 0,
       attackSpeedTicks: mobData.combat.attackSpeedTicks,
       moveSpeed: mobData.movement.speed,
       xpReward: mobData.combat.xpReward,

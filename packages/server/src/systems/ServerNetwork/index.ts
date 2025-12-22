@@ -85,7 +85,11 @@ import { InitializationManager } from "./initialization";
 import { ConnectionHandler } from "./connection-handler";
 import { InteractionSessionManager } from "./InteractionSessionManager";
 import { handleChatAdded } from "./handlers/chat";
-import { handleAttackMob, handleChangeAttackStyle } from "./handlers/combat";
+import {
+  handleAttackMob,
+  handleChangeAttackStyle,
+  handleSetAutoRetaliate,
+} from "./handlers/combat";
 import {
   handlePickupItem,
   handleDropItem,
@@ -504,6 +508,12 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       );
     });
 
+    // OSRS-accurate: Cancel pending attack when player clicks elsewhere
+    this.world.on(EventType.PENDING_ATTACK_CANCEL, (event) => {
+      const { playerId } = event as { playerId: string };
+      this.pendingAttackManager.cancelPendingAttack(playerId);
+    });
+
     // Save manager
     this.saveManager = new SaveManager(this.world, this.db);
 
@@ -698,6 +708,9 @@ export class ServerNetwork extends System implements NetworkWithSocket {
 
     this.handlers["onChangeAttackStyle"] = (socket, data) =>
       handleChangeAttackStyle(socket, data, this.world);
+
+    this.handlers["onSetAutoRetaliate"] = (socket, data) =>
+      handleSetAutoRetaliate(socket, data, this.world);
 
     this.handlers["onPickupItem"] = (socket, data) =>
       handlePickupItem(socket, data, this.world);

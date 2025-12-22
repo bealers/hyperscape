@@ -368,9 +368,15 @@ export class PlayerLocal extends Entity implements HotReloadable {
     combatStyle: "attack",
     inCombat: false,
     combatTarget: null,
+    autoRetaliate: true, // OSRS default: ON
   };
   // Issue #322: Store last combat-facing rotation to preserve facing direction after combat ends
   private _lastCombatRotation: THREE.Quaternion | null = null;
+
+  // Phase 5: Server-controlled face target (removes client-side attacker search)
+  // This is set by COMBAT_FACE_TARGET events from the server
+  // Client should NOT independently search for attackers
+  private _serverFaceTargetId: string | null = null;
   stats?: {
     attack: number;
     strength: number;
@@ -596,6 +602,13 @@ export class PlayerLocal extends Entity implements HotReloadable {
       max: maxHealth,
     };
     this.hyperscapePlayerId = data.id || "";
+
+    // Apply auto-retaliate setting from server if provided (persisted from DB)
+    const autoRetaliateFromData = (data as { autoRetaliate?: boolean })
+      .autoRetaliate;
+    if (typeof autoRetaliateFromData === "boolean") {
+      this.combat.autoRetaliate = autoRetaliateFromData;
+    }
 
     // Initialize emote to idle if not provided
     if (!this.emote && !data.e) {
@@ -1262,6 +1275,21 @@ export class PlayerLocal extends Entity implements HotReloadable {
     this.world.on(
       EventType.PLAYER_RESPAWNED,
       this.handlePlayerRespawned.bind(this),
+    );
+    this.world.on(
+      EventType.UI_AUTO_RETALIATE_CHANGED,
+      this.handleAutoRetaliateChanged.bind(this),
+    );
+
+    // Phase 5: Server-controlled combat visuals (client display-only)
+    // Client no longer searches for attackers - server tells us who to face
+    this.world.on(
+      EventType.COMBAT_FACE_TARGET,
+      this.handleCombatFaceTarget.bind(this),
+    );
+    this.world.on(
+      EventType.COMBAT_CLEAR_FACE_TARGET,
+      this.handleCombatClearFaceTarget.bind(this),
     );
 
     // Signal to UI that the world is ready
@@ -1931,7 +1959,8 @@ export class PlayerLocal extends Entity implements HotReloadable {
     }
 
     // COMBAT ROTATION: Rotate to face target when in combat (RuneScape-style)
-    // Priority: 1) Our combat target (from server), 2) Mob attacking us
+    // Phase 5: Client is display-only - server controls all combat facing
+    // Priority: 1) Our combat target (from server), 2) Server face target (attacker)
     let combatTarget: {
       position: { x: number; z: number };
       id: string;
@@ -1956,26 +1985,24 @@ export class PlayerLocal extends Entity implements HotReloadable {
       }
     }
 
-    // If no target from our combat state, check for mobs attacking us
-    if (!combatTarget) {
-      for (const entity of this.world.entities.items.values()) {
-        if (entity.type === "mob" && entity.position) {
-          const mobEntity = entity as any;
-          // Check if mob is in ATTACK state and targeting this player
-          if (
-            mobEntity.config?.aiState === "attack" &&
-            mobEntity.config?.targetPlayerId === this.id
-          ) {
-            const dx = entity.position.x - this.position.x;
-            const dz = entity.position.z - this.position.z;
-            const distance2D = Math.sqrt(dx * dx + dz * dz);
+    // Phase 5: Server-controlled face target (client is display-only)
+    // If no combat target, check if server told us to face an attacker
+    // This replaces the old client-side mob search loop
+    if (!combatTarget && this._serverFaceTargetId) {
+      const targetEntity = this.world.entities.items.get(
+        this._serverFaceTargetId,
+      );
+      if (targetEntity?.position) {
+        const dx = targetEntity.position.x - this.position.x;
+        const dz = targetEntity.position.z - this.position.z;
+        const distance2D = Math.sqrt(dx * dx + dz * dz);
 
-            // Only rotate if mob is within reasonable combat range
-            if (distance2D <= 3) {
-              combatTarget = { position: entity.position, id: entity.id };
-              break; // Only face one mob at a time
-            }
-          }
+        // Only rotate if target is within reasonable combat range
+        if (distance2D <= 10) {
+          combatTarget = {
+            position: targetEntity.position,
+            id: targetEntity.id,
+          };
         }
       }
     }
@@ -2297,6 +2324,53 @@ export class PlayerLocal extends Entity implements HotReloadable {
   }
 
   /**
+   * Handle UI_AUTO_RETALIATE_CHANGED event from server
+   * Updates local combat state for client-side facing behavior
+   */
+  handleAutoRetaliateChanged(event: {
+    playerId: string;
+    enabled: boolean;
+  }): void {
+    // Only handle events for this player
+    if (event.playerId !== this.data.id) return;
+
+    this.combat.autoRetaliate = event.enabled;
+  }
+
+  /**
+   * Handle COMBAT_FACE_TARGET event from server (Phase 5)
+   *
+   * Server tells client to face a specific entity during combat.
+   * This replaces client-side attacker search - client is now display-only.
+   *
+   * @param event.playerId - Player who should face the target
+   * @param event.targetId - Entity to face
+   */
+  handleCombatFaceTarget(eventData: unknown): void {
+    const event = eventData as { playerId: string; targetId: string };
+    // Only handle events for this player
+    if (event.playerId !== this.data.id) return;
+
+    this._serverFaceTargetId = event.targetId;
+  }
+
+  /**
+   * Handle COMBAT_CLEAR_FACE_TARGET event from server (Phase 5)
+   *
+   * Server tells client to stop facing a specific target.
+   * Called when combat ends or target dies.
+   *
+   * @param event.playerId - Player who should clear their face target
+   */
+  handleCombatClearFaceTarget(eventData: unknown): void {
+    const event = eventData as { playerId: string };
+    // Only handle events for this player
+    if (event.playerId !== this.data.id) return;
+
+    this._serverFaceTargetId = null;
+  }
+
+  /**
    * Handle PLAYER_SET_DEAD event from server
    * CRITICAL: This is the entry point to death flow - blocks all input and movement
    */
@@ -2480,6 +2554,16 @@ export class PlayerLocal extends Entity implements HotReloadable {
     this.world.off(EventType.PLAYER_TELEPORT_REQUEST, this.handleTeleport);
     this.world.off(EventType.PLAYER_SET_DEAD, this.handlePlayerSetDead);
     this.world.off(EventType.PLAYER_RESPAWNED, this.handlePlayerRespawned);
+    this.world.off(
+      EventType.UI_AUTO_RETALIATE_CHANGED,
+      this.handleAutoRetaliateChanged,
+    );
+    // Phase 5: Clean up server-controlled combat visual listeners
+    this.world.off(EventType.COMBAT_FACE_TARGET, this.handleCombatFaceTarget);
+    this.world.off(
+      EventType.COMBAT_CLEAR_FACE_TARGET,
+      this.handleCombatClearFaceTarget,
+    );
 
     // Clean up physics
     if (this.capsule && this.capsuleHandle) {

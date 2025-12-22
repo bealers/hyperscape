@@ -13,6 +13,8 @@
  */
 
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
+import type { IEntityOccupancy } from "./EntityOccupancyMap";
+import type { EntityID } from "../../../types/core/identifiers";
 
 /**
  * Core tile system constants
@@ -62,12 +64,32 @@ export interface TileFlags {
 /**
  * Convert world coordinates to tile coordinates
  * Uses floor to ensure consistent tile boundaries
+ *
+ * NOTE: This allocates a new object. For hot paths, use worldToTileInto().
  */
 export function worldToTile(worldX: number, worldZ: number): TileCoord {
   return {
     x: Math.floor(worldX / TILE_SIZE),
     z: Math.floor(worldZ / TILE_SIZE),
   };
+}
+
+/**
+ * Convert world coordinates to tile coordinates (zero-allocation)
+ *
+ * Writes to an existing TileCoord object to avoid GC pressure in hot paths.
+ *
+ * @param worldX - World X coordinate
+ * @param worldZ - World Z coordinate
+ * @param out - Pre-allocated TileCoord to write to
+ */
+export function worldToTileInto(
+  worldX: number,
+  worldZ: number,
+  out: TileCoord,
+): void {
+  out.x = Math.floor(worldX / TILE_SIZE);
+  out.z = Math.floor(worldZ / TILE_SIZE);
 }
 
 /**
@@ -445,6 +467,146 @@ export const TILE_DIRECTIONS = [
 ] as const;
 
 /**
+ * Cardinal directions only (N/E/S/W, no diagonals)
+ * OSRS uses all 4 cardinal directions for NPC step-out when on same tile
+ *
+ * @see https://osrs-docs.com/docs/mechanics/entity-collision/
+ */
+export const CARDINAL_DIRECTIONS = [
+  { x: 0, z: 1 }, // North
+  { x: 1, z: 0 }, // East
+  { x: 0, z: -1 }, // South
+  { x: -1, z: 0 }, // West
+] as const;
+
+/**
+ * Get cardinal-adjacent tiles (N/E/S/W only, no diagonals)
+ *
+ * @param tile - Center tile
+ * @returns Array of 4 cardinal-adjacent tiles
+ */
+export function getCardinalTiles(tile: TileCoord): TileCoord[] {
+  return CARDINAL_DIRECTIONS.map((dir) => ({
+    x: tile.x + dir.x,
+    z: tile.z + dir.z,
+  }));
+}
+
+/**
+ * Get a random cardinal-adjacent tile
+ * Used for OSRS-accurate NPC step-out when on same tile as target.
+ *
+ * OSRS behavior: "In RS, they pick a random cardinal direction (north, east,
+ * west, south) and try to move the NPC towards that by 1 tile."
+ *
+ * @param tile - Center tile
+ * @param rng - Random number generator (for deterministic behavior)
+ * @returns Random cardinal tile (N, E, S, or W)
+ *
+ * @see https://osrs-docs.com/docs/mechanics/entity-collision/
+ */
+export function getRandomCardinalTile(
+  tile: TileCoord,
+  rng: { nextInt: (max: number) => number },
+): TileCoord {
+  const direction = CARDINAL_DIRECTIONS[rng.nextInt(4)];
+  return {
+    x: tile.x + direction.x,
+    z: tile.z + direction.z,
+  };
+}
+
+// ============================================================================
+// PRE-ALLOCATED BUFFER FOR STEP-OUT (Zero-allocation)
+// ============================================================================
+
+/**
+ * Pre-allocated buffer for step-out tile selection.
+ * Avoids creating new arrays on each call.
+ */
+const _stepOutBuffer: TileCoord[] = [
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+];
+
+/**
+ * Find the best cardinal tile to step out to when on same tile as target.
+ *
+ * OSRS-accurate: When an NPC is on the same tile as its target, it must
+ * step out to a cardinal tile before it can attack. This function finds
+ * the first valid tile by:
+ * 1. Shuffling all 4 cardinal directions (maintains OSRS randomness)
+ * 2. Checking each for terrain walkability AND entity occupancy
+ * 3. Returning the first valid tile found
+ *
+ * This prevents the "thrashing" bug where random single-direction picking
+ * could repeatedly select blocked tiles while valid tiles exist.
+ *
+ * Memory: Uses pre-allocated buffer to avoid GC pressure in hot paths.
+ *
+ * @param currentTile - Mob's current tile (same as target)
+ * @param occupancy - Entity occupancy map for collision checking
+ * @param entityId - Mob's entity ID (excluded from occupancy check)
+ * @param isWalkable - Terrain walkability check function
+ * @param rng - RNG for shuffling directions (deterministic)
+ * @returns Best tile to step to, or null if all 4 cardinal tiles are blocked
+ *
+ * @see https://osrs-docs.com/docs/mechanics/entity-collision/
+ */
+export function getBestStepOutTile(
+  currentTile: TileCoord,
+  occupancy: IEntityOccupancy,
+  entityId: EntityID,
+  isWalkable: (tile: TileCoord) => boolean,
+  rng: { nextInt: (max: number) => number },
+): TileCoord | null {
+  // Populate buffer with cardinal tiles
+  // South
+  _stepOutBuffer[0].x = currentTile.x;
+  _stepOutBuffer[0].z = currentTile.z - 1;
+  // North
+  _stepOutBuffer[1].x = currentTile.x;
+  _stepOutBuffer[1].z = currentTile.z + 1;
+  // West
+  _stepOutBuffer[2].x = currentTile.x - 1;
+  _stepOutBuffer[2].z = currentTile.z;
+  // East
+  _stepOutBuffer[3].x = currentTile.x + 1;
+  _stepOutBuffer[3].z = currentTile.z;
+
+  // Fisher-Yates shuffle for random order (OSRS-style randomness)
+  for (let i = 3; i > 0; i--) {
+    const j = rng.nextInt(i + 1);
+    // Swap values (not references, to keep buffer intact)
+    const tempX = _stepOutBuffer[i].x;
+    const tempZ = _stepOutBuffer[i].z;
+    _stepOutBuffer[i].x = _stepOutBuffer[j].x;
+    _stepOutBuffer[i].z = _stepOutBuffer[j].z;
+    _stepOutBuffer[j].x = tempX;
+    _stepOutBuffer[j].z = tempZ;
+  }
+
+  // Find first valid tile
+  for (let i = 0; i < 4; i++) {
+    const tile = _stepOutBuffer[i];
+
+    // Check terrain walkability first (cheaper check)
+    if (!isWalkable(tile)) continue;
+
+    // Check entity occupancy (exclude self)
+    if (occupancy.isBlocked(tile, entityId)) continue;
+
+    // Found a valid tile - return a copy (buffer will be reused)
+    return { x: tile.x, z: tile.z };
+  }
+
+  // All tiles blocked
+  return null;
+}
+
+/**
  * Check if a direction is diagonal
  */
 export function isDiagonal(dx: number, dz: number): boolean {
@@ -495,4 +657,177 @@ export function createTileMovementState(
     isRunning: false,
     moveSeq: 0,
   };
+}
+
+// ============================================================================
+// OCCUPANCY-AWARE TILE FUNCTIONS (Zero-Allocation)
+// ============================================================================
+
+/** Pre-allocated buffer for cardinal melee tiles (range 1) */
+const _cardinalMeleeTiles: TileCoord[] = [
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+  { x: 0, z: 0 },
+];
+
+/** Pre-allocated buffer for extended melee tiles (range 2+, max 5x5 = 24 tiles) */
+const _extendedMeleeTiles: TileCoord[] = Array.from({ length: 24 }, () => ({
+  x: 0,
+  z: 0,
+}));
+
+/**
+ * Get cardinal melee tiles (range 1) into pre-allocated buffer
+ *
+ * OSRS melee range 1: Cardinal only (N/S/E/W) - no diagonal attacks
+ * Uses zero-allocation by writing to provided buffer.
+ *
+ * @param targetTile - Target's tile position
+ * @param buffer - Pre-allocated buffer to fill (must have length >= 4)
+ * @returns 4 (always 4 cardinal tiles)
+ */
+export function getCardinalMeleeTilesInto(
+  targetTile: TileCoord,
+  buffer: TileCoord[],
+): number {
+  buffer[0].x = targetTile.x;
+  buffer[0].z = targetTile.z - 1; // South
+  buffer[1].x = targetTile.x;
+  buffer[1].z = targetTile.z + 1; // North
+  buffer[2].x = targetTile.x - 1;
+  buffer[2].z = targetTile.z; // West
+  buffer[3].x = targetTile.x + 1;
+  buffer[3].z = targetTile.z; // East
+  return 4;
+}
+
+/**
+ * Get extended melee tiles (range 2+) into pre-allocated buffer
+ *
+ * For halberd/spear range 2+ weapons that can attack diagonally.
+ * Uses Chebyshev distance - all tiles within range.
+ *
+ * @param targetTile - Target's tile position
+ * @param range - Attack range (2+)
+ * @param buffer - Pre-allocated buffer to fill
+ * @returns Number of tiles filled
+ */
+export function getExtendedMeleeTilesInto(
+  targetTile: TileCoord,
+  range: number,
+  buffer: TileCoord[],
+): number {
+  let index = 0;
+
+  for (let dx = -range; dx <= range && index < buffer.length; dx++) {
+    for (let dz = -range; dz <= range && index < buffer.length; dz++) {
+      // Skip target tile itself
+      if (dx === 0 && dz === 0) continue;
+
+      // Check if within Chebyshev distance
+      if (Math.max(Math.abs(dx), Math.abs(dz)) <= range) {
+        buffer[index].x = targetTile.x + dx;
+        buffer[index].z = targetTile.z + dz;
+        index++;
+      }
+    }
+  }
+
+  return index;
+}
+
+/**
+ * Find best unoccupied combat tile for melee attack (zero-allocation)
+ *
+ * OSRS-accurate: Cardinal tiles only for range 1, diagonal allowed for range 2+.
+ * Checks both terrain walkability AND entity occupancy.
+ *
+ * Uses internal pre-allocated buffers - DO NOT store returned tile reference
+ * beyond the current call frame.
+ *
+ * @param attackerTile - Attacker's current tile
+ * @param targetTile - Target's tile
+ * @param occupancy - Entity occupancy map
+ * @param attackerId - Attacker's ID (excluded from collision check)
+ * @param isWalkable - Function to check terrain walkability
+ * @param range - Attack range (default 1)
+ * @returns Best tile reference (internal buffer) or null if all blocked
+ *
+ * @see NPC_ENTITY_COLLISION_PLAN.md Phase 4
+ */
+export function getBestUnoccupiedMeleeTile(
+  attackerTile: TileCoord,
+  targetTile: TileCoord,
+  occupancy: IEntityOccupancy,
+  attackerId: EntityID,
+  isWalkable: (tile: TileCoord) => boolean,
+  range: number = 1,
+): TileCoord | null {
+  // Get candidate tiles based on range
+  const buffer =
+    range === COMBAT_CONSTANTS.MELEE_RANGE_STANDARD
+      ? _cardinalMeleeTiles
+      : _extendedMeleeTiles;
+  const tileCount =
+    range === COMBAT_CONSTANTS.MELEE_RANGE_STANDARD
+      ? getCardinalMeleeTilesInto(targetTile, buffer)
+      : getExtendedMeleeTilesInto(targetTile, range, buffer);
+
+  // Calculate distances and find best unoccupied tile
+  let bestTile: TileCoord | null = null;
+  let bestDistance = Infinity;
+
+  for (let i = 0; i < tileCount; i++) {
+    const tile = buffer[i];
+
+    // Skip if blocked by another entity (excludes self)
+    if (occupancy.isBlocked(tile, attackerId)) continue;
+
+    // Skip if terrain is unwalkable
+    if (!isWalkable(tile)) continue;
+
+    // Calculate Chebyshev distance from attacker to this tile
+    const distance = Math.max(
+      Math.abs(attackerTile.x - tile.x),
+      Math.abs(attackerTile.z - tile.z),
+    );
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestTile = tile;
+    }
+  }
+
+  return bestTile;
+}
+
+/**
+ * Check if any cardinal tile around target is unoccupied (zero-allocation)
+ *
+ * Fast check to determine if any melee position is available.
+ * Used before committing to path calculation.
+ *
+ * @param targetTile - Target's tile position
+ * @param occupancy - Entity occupancy map
+ * @param excludeEntityId - Entity to exclude from collision check
+ * @param isWalkable - Function to check terrain walkability
+ * @returns true if at least one cardinal tile is available
+ */
+export function hasUnoccupiedCardinalTile(
+  targetTile: TileCoord,
+  occupancy: IEntityOccupancy,
+  excludeEntityId: EntityID,
+  isWalkable: (tile: TileCoord) => boolean,
+): boolean {
+  getCardinalMeleeTilesInto(targetTile, _cardinalMeleeTiles);
+
+  for (let i = 0; i < 4; i++) {
+    const tile = _cardinalMeleeTiles[i];
+    if (!occupancy.isBlocked(tile, excludeEntityId) && isWalkable(tile)) {
+      return true;
+    }
+  }
+
+  return false;
 }

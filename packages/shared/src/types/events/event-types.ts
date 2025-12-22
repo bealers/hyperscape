@@ -188,6 +188,16 @@ export enum EventType {
   COMBAT_KILL = "combat:kill",
   COMBAT_LEVEL_CHANGED = "combat:level:changed",
   COMBAT_FOLLOW_TARGET = "combat:follow_target",
+  COMBAT_PLAYER_DISENGAGE = "combat:player_disengage", // Player clicked away, cancel their attacking combat
+  PENDING_ATTACK_CANCEL = "combat:pending_attack_cancel", // Player clicked elsewhere, cancel pending attack
+
+  // Server-controlled combat visuals (Phase 5 - Client display-only)
+  // These events are sent from server to client to control combat visuals
+  // Client should NOT independently search for attackers or decide facing
+  COMBAT_FACE_TARGET = "combat:face_target", // Server tells client to face a specific entity
+  COMBAT_CLEAR_FACE_TARGET = "combat:clear_face_target", // Server tells client to stop facing target
+  COMBAT_PLAY_ANIMATION = "combat:play_animation", // Server tells client to play combat animation
+  COMBAT_SHOW_HITSPLAT = "combat:show_hitsplat", // Server tells client to display hitsplat
 
   // Aggro System
   AGGRO_PLAYER_LEFT = "aggro:player_left",
@@ -485,6 +495,9 @@ export enum EventType {
   UI_ATTACK_STYLE_GET = "ui:attack_style:get",
   UI_ATTACK_STYLE_UPDATE = "ui:attack_style:update",
   UI_ATTACK_STYLE_CHANGED = "ui:attack_style:changed",
+  UI_AUTO_RETALIATE_GET = "ui:auto_retaliate:get",
+  UI_AUTO_RETALIATE_UPDATE = "ui:auto_retaliate:update",
+  UI_AUTO_RETALIATE_CHANGED = "ui:auto_retaliate:changed",
   UI_MESSAGE = "ui:message",
   UI_REQUEST = "ui:request",
   UI_CONTEXT_ACTION = "ui:context_action",

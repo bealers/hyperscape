@@ -1,20 +1,5 @@
-/**
- * CombatAuditLog - Persistent combat event logging
- *
- * Records combat events for post-mortem analysis, exploit investigation,
- * and anti-cheat verification. Events are stored in memory with configurable
- * retention limits.
- *
- * Use Cases:
- * - Investigate reported exploits
- * - Verify anti-cheat alerts
- * - Post-mortem analysis of combat issues
- * - Debug combat system behavior
- */
+/** Records combat events for anti-cheat verification and debug */
 
-/**
- * Position interface for combat events
- */
 interface Position3D {
   x: number;
   y: number;

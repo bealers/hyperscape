@@ -66,6 +66,7 @@ export class MobNPCSystem extends SystemBase {
             attack: npcData.stats.attack,
             strength: npcData.stats.strength,
             defense: npcData.stats.defense,
+            defenseBonus: npcData.stats.defenseBonus ?? 0,
             ranged: npcData.stats.ranged,
           },
           equipment: {
@@ -276,6 +277,7 @@ export class MobNPCSystem extends SystemBase {
         attack: config.stats?.attack || 1,
         strength: config.stats?.strength || 1,
         defense: config.stats?.defense || 1,
+        defenseBonus: config.stats?.defenseBonus || 0,
         ranged: config.stats?.ranged || 1,
       },
       target: null,

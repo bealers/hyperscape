@@ -164,6 +164,13 @@ export class PlayerRepository extends BaseRepository {
     if (data.positionZ !== undefined) {
       updateData.positionZ = data.positionZ;
     }
+    // Combat preferences
+    if (data.autoRetaliate !== undefined) {
+      updateData.autoRetaliate = data.autoRetaliate;
+    }
+    if (data.attackStyle !== undefined) {
+      updateData.attackStyle = data.attackStyle;
+    }
 
     // If no update data provided, skip silently (character doesn't need updating)
     if (Object.keys(updateData).length === 0) {

@@ -42,7 +42,7 @@ function createTestPlayer(
     damageHistory: [],
   };
 
-  const position = options.position ?? { x: 0, y: 0, z: 0 };
+  const position = options.position ?? { x: 0.5, y: 0, z: 0.5 }; // Default cardinal position
   const stats = options.stats ?? { attack: 10, strength: 10, defence: 10 };
 
   return {
@@ -104,6 +104,10 @@ function createTestPlayer(
     },
     // For PvP tests
     isDead: () => healthTracker.current <= 0,
+    // Required for enterCombat dead player check (must be dynamic getter)
+    get alive() {
+      return healthTracker.current > 0;
+    },
   };
 }
 
@@ -127,7 +131,7 @@ function createTestMob(
     damageHistory: [],
   };
 
-  const position = options.position ?? { x: 1, y: 0, z: 1 };
+  const position = options.position ?? { x: 0.5, y: 0, z: 1.5 }; // Default cardinal north of player
   const stats = options.stats ?? { attack: 5, strength: 5, defence: 5 };
   const combatRange = options.combatRange ?? 1;
   const attackSpeedTicks =
@@ -240,6 +244,8 @@ function createTestWorld(options: { currentTick?: number } = {}) {
       },
     ),
     getPlayer: (id: string) => players.get(id),
+    // Critical: Return auto-retaliate setting (default true)
+    getPlayerAutoRetaliate: () => true,
   };
 
   return {
@@ -263,6 +269,12 @@ function createTestWorld(options: { currentTick?: number } = {}) {
     },
     getPlayer: (id: string) => players.get(id),
     getSystem: (name: string) => {
+      if (name === "entity-manager") {
+        // Required by CombatSystem.init()
+        return {
+          getEntity: (id: string) => entities.get(id) || players.get(id),
+        };
+      }
       if (name === "equipment") {
         return {
           getPlayerEquipment: () => ({ weapon: null }),
@@ -303,9 +315,11 @@ describe("CombatFlow Integration", () => {
   let combatSystem: CombatSystem;
   let world: ReturnType<typeof createTestWorld>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     world = createTestWorld({ currentTick: 100 });
     combatSystem = new CombatSystem(world as unknown as any);
+    // CRITICAL: Call init() to cache playerSystem for auto-retaliate checks
+    await combatSystem.init();
   });
 
   afterEach(() => {
@@ -314,15 +328,15 @@ describe("CombatFlow Integration", () => {
 
   describe("full player-vs-mob combat cycle", () => {
     it("completes combat from start to mob death", () => {
-      // Setup: Player near a low-health mob
+      // Setup: Player near a low-health mob (cardinal adjacent for OSRS melee)
       const player = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
         stats: { attack: 50, strength: 50, defence: 10 },
       });
       const mob = createTestMob("mob1", {
         health: 10, // Low health to ensure death
         maxHealth: 10,
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 }, // Cardinal north, not diagonal
         stats: { attack: 5, strength: 5, defence: 1 },
       });
 
@@ -357,13 +371,13 @@ describe("CombatFlow Integration", () => {
 
     it("tracks damage dealt throughout combat", () => {
       const player = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
         stats: { attack: 30, strength: 30, defence: 10 },
       });
       const mob = createTestMob("mob1", {
         health: 100,
         maxHealth: 100,
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
 
       world.players.set("player1", player);
@@ -396,11 +410,11 @@ describe("CombatFlow Integration", () => {
   describe("attack cooldowns across multiple ticks", () => {
     it("respects attack cooldown between attacks", () => {
       const player = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
       });
       const mob = createTestMob("mob1", {
         health: 200,
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
 
       world.players.set("player1", player);
@@ -537,7 +551,7 @@ describe("CombatFlow Integration", () => {
       });
       const mob = createTestMob("mob1", {
         health: 5, // Very low health
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
 
       world.players.set("player1", player);
@@ -651,16 +665,16 @@ describe("CombatFlow Integration", () => {
   describe("multiple concurrent combats", () => {
     it("handles multiple players fighting different mobs", () => {
       const player1 = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
       });
       const player2 = createTestPlayer("player2", {
-        position: { x: 10, y: 0, z: 10 },
+        position: { x: 10.5, y: 0, z: 10.5 },
       });
       const mob1 = createTestMob("mob1", {
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
       const mob2 = createTestMob("mob2", {
-        position: { x: 11, y: 0, z: 11 },
+        position: { x: 10.5, y: 0, z: 11.5 }, // Cardinal north from player2
       });
 
       world.players.set("player1", player1);
@@ -694,14 +708,14 @@ describe("CombatFlow Integration", () => {
 
     it("handles multiple players attacking same mob", () => {
       const player1 = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 }, // Cardinal south of mob
       });
       const player2 = createTestPlayer("player2", {
-        position: { x: 2, y: 0, z: 0 },
+        position: { x: 1.5, y: 0, z: 1.5 }, // Cardinal east of mob
       });
       const mob = createTestMob("mob1", {
         health: 200,
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
 
       world.players.set("player1", player1);
@@ -780,16 +794,16 @@ describe("CombatFlow Integration", () => {
 
     it("getAllCombatStates returns all active combats", () => {
       const player1 = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
       });
       const player2 = createTestPlayer("player2", {
-        position: { x: 10, y: 0, z: 10 },
+        position: { x: 10.5, y: 0, z: 10.5 },
       });
       const mob1 = createTestMob("mob1", {
-        position: { x: 1, y: 0, z: 1 },
+        position: { x: 0.5, y: 0, z: 1.5 },
       });
       const mob2 = createTestMob("mob2", {
-        position: { x: 11, y: 0, z: 11 },
+        position: { x: 10.5, y: 0, z: 11.5 }, // Cardinal north from player2
       });
 
       world.players.set("player1", player1);
@@ -815,7 +829,7 @@ describe("CombatFlow Integration", () => {
   describe("edge cases", () => {
     it("prevents combat when target is out of range", () => {
       const player = createTestPlayer("player1", {
-        position: { x: 0, y: 0, z: 0 },
+        position: { x: 0.5, y: 0, z: 0.5 },
       });
       const mob = createTestMob("mob1", {
         position: { x: 100, y: 0, z: 100 }, // Far away
@@ -939,6 +953,253 @@ describe("CombatFlow Integration", () => {
       expect(finalStats.quaternions.inUse).toBeLessThanOrEqual(
         initialQuaternions + 5,
       );
+    });
+  });
+
+  /**
+   * OSRS-accurate auto-retaliate target persistence tests
+   *
+   * @see https://oldschool.runescape.wiki/w/Auto_Retaliate
+   * @see AUTO_RETALIATE_FIX_PLAN.md
+   *
+   * In OSRS, auto-retaliate ONLY triggers when the player has NO current target.
+   * When player is already fighting an enemy, getting attacked by another enemy
+   * does NOT cause the player to switch targets.
+   */
+  describe("OSRS-accurate auto-retaliate target persistence", () => {
+    it("does NOT switch targets when attacked by second enemy while fighting", () => {
+      // Setup: Player with two mobs at different positions
+      const player = createTestPlayer("player1", {
+        position: { x: 0.5, y: 0, z: 0.5 },
+      });
+      const mob1 = createTestMob("mob1", {
+        health: 100,
+        position: { x: 0.5, y: 0, z: 1.5 }, // Cardinal north of player
+      });
+      const mob2 = createTestMob("mob2", {
+        health: 100,
+        position: { x: 1.5, y: 0, z: 0.5 }, // Cardinal east of player
+      });
+
+      world.players.set("player1", player);
+      world.mobs.set("mob1", mob1);
+      world.mobs.set("mob2", mob2);
+
+      // Act 1: Player attacks mob1
+      combatSystem.startCombat("player1", "mob1", {
+        attackerType: "player",
+        targetType: "mob",
+      });
+
+      // Verify player is targeting mob1
+      const initialState = combatSystem.getCombatData("player1");
+      expect(initialState?.targetId).toBe("mob1");
+
+      // Process a tick to establish combat
+      combatSystem.processCombatTick(world.currentTick);
+
+      // Act 2: mob2 attacks player while player is fighting mob1
+      // This simulates another enemy walking up and attacking
+      combatSystem.startCombat("mob2", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Assert: Player should STILL be targeting mob1, NOT mob2
+      // This is the OSRS-accurate behavior
+      const afterState = combatSystem.getCombatData("player1");
+      expect(afterState?.targetId).toBe("mob1");
+      expect(afterState?.targetId).not.toBe("mob2");
+    });
+
+    it("auto-retaliates to attacker when player has no current target", () => {
+      // Setup: Player is idle (not in combat)
+      const player = createTestPlayer("player1", {
+        position: { x: 0.5, y: 0, z: 0.5 },
+      });
+      const mob1 = createTestMob("mob1", {
+        health: 100,
+        position: { x: 0.5, y: 0, z: 1.5 },
+      });
+
+      world.players.set("player1", player);
+      world.mobs.set("mob1", mob1);
+
+      // Verify player is NOT in combat initially
+      expect(combatSystem.isInCombat("player1")).toBe(false);
+
+      // Act: mob1 attacks idle player
+      combatSystem.startCombat("mob1", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Assert: Player should now target mob1 (auto-retaliate triggered)
+      const combatData = combatSystem.getCombatData("player1");
+      expect(combatData).not.toBeNull();
+      expect(combatData?.targetId).toBe("mob1");
+      expect(combatData?.inCombat).toBe(true);
+    });
+
+    it("maintains target through multiple attacks from different enemies", () => {
+      // Setup: Player fighting mob1, mob2 and mob3 both attack
+      const player = createTestPlayer("player1", {
+        position: { x: 0.5, y: 0, z: 0.5 },
+      });
+      const mob1 = createTestMob("mob1", {
+        health: 100,
+        position: { x: 0.5, y: 0, z: 1.5 },
+      });
+      const mob2 = createTestMob("mob2", {
+        health: 100,
+        position: { x: 1.5, y: 0, z: 0.5 },
+      });
+      const mob3 = createTestMob("mob3", {
+        health: 100,
+        position: { x: -0.5, y: 0, z: 0.5 }, // Cardinal west of player
+      });
+
+      world.players.set("player1", player);
+      world.mobs.set("mob1", mob1);
+      world.mobs.set("mob2", mob2);
+      world.mobs.set("mob3", mob3);
+
+      // Player starts attacking mob1
+      combatSystem.startCombat("player1", "mob1", {
+        attackerType: "player",
+        targetType: "mob",
+      });
+
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
+
+      // mob2 attacks player
+      combatSystem.startCombat("mob2", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Still targeting mob1
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
+
+      // mob3 also attacks player
+      combatSystem.startCombat("mob3", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // STILL targeting mob1 - OSRS accurate
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
+
+      // Process some combat ticks
+      for (let i = 0; i < 5; i++) {
+        world.advanceTicks(COMBAT_CONSTANTS.DEFAULT_ATTACK_SPEED_TICKS);
+        combatSystem.processCombatTick(world.currentTick);
+      }
+
+      // After multiple attacks, still targeting mob1
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
+    });
+
+    it("switches to last attacker after current target dies", () => {
+      // Setup: Player attacking mob1, mob2 attacks player
+      const player = createTestPlayer("player1", {
+        position: { x: 0.5, y: 0, z: 0.5 },
+        stats: { attack: 99, strength: 99, defence: 10 }, // High damage to kill quickly
+      });
+      const mob1 = createTestMob("mob1", {
+        health: 5, // Very low health
+        position: { x: 0.5, y: 0, z: 1.5 },
+      });
+      const mob2 = createTestMob("mob2", {
+        health: 100,
+        position: { x: 1.5, y: 0, z: 0.5 },
+      });
+
+      world.players.set("player1", player);
+      world.mobs.set("mob1", mob1);
+      world.mobs.set("mob2", mob2);
+
+      // Player attacks mob1
+      combatSystem.startCombat("player1", "mob1", {
+        attackerType: "player",
+        targetType: "mob",
+      });
+
+      // mob2 attacks player (while player is fighting mob1)
+      combatSystem.startCombat("mob2", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Verify still targeting mob1
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
+
+      // Process ticks until mob1 dies
+      let maxIterations = 20;
+      while (!mob1.isDead() && maxIterations > 0) {
+        world.advanceTicks(COMBAT_CONSTANTS.DEFAULT_ATTACK_SPEED_TICKS);
+        combatSystem.processCombatTick(world.currentTick);
+        maxIterations--;
+      }
+
+      expect(mob1.isDead()).toBe(true);
+
+      // Force end combat with dead mob1 to clean up state
+      combatSystem.forceEndCombat("player1");
+
+      // Now have mob2 attack player again (simulating ongoing aggro)
+      combatSystem.startCombat("mob2", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Player should now auto-retaliate to mob2 (their current target is dead/gone)
+      const afterState = combatSystem.getCombatData("player1");
+      expect(afterState?.targetId).toBe("mob2");
+    });
+
+    it("extends combat timer when attacked while already fighting", () => {
+      // Setup: Player fighting mob1
+      const player = createTestPlayer("player1", {
+        position: { x: 0.5, y: 0, z: 0.5 },
+      });
+      const mob1 = createTestMob("mob1", {
+        health: 1000, // High health to not die
+        position: { x: 0.5, y: 0, z: 1.5 },
+      });
+      const mob2 = createTestMob("mob2", {
+        health: 100,
+        position: { x: 1.5, y: 0, z: 0.5 },
+      });
+
+      world.players.set("player1", player);
+      world.mobs.set("mob1", mob1);
+      world.mobs.set("mob2", mob2);
+
+      // Player attacks mob1
+      combatSystem.startCombat("player1", "mob1", {
+        attackerType: "player",
+        targetType: "mob",
+      });
+
+      // Advance almost to combat timeout
+      world.advanceTicks(COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS - 1);
+      combatSystem.processCombatTick(world.currentTick);
+
+      // mob2 attacks player - should extend combat timer
+      combatSystem.startCombat("mob2", "player1", {
+        attackerType: "mob",
+        targetType: "player",
+      });
+
+      // Advance a few more ticks (would have timed out without extension)
+      world.advanceTicks(3);
+      combatSystem.processCombatTick(world.currentTick);
+
+      // Player should still be in combat (timer was extended)
+      expect(combatSystem.isInCombat("player1")).toBe(true);
+      // And still targeting mob1
+      expect(combatSystem.getCombatData("player1")?.targetId).toBe("mob1");
     });
   });
 });

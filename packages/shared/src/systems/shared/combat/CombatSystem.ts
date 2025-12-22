@@ -5,28 +5,19 @@
 import { EventType } from "../../../types/events";
 import type { World } from "../../../core/World";
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
-import { AttackType, MobInstance } from "../../../types/core/core";
+import { AttackType } from "../../../types/core/core";
 import { EntityID } from "../../../types/core/identifiers";
 import { MobEntity } from "../../../entities/npc/MobEntity";
-import { MobAIState } from "../../../types/entities";
 import { Entity } from "../../../entities/Entity";
 import { PlayerSystem } from "..";
 import {
-  calculateDamage,
-  calculateDistance2D,
-  calculateDistance3D,
-  CombatStats,
-  isAttackOnCooldown,
   isAttackOnCooldownTicks,
   calculateRetaliationDelay,
-  attackSpeedSecondsToTicks,
-  attackSpeedMsToTicks,
 } from "../../../utils/game/CombatCalculations";
 import { createEntityID } from "../../../utils/IdentifierUtils";
 import { EntityManager } from "..";
 import { MobNPCSystem } from "..";
 import { SystemBase } from "..";
-import { Emotes } from "../../../data/playerEmotes";
 import { getItem } from "../../../data/items";
 import { tilesWithinMeleeRange } from "../movement/TileSystem";
 import { tilePool, PooledTile } from "../../../utils/pools/TilePool";
@@ -42,51 +33,37 @@ import { getEntityPosition } from "../../../utils/game/EntityPositionUtils";
 import { quaternionPool } from "../../../utils/pools/QuaternionPool";
 import { EntityIdValidator } from "./EntityIdValidator";
 import { CombatRateLimiter } from "./CombatRateLimiter";
+import { CombatEntityResolver } from "./CombatEntityResolver";
+import { DamageCalculator } from "./DamageCalculator";
+import {
+  EventStore,
+  GameEventType,
+  type GameStateInfo,
+  type EntitySnapshot,
+  type CombatSnapshot,
+} from "../EventStore";
+import {
+  getGameRngState,
+  type SeededRandomState,
+} from "../../../utils/SeededRandom";
+import {
+  DamageHandler,
+  PlayerDamageHandler,
+  MobDamageHandler,
+} from "./handlers";
+import { PidManager } from "./PidManager";
+import { getGameRng } from "../../../utils/SeededRandom";
+import {
+  isEntityDead,
+  getMobRetaliates,
+  getPendingAttacker,
+  clearPendingAttacker,
+  isPlayerDamageHandler,
+  isMobEntity,
+} from "../../../utils/typeGuards";
 
 // Re-export CombatData from CombatStateService for backwards compatibility
 export type { CombatData } from "./CombatStateService";
-
-/**
- * Interface for player entity properties accessed by CombatSystem
- * Uses abbreviated keys for network bandwidth efficiency:
- * - c = inCombat, ct = combatTarget, e = emote
- */
-interface CombatPlayerEntity {
-  id: string;
-  combat?: {
-    inCombat: boolean;
-    combatTarget: string | null;
-  };
-  data?: {
-    c?: boolean; // inCombat (abbreviated)
-    ct?: string | null; // combatTarget (abbreviated)
-    e?: string; // emote (abbreviated)
-    isLoading?: boolean;
-  };
-  emote?: string;
-  base?: {
-    quaternion: { set(x: number, y: number, z: number, w: number): void };
-  };
-  node?: {
-    quaternion: {
-      set(x: number, y: number, z: number, w: number): void;
-      copy(q: { x: number; y: number; z: number; w: number }): void;
-    };
-  };
-  position?: { x: number; y: number; z: number };
-  getPosition?: () => { x: number; y: number; z: number };
-  markNetworkDirty?: () => void;
-  health?: number;
-  name?: string;
-}
-
-/**
- * Interface for mob entity with optional setServerEmote method
- * Used for type-safe emote setting in combat
- */
-interface MobWithServerEmote {
-  setServerEmote?: (emote: string) => void;
-}
 
 /**
  * Attack data structure for validation and execution
@@ -114,18 +91,20 @@ export class CombatSystem extends SystemBase {
   private nextAttackTicks = new Map<EntityID, number>(); // Tick when entity can next attack
   private mobSystem?: MobNPCSystem;
   private entityManager?: EntityManager;
+  private playerSystem?: PlayerSystem; // Cached for auto-retaliate checks (hot path optimization)
 
-  // Modular services (Phase 5 extraction)
-  private stateService: CombatStateService;
+  // Public for GameTickProcessor access during tick processing
+  public readonly stateService: CombatStateService;
   private animationManager: CombatAnimationManager;
   private rotationManager: CombatRotationManager;
 
-  // Anti-cheat monitoring (Phase 6 - Game Studio Hardening)
-  private antiCheat: CombatAntiCheat;
-
-  // Input validation and rate limiting (Phase 6.5 - Security Hardening)
+  public readonly antiCheat: CombatAntiCheat;
   private entityIdValidator: EntityIdValidator;
   private rateLimiter: CombatRateLimiter;
+  public readonly eventStore: EventStore;
+  private entityResolver: CombatEntityResolver;
+  private damageCalculator: DamageCalculator;
+  private eventRecordingEnabled: boolean = true;
 
   // Equipment stats cache per player for damage calculations
   private playerEquipmentStats = new Map<
@@ -137,6 +116,14 @@ export class CombatSystem extends SystemBase {
   private readonly _attackerTile: PooledTile = tilePool.acquire();
   private readonly _targetTile: PooledTile = tilePool.acquire();
 
+  // Auto-retaliate disabled after 20 minutes of no input (OSRS behavior)
+  private lastInputTick = new Map<string, number>();
+
+  private damageHandlers: Map<"player" | "mob", DamageHandler>;
+
+  // Lower PID = higher priority when attacks occur on same tick
+  public readonly pidManager: PidManager;
+
   constructor(world: World) {
     super(world, {
       name: "combat",
@@ -147,17 +134,26 @@ export class CombatSystem extends SystemBase {
       autoCleanup: true,
     });
 
-    // Initialize modular services
     this.stateService = new CombatStateService(world);
     this.animationManager = new CombatAnimationManager(world);
     this.rotationManager = new CombatRotationManager(world);
-
-    // Initialize anti-cheat monitoring (Phase 6 - Game Studio Hardening)
     this.antiCheat = new CombatAntiCheat();
-
-    // Initialize input validation and rate limiting (Phase 6.5 - Security Hardening)
     this.entityIdValidator = new EntityIdValidator();
     this.rateLimiter = new CombatRateLimiter();
+    this.entityResolver = new CombatEntityResolver(world);
+    this.damageCalculator = new DamageCalculator(this.playerEquipmentStats);
+
+    this.eventStore = new EventStore({
+      snapshotInterval: 100,
+      maxEvents: 100000,
+      maxSnapshots: 10,
+    });
+
+    this.damageHandlers = new Map();
+    this.damageHandlers.set("player", new PlayerDamageHandler(world));
+    this.damageHandlers.set("mob", new MobDamageHandler(world));
+
+    this.pidManager = new PidManager(getGameRng());
   }
 
   async init(): Promise<void> {
@@ -171,6 +167,39 @@ export class CombatSystem extends SystemBase {
 
     // Get mob NPC system - optional but recommended
     this.mobSystem = this.world.getSystem<MobNPCSystem>("mob-npc");
+
+    // Configure entity resolver with entity manager and logger
+    this.entityResolver.setEntityManager(this.entityManager);
+    this.entityResolver.setLogger(this.logger);
+
+    // Cache PlayerSystem for auto-retaliate checks (hot path optimization)
+    // Optional dependency - combat still works without it (defaults to retaliate)
+    this.playerSystem = this.world.getSystem<PlayerSystem>("player");
+
+    // Cache PlayerSystem into PlayerDamageHandler for damage application
+    const playerHandler = this.damageHandlers.get("player");
+    if (isPlayerDamageHandler(playerHandler)) {
+      playerHandler.cachePlayerSystem(this.playerSystem ?? null);
+    }
+
+    // Listen for auto-retaliate toggle to start combat if toggled ON while being attacked
+    this.subscribe(
+      EventType.UI_AUTO_RETALIATE_CHANGED,
+      (data: { playerId: string; enabled: boolean }) => {
+        if (data.enabled) {
+          this.handleAutoRetaliateEnabled(data.playerId);
+        }
+      },
+    );
+
+    // OSRS-accurate: Player clicked to move = cancel their attacking combat
+    // In OSRS, clicking anywhere else cancels your current action including combat
+    this.subscribe(
+      EventType.COMBAT_PLAYER_DISENGAGE,
+      (data: { playerId: string }) => {
+        this.handlePlayerDisengage(data.playerId);
+      },
+    );
 
     // Set up event listeners - required for combat to function
     this.subscribe(
@@ -220,10 +249,14 @@ export class CombatSystem extends SystemBase {
       },
     );
 
-    // Listen for player disconnect to clean up combat state
-    // This prevents orphaned combat states when players disconnect mid-combat
+    this.subscribe(EventType.PLAYER_JOINED, (data: { playerId: string }) => {
+      const tickNumber = this.world.currentTick ?? 0;
+      this.pidManager.assignPid(data.playerId as EntityID, tickNumber);
+    });
+
     this.subscribe(EventType.PLAYER_LEFT, (data: { playerId: string }) => {
       this.cleanupPlayerDisconnect(data.playerId);
+      this.pidManager.removePid(data.playerId as EntityID);
     });
 
     // Listen for explicit combat stop requests (e.g., player clicking new target)
@@ -239,7 +272,7 @@ export class CombatSystem extends SystemBase {
       },
     );
 
-    // Issue #342: Listen for combat follow events to initiate player movement toward target
+    // Listen for combat follow events to initiate player movement toward target
     this.subscribe(
       EventType.COMBAT_FOLLOW_TARGET,
       (data: {
@@ -288,7 +321,6 @@ export class CombatSystem extends SystemBase {
     const { attackerId, targetId, attackerType } = data;
     const currentTick = this.world.currentTick;
 
-    // Phase 6.5: Input validation - reject malformed entity IDs
     if (!this.entityIdValidator.isValid(attackerId)) {
       const sanitized = this.entityIdValidator.sanitizeForLogging(attackerId);
       this.logger.warn("Invalid attacker ID rejected", {
@@ -313,7 +345,6 @@ export class CombatSystem extends SystemBase {
       return;
     }
 
-    // Phase 6.5: Rate limiting - prevent request flooding
     if (attackerType === "player") {
       const rateResult = this.rateLimiter.checkLimit(attackerId, currentTick);
       if (!rateResult.allowed) {
@@ -324,10 +355,6 @@ export class CombatSystem extends SystemBase {
         });
         return;
       }
-    }
-
-    // Anti-cheat: Track attack rate for players (Phase 6)
-    if (attackerType === "player") {
       this.antiCheat.trackAttack(attackerId, currentTick);
     }
 
@@ -368,8 +395,8 @@ export class CombatSystem extends SystemBase {
     const typedTargetId = createEntityID(targetId);
 
     // Get attacker and target entities
-    const attacker = this.getEntity(attackerId, attackerType);
-    const target = this.getEntity(targetId, targetType);
+    const attacker = this.entityResolver.resolve(attackerId, attackerType);
+    const target = this.entityResolver.resolve(targetId, targetType);
 
     // Check entities exist
     if (!attacker || !target) {
@@ -384,12 +411,12 @@ export class CombatSystem extends SystemBase {
     }
 
     // Check attacker is alive
-    if (!this.isEntityAlive(attacker, attackerType)) {
+    if (!this.entityResolver.isAlive(attacker, attackerType)) {
       return invalidResult;
     }
 
-    // Check target is alive (Issue #265)
-    if (!this.isEntityAlive(target, targetType)) {
+    // Check target is alive
+    if (!this.entityResolver.isAlive(target, targetType)) {
       if (attackerType === "player") {
         this.antiCheat.recordDeadTargetAttack(
           attackerId,
@@ -400,7 +427,7 @@ export class CombatSystem extends SystemBase {
       return invalidResult;
     }
 
-    // Check target not in loading protection (Issue #356)
+    // Check target not in loading protection
     if (targetType === "player" && target.data?.isLoading) {
       if (attackerType === "player") {
         this.antiCheat.recordViolation(
@@ -416,9 +443,8 @@ export class CombatSystem extends SystemBase {
     }
 
     // Check target is attackable (for mobs)
-    if (targetType === "mob") {
-      const mobEntity = target as MobEntity;
-      if (mobEntity.isAttackable && !mobEntity.isAttackable()) {
+    if (targetType === "mob" && isMobEntity(target)) {
+      if (typeof target.isAttackable === "function" && !target.isAttackable()) {
         this.emitTypedEvent(EventType.COMBAT_ATTACK_FAILED, {
           attackerId,
           targetId,
@@ -481,7 +507,10 @@ export class CombatSystem extends SystemBase {
     // Use pre-allocated pooled tiles (zero GC)
     tilePool.setFromPosition(this._attackerTile, attackerPos);
     tilePool.setFromPosition(this._targetTile, targetPos);
-    const combatRangeTiles = this.getEntityCombatRange(attacker, attackerType);
+    const combatRangeTiles = this.entityResolver.getCombatRange(
+      attacker,
+      attackerType,
+    );
 
     // OSRS-accurate melee range check:
     // - Range 1: Cardinal only (N/S/E/W)
@@ -505,6 +534,7 @@ export class CombatSystem extends SystemBase {
           currentTick,
         );
       }
+
       this.emitTypedEvent(EventType.COMBAT_ATTACK_FAILED, {
         attackerId: data.attackerId,
         targetId: data.targetId,
@@ -542,7 +572,7 @@ export class CombatSystem extends SystemBase {
 
     // Get attack speed
     const entityType = attacker.type === "mob" ? "mob" : "player";
-    const attackSpeedTicks = this.getAttackSpeedTicks(
+    const attackSpeedTicks = this.entityResolver.getAttackSpeed(
       typedAttackerId,
       entityType,
     );
@@ -555,7 +585,7 @@ export class CombatSystem extends SystemBase {
       targetType,
     );
 
-    // Play attack animation (Issue #340: pass attack speed for proper animation duration)
+    // Play attack animation with attack speed for proper animation duration
     this.animationManager.setCombatEmote(
       attackerId,
       attackerType,
@@ -565,7 +595,7 @@ export class CombatSystem extends SystemBase {
 
     // Calculate and apply damage
     const rawDamage = this.calculateMeleeDamage(attacker, target);
-    const currentHealth = this.getEntityHealth(target);
+    const currentHealth = this.entityResolver.getHealth(target);
     const damage = Math.min(rawDamage, currentHealth);
 
     this.applyDamage(targetId, targetType, damage, attackerId);
@@ -580,8 +610,8 @@ export class CombatSystem extends SystemBase {
       position: targetPosition,
     });
 
-    // Check if target died - skip remaining logic if so (Issue #265)
-    if (!this.isEntityAlive(target, targetType)) {
+    // Check if target died - skip remaining logic if so
+    if (!this.entityResolver.isAlive(target, targetType)) {
       return;
     }
 
@@ -603,8 +633,96 @@ export class CombatSystem extends SystemBase {
   }
 
   /**
-   * Issue #342: Handle combat follow - move player toward target when out of melee range
-   * This allows combat to continue when the target moves instead of timing out
+   * Handle auto-retaliate being toggled ON while being attacked
+   * OSRS behavior: Player should start fighting back immediately
+   *
+   * Supports both PvE (mob attacker) and PvP (player attacker) scenarios.
+   */
+  private handleAutoRetaliateEnabled(playerId: string): void {
+    const playerEntity = this.world.getPlayer?.(playerId);
+    if (!playerEntity) return;
+
+    // Use type guard to get pending attacker ID
+    const pendingAttacker = getPendingAttacker(playerEntity);
+    if (!pendingAttacker) return;
+
+    // Detect attacker type dynamically - supports both PvP and PvE
+    // This fixes the bug where PvP retaliation failed because we assumed "mob"
+    const attackerType = this.entityResolver.resolveType(pendingAttacker);
+    const attackerEntity = this.entityResolver.resolve(
+      pendingAttacker,
+      attackerType,
+    );
+
+    if (
+      !attackerEntity ||
+      !this.entityResolver.isAlive(attackerEntity, attackerType)
+    ) {
+      // Attacker gone - clear pending attacker state using type guard
+      clearPendingAttacker(playerEntity);
+      return;
+    }
+
+    // Start combat! Player now retaliates against the attacker
+    const attackSpeedTicks = this.entityResolver.getAttackSpeed(
+      createEntityID(playerId),
+      "player",
+    );
+
+    // enterCombat() detects entity types internally
+    this.enterCombat(
+      createEntityID(playerId),
+      createEntityID(pendingAttacker),
+      attackSpeedTicks,
+    );
+
+    // Clear pending attacker since we're now actively fighting
+    clearPendingAttacker(playerEntity);
+
+    // Clear server face target since player now has a combat target
+    this.emitTypedEvent(EventType.COMBAT_CLEAR_FACE_TARGET, {
+      playerId: playerId,
+    });
+
+    // Face the target and start combat animation
+    this.rotationManager.rotateTowardsTarget(
+      playerId,
+      pendingAttacker,
+      "player",
+      attackerType, // Was hardcoded "mob" - now supports PvP
+    );
+  }
+
+  /**
+   * OSRS-accurate: Handle player clicking to move (disengage from combat)
+   * In OSRS, clicking anywhere else cancels your current action including combat.
+   * This allows players to walk away from fights regardless of auto-retaliate setting.
+   */
+  private handlePlayerDisengage(playerId: string): void {
+    // Check if player is currently attacking something
+    const combatState = this.stateService.getCombatData(playerId);
+    if (!combatState || combatState.attackerType !== "player") {
+      return; // Not in combat as an attacker, nothing to cancel
+    }
+
+    const targetId = String(combatState.targetId);
+
+    // End the player's attacking combat state
+    this.forceEndCombat(playerId);
+
+    // Mark player as "in combat without target" - the mob is still attacking them
+    // This keeps the combat timer active but player won't auto-attack
+    // If auto-retaliate is ON and mob catches up and hits, player will start fighting again
+    this.stateService.markInCombatWithoutTarget(playerId, targetId);
+
+    // OSRS-ACCURATE: Do NOT face the mob when walking away
+    // Player should face their walking direction (handled by tile movement)
+    // Only face mob when auto-retaliate triggers (handled by enterCombat)
+  }
+
+  /**
+   * Handle combat follow - move player toward target when out of melee range.
+   * This allows combat to continue when the target moves instead of timing out.
    *
    * NOTE: Actual movement is handled by ServerNetwork listening for COMBAT_FOLLOW_TARGET event.
    * This handler validates that combat is still active before the server initiates movement.
@@ -629,114 +747,7 @@ export class CombatSystem extends SystemBase {
     attacker: Entity | MobEntity,
     target: Entity | MobEntity,
   ): number {
-    // Extract required properties for damage calculation
-    let attackerData: {
-      stats?: CombatStats;
-      config?: { attackPower?: number };
-    } = {};
-    let targetData: { stats?: CombatStats; config?: { defense?: number } } = {};
-
-    // Strong type assumption - check if attacker has getMobData method (MobEntity)
-    const attackerMob = attacker as MobEntity;
-    if (attackerMob.getMobData) {
-      const mobData = attackerMob.getMobData();
-      attackerData = {
-        stats: { attack: mobData.attack }, // Pass attack stat for accuracy calculation
-        config: { attackPower: mobData.attackPower },
-      };
-    } else {
-      // Handle player or other Entity - get stats from components
-      const statsComponent = attacker.getComponent("stats");
-      if (statsComponent?.data) {
-        // Extract .level from SkillData objects for combat calculations
-        const stats = statsComponent.data as {
-          attack?: { level: number } | number;
-          strength?: { level: number } | number;
-          defense?: { level: number } | number;
-          ranged?: { level: number } | number;
-        };
-        attackerData = {
-          stats: {
-            attack:
-              typeof stats.attack === "object"
-                ? stats.attack.level
-                : (stats.attack ?? 1),
-            strength:
-              typeof stats.strength === "object"
-                ? stats.strength.level
-                : (stats.strength ?? 1),
-            defense:
-              typeof stats.defense === "object"
-                ? stats.defense.level
-                : (stats.defense ?? 1),
-            ranged:
-              typeof stats.ranged === "object"
-                ? stats.ranged.level
-                : (stats.ranged ?? 1),
-          },
-        };
-      }
-    }
-
-    // Strong type assumption - check if target has getMobData method (MobEntity)
-    const targetMob = target as MobEntity;
-    if (targetMob.getMobData) {
-      const mobData = targetMob.getMobData();
-      targetData = {
-        stats: { defense: mobData.defense }, // Pass defense stat for accuracy calculation
-        config: { defense: mobData.defense },
-      };
-    } else {
-      // Handle player or other Entity
-      const statsComponent = target.getComponent("stats");
-      if (statsComponent?.data) {
-        // Extract .level from SkillData objects for combat calculations
-        const stats = statsComponent.data as {
-          attack?: { level: number } | number;
-          strength?: { level: number } | number;
-          defense?: { level: number } | number;
-          ranged?: { level: number } | number;
-        };
-        targetData = {
-          stats: {
-            attack:
-              typeof stats.attack === "object"
-                ? stats.attack.level
-                : (stats.attack ?? 1),
-            strength:
-              typeof stats.strength === "object"
-                ? stats.strength.level
-                : (stats.strength ?? 1),
-            defense:
-              typeof stats.defense === "object"
-                ? stats.defense.level
-                : (stats.defense ?? 1),
-            ranged:
-              typeof stats.ranged === "object"
-                ? stats.ranged.level
-                : (stats.ranged ?? 1),
-          },
-        };
-      }
-    }
-
-    // Get equipment stats for player attacker
-    let equipmentStats:
-      | { attack: number; strength: number; defense: number; ranged: number }
-      | undefined = undefined;
-    if (!attackerMob.getMobData) {
-      // Attacker is a player - get equipment stats
-      equipmentStats = this.playerEquipmentStats.get(attacker.id);
-    }
-
-    const result = calculateDamage(
-      attackerData,
-      targetData,
-      AttackType.MELEE,
-      equipmentStats,
-    );
-
-    return result.damage;
+    return this.damageCalculator.calculateMeleeDamage(attacker, target);
   }
 
   // MVP: calculateRangedDamage removed - melee only
@@ -747,120 +758,70 @@ export class CombatSystem extends SystemBase {
     damage: number,
     attackerId: string,
   ): void {
-    // Handle damage based on target type
-    if (targetType === "player") {
-      // Get player system and use its damage method
-      const playerSystem = this.world.getSystem<PlayerSystem>("player");
-      if (!playerSystem) {
-        this.logger.error("PlayerSystem not found");
-        return;
-      }
+    // Validate target type
+    if (targetType !== "player" && targetType !== "mob") {
+      return;
+    }
 
-      const entity = this.getEntity(targetId, "player");
-      if (!entity) {
-        this.logger.error("Player entity not found for damage", undefined, {
+    // Get the appropriate handler for the target type
+    const handler = this.damageHandlers.get(targetType);
+    if (!handler) {
+      this.logger.error("No damage handler for target type", undefined, {
+        targetType,
+      });
+      return;
+    }
+
+    // Create typed EntityID for handler
+    const typedTargetId = createEntityID(targetId);
+    const typedAttackerId = createEntityID(attackerId);
+
+    // Determine attacker type for handler
+    const attackerType = this.entityResolver.resolveType(attackerId);
+
+    // Apply damage through polymorphic handler
+    const result = handler.applyDamage(
+      typedTargetId,
+      damage,
+      typedAttackerId,
+      attackerType,
+    );
+
+    // Handle failed damage application
+    if (!result.success) {
+      if (result.targetDied) {
+        // Target was already dead - end ALL combat with this entity
+        this.handleEntityDied(targetId, targetType);
+      } else {
+        this.logger.error("Failed to apply damage", undefined, {
           targetId,
+          targetType,
         });
-        return;
       }
+      return;
+    }
 
-      const damaged = playerSystem.damagePlayer(targetId, damage, attackerId);
+    // Prevent additional attacks if target died this tick
+    if (result.targetDied) {
+      this.handleEntityDied(targetId, targetType);
+      return;
+    }
 
-      // CRITICAL: If damage failed, check if player is dead and end combat
-      // damagePlayer() returns false when player.alive = false (line 1097)
-      if (!damaged) {
-        const targetEntity = this.getEntity(targetId, "player");
-        const isAlive = this.isEntityAlive(targetEntity, "player");
-        if (!isAlive) {
-          // Player is dead - end ALL combat with this player immediately
-          this.handleEntityDied(targetId, "player");
-          return;
-        }
-        // Player not dead but damage still failed - log and continue
-        this.logger.error("Failed to damage player", undefined, { targetId });
-        return;
-      }
+    // Emit UI message based on target type
+    if (targetType === "player") {
+      // Get attacker name for message
+      const attackerHandler = this.damageHandlers.get(attackerType);
+      const attackerName = attackerHandler
+        ? attackerHandler.getDisplayName(typedAttackerId)
+        : "enemy";
 
-      // CRITICAL: Check if player died from THIS attack - end ALL combat with this player
-      // This prevents additional auto-attacks from ANY mob in the same frame
-      const targetEntity = this.getEntity(targetId, "player");
-      const isAlive = this.isEntityAlive(targetEntity, "player");
-      if (!isAlive) {
-        this.handleEntityDied(targetId, "player");
-        return;
-      }
-
-      const attacker = this.getEntity(attackerId, "mob");
-      const attackerName = this.getTargetName(attacker);
       this.emitTypedEvent(EventType.UI_MESSAGE, {
         playerId: targetId,
         message: `The ${attackerName} hits you for ${damage} damage!`,
         type: "damage",
       });
-    } else if (targetType === "mob") {
-      // For mobs, get the entity from EntityManager and use its takeDamage method
-      const mobEntity = this.world.entities.get(targetId) as MobEntity;
-      if (!mobEntity) {
-        this.logger.warn("Mob entity not found - may have been destroyed", {
-          targetId,
-        });
-        return;
-      }
-
-      // Check if mob is already dead
-      if (mobEntity.isDead()) {
-        this.logger.warn("Cannot damage dead mob", { targetId });
-        return;
-      }
-
-      // Check if the mob has a takeDamage method (MobEntity)
-      if (typeof mobEntity.takeDamage === "function") {
-        mobEntity.takeDamage(damage, attackerId);
-
-        // Emit MOB_NPC_ATTACKED event so EntityManager can handle death
-        this.emitTypedEvent(EventType.MOB_NPC_ATTACKED, {
-          mobId: targetId,
-          damage: damage,
-          attackerId: attackerId,
-        });
-      } else {
-        // Fallback for entities without takeDamage method
-        const currentHealth = mobEntity.getProperty("health") as
-          | { current: number; max: number }
-          | number;
-        const healthValue =
-          typeof currentHealth === "number"
-            ? currentHealth
-            : currentHealth.current;
-        const maxHealth =
-          typeof currentHealth === "number" ? 100 : currentHealth.max;
-
-        const newHealth = Math.max(0, healthValue - damage);
-
-        if (typeof currentHealth === "number") {
-          mobEntity.setProperty("health", newHealth);
-        } else {
-          mobEntity.setProperty("health", {
-            current: newHealth,
-            max: maxHealth,
-          });
-        }
-
-        // Check if mob died
-        if (newHealth <= 0) {
-          // Don't emit NPC_DIED here - let MobEntity.die() handle it
-          // Don't emit COMBAT_KILL here either - let MobEntity.die() handle it
-
-          this.emitTypedEvent(EventType.UI_MESSAGE, {
-            playerId: attackerId,
-            message: `You have defeated the ${mobEntity.getProperty("name") || mobEntity.getProperty("mobType") || "unknown"}!`,
-            type: "success",
-          });
-        }
-      }
-    } else {
-      return;
     }
+    // Note: Mob death messages are emitted by MobEntity.die() to avoid duplication
 
     // Note: Damage splatter events are now emitted at the call sites
     // (handleMeleeAttack, processAutoAttack) to ensure they're emitted even for 0 damage hits
@@ -881,15 +842,9 @@ export class CombatSystem extends SystemBase {
     const attackerEntity = this.world.entities.get(String(attackerId));
     const targetEntity = this.world.entities.get(String(targetId));
 
-    // Don't enter combat if target is dead
-    if (targetEntity && "health" in targetEntity) {
-      const targetWithHealth = targetEntity as unknown as CombatPlayerEntity;
-      if (
-        targetWithHealth.health !== undefined &&
-        targetWithHealth.health <= 0
-      ) {
-        return;
-      }
+    // Don't enter combat if target is dead (using type guard)
+    if (isEntityDead(targetEntity)) {
+      return;
     }
 
     // Also check if target is a player marked as dead
@@ -908,8 +863,9 @@ export class CombatSystem extends SystemBase {
 
     // Get attack speeds in ticks (use provided or calculate)
     const attackerAttackSpeedTicks =
-      attackerSpeedTicks ?? this.getAttackSpeedTicks(attackerId, attackerType);
-    const targetAttackSpeedTicks = this.getAttackSpeedTicks(
+      attackerSpeedTicks ??
+      this.entityResolver.getAttackSpeed(attackerId, attackerType);
+    const targetAttackSpeedTicks = this.entityResolver.getAttackSpeed(
       targetId,
       targetType,
     );
@@ -926,59 +882,137 @@ export class CombatSystem extends SystemBase {
 
     // OSRS Retaliation: Target retaliates after ceil(speed/2) + 1 ticks
     // @see https://oldschool.runescape.wiki/w/Auto_Retaliate
-    // Check if target can retaliate (mobs have retaliates flag, players always can)
+    // Check if target can retaliate (mobs have retaliates flag, players check auto-retaliate setting)
     let canRetaliate = true;
     if (targetType === "mob" && targetEntity) {
-      // Check mob's retaliates config - if false, mob won't fight back
-      const mobConfig = (
-        targetEntity as unknown as { config?: { retaliates?: boolean } }
-      ).config;
-      if (mobConfig && mobConfig.retaliates === false) {
+      // Check mob's retaliates config using type guard - if false, mob won't fight back
+      canRetaliate = getMobRetaliates(targetEntity);
+    } else if (targetType === "player") {
+      // Check player's auto-retaliate setting
+      // Uses cached reference (no getSystem() call in hot path)
+      // Defaults to true if PlayerSystem unavailable (fail-safe, OSRS default)
+      if (this.playerSystem) {
+        canRetaliate = this.playerSystem.getPlayerAutoRetaliate(
+          String(targetId),
+        );
+      }
+      // Note: If playerSystem is null, canRetaliate stays true (default OSRS behavior)
+
+      // 20 min AFK disables auto-retaliate
+      if (canRetaliate && this.isAFKTooLong(String(targetId), currentTick)) {
         canRetaliate = false;
       }
     }
 
+    // Attacker always faces target
+    this.rotationManager.rotateTowardsTarget(
+      String(attackerId),
+      String(targetId),
+      attackerType,
+      targetType,
+    );
+
+    // Auto-retaliate only triggers when player has no current target
+    let targetHasValidTarget = false;
     if (canRetaliate) {
-      const retaliationDelay = calculateRetaliationDelay(
-        targetAttackSpeedTicks,
+      const targetCombatState = this.stateService.getCombatData(targetId);
+      targetHasValidTarget = !!(
+        targetCombatState &&
+        targetCombatState.inCombat &&
+        this.entityResolver.isAlive(
+          this.entityResolver.resolve(
+            String(targetCombatState.targetId),
+            targetCombatState.targetType,
+          ),
+          targetCombatState.targetType,
+        )
       );
 
-      this.stateService.createRetaliatorState(
-        targetId,
-        attackerId,
-        targetType,
-        attackerType,
-        currentTick,
-        retaliationDelay,
-        targetAttackSpeedTicks,
-      );
+      if (!targetHasValidTarget) {
+        // Target has no valid target - schedule retaliation (normal OSRS auto-retaliate)
+        const retaliationDelay = calculateRetaliationDelay(
+          targetAttackSpeedTicks,
+        );
+
+        this.stateService.createRetaliatorState(
+          targetId,
+          attackerId,
+          targetType,
+          attackerType,
+          currentTick,
+          retaliationDelay,
+          targetAttackSpeedTicks,
+        );
+
+        // OSRS-ACCURATE: Auto-retaliate ALWAYS redirects player toward attacker
+        // When hit with auto-retaliate ON, player stops any current movement and turns to fight
+        // The COMBAT_FOLLOW_TARGET event replaces any existing movement destination
+        // Wiki: "the player's character walks/runs towards the monster attacking and fights back"
+
+        // NOTE: We do NOT call rotateTowardsTarget() here because:
+        // 1. COMBAT_FOLLOW_TARGET triggers movePlayerToward() which handles rotation
+        // 2. Having two rotation updates causes visual jank (quick turn-around-then-back)
+        // 3. Client's TileInterpolator will slerp smoothly to the new path direction
+
+        // Always emit follow event - this REPLACES any existing movement
+        // Player was walking to tile A, now walks to attacker instead
+        if (targetType === "player" && attackerEntity) {
+          const attackerPos = getEntityPosition(attackerEntity);
+          if (attackerPos) {
+            this.emitTypedEvent(EventType.COMBAT_FOLLOW_TARGET, {
+              playerId: String(targetId),
+              targetId: String(attackerId),
+              targetPosition: {
+                x: attackerPos.x,
+                y: attackerPos.y,
+                z: attackerPos.z,
+              },
+            });
+          }
+        }
+      } else {
+        // Target already has valid target - just extend their combat timer
+        // They stay locked on their current target (OSRS-accurate)
+        this.stateService.extendCombatTimer(targetId, currentTick);
+      }
     }
 
-    // Rotate both entities to face each other (RuneScape-style)
-    this.rotationManager.rotateTowardsTarget(
+    // Sync combat state to player entities for client-side combat awareness
+    // Attacker always gets combat state with target
+    this.stateService.syncCombatStateToEntity(
       String(attackerId),
       String(targetId),
-      attackerType,
-      targetType,
-    );
-    this.rotationManager.rotateTowardsTarget(
-      String(targetId),
-      String(attackerId),
-      targetType,
       attackerType,
     );
 
-    // Sync combat state to player entities for client-side combat awareness
-    this.stateService.syncCombatStateToEntity(
-      String(attackerId),
-      String(targetId),
-      attackerType,
-    );
-    this.stateService.syncCombatStateToEntity(
-      String(targetId),
-      String(attackerId),
-      targetType,
-    );
+    // Target only gets NEW combat target if:
+    // 1. They will retaliate (auto-retaliate ON), AND
+    // 2. They don't already have a valid target (OSRS-accurate)
+    //
+    // If target already has a valid target, we don't overwrite their target state.
+    // They stay locked on their current enemy.
+    // NOTE: We use the same targetHasValidTarget value calculated BEFORE state modifications
+    if (canRetaliate && !targetHasValidTarget) {
+      // Target has no valid target - sync them to attack this attacker
+      this.stateService.syncCombatStateToEntity(
+        String(targetId),
+        String(attackerId),
+        targetType,
+      );
+    } else if (!canRetaliate && targetType === "player") {
+      // Mark player as in combat (for logout timer) but without a target
+      // Store attackerId so combat can start if auto-retaliate is toggled ON
+      this.stateService.markInCombatWithoutTarget(
+        String(targetId),
+        String(attackerId),
+      );
+
+      // Player visually faces attacker even with auto-retaliate off
+      this.emitTypedEvent(EventType.COMBAT_FACE_TARGET, {
+        playerId: String(targetId),
+        targetId: String(attackerId),
+      });
+    }
 
     // DON'T set combat emotes here - we set them when attacks happen instead
     // This prevents the animation from looping continuously
@@ -987,6 +1021,14 @@ export class CombatSystem extends SystemBase {
     this.emitTypedEvent(EventType.COMBAT_STARTED, {
       attackerId: String(attackerId),
       targetId: String(targetId),
+    });
+
+    this.recordCombatEvent(GameEventType.COMBAT_START, String(attackerId), {
+      targetId: String(targetId),
+      attackerType,
+      targetType,
+      attackerAttackSpeedTicks,
+      targetAttackSpeedTicks,
     });
 
     // Show combat UI indicator for the local player (whoever that is)
@@ -1002,7 +1044,7 @@ export class CombatSystem extends SystemBase {
 
       this.emitTypedEvent(EventType.UI_MESSAGE, {
         playerId: localPlayer.id,
-        message: `⚔️ Combat started with ${opponentName}!`,
+        message: `Combat started with ${opponentName}!`,
         type: "combat",
         duration: 3000,
       });
@@ -1056,6 +1098,24 @@ export class CombatSystem extends SystemBase {
       targetId: String(combatState.targetId),
     });
 
+    this.recordCombatEvent(GameEventType.COMBAT_END, data.entityId, {
+      targetId: String(combatState.targetId),
+      attackerType: combatState.attackerType,
+      targetType: combatState.targetType,
+      reason: "timeout_or_manual",
+    });
+
+    if (combatState.attackerType === "player") {
+      this.emitTypedEvent(EventType.COMBAT_CLEAR_FACE_TARGET, {
+        playerId: data.entityId,
+      });
+    }
+    if (combatState.targetType === "player") {
+      this.emitTypedEvent(EventType.COMBAT_CLEAR_FACE_TARGET, {
+        playerId: String(combatState.targetId),
+      });
+    }
+
     // Show combat end message for player
     if (combatState.attackerType === "player") {
       this.emitTypedEvent(EventType.UI_MESSAGE, {
@@ -1067,13 +1127,21 @@ export class CombatSystem extends SystemBase {
   }
 
   /**
-   * Handle entity death - mark dead entity as non-targetable, let combat timeout naturally
-   * CRITICAL FIX FOR ISSUE #269: RuneScape-style combat timer
-   * In OSRS, combat lasts for 8 ticks (4.8 seconds) after the LAST hit
-   * Don't end combat immediately - let the timer expire naturally so health bars stay visible
+   * Handle entity death - combat times out naturally after 8 ticks (4.8s)
+   * so health bars stay visible briefly after death
    */
   private handleEntityDied(entityId: string, entityType: string): void {
     const typedEntityId = createEntityID(entityId);
+
+    const deathEventType =
+      entityType === "player"
+        ? GameEventType.DEATH_PLAYER
+        : GameEventType.DEATH_MOB;
+    const combatState = this.stateService.getCombatData(entityId);
+    this.recordCombatEvent(deathEventType, entityId, {
+      entityType,
+      killedBy: combatState ? String(combatState.targetId) : "unknown",
+    });
 
     // Simply remove the dead entity's combat state - they're no longer in combat
     // But DON'T call endCombat() for attackers - let their combat timer expire naturally
@@ -1087,23 +1155,37 @@ export class CombatSystem extends SystemBase {
 
     // Find all attackers targeting this dead entity
     // Their combat will naturally timeout after 4.8 seconds (8 ticks) since they got the last hit
-    // This matches RuneScape behavior where health bars stay visible briefly after combat ends
     const combatStatesMap = this.stateService.getCombatStatesMap();
     for (const [attackerId, state] of combatStatesMap) {
       if (String(state.targetId) === entityId) {
-        // CRITICAL: Clear the attacker's attack cooldown so they can attack new targets immediately
-        // Without this, mobs would be stuck waiting for cooldown after their target dies and respawns
+        // Allow attacker to target someone else immediately
         this.nextAttackTicks.delete(attackerId);
 
-        // CRITICAL: If the attacker is a mob, reset its internal CombatStateManager
-        // This clears the mob's own nextAttackTick so it can attack immediately when target respawns
         if (state.attackerType === "mob") {
-          const mobEntity = this.world.entities.get(
-            String(attackerId),
-          ) as MobEntity;
-          if (mobEntity && typeof mobEntity.onTargetDied === "function") {
+          const mobEntity = this.world.entities.get(String(attackerId));
+          if (
+            isMobEntity(mobEntity) &&
+            typeof mobEntity.onTargetDied === "function"
+          ) {
             mobEntity.onTargetDied(entityId);
           }
+        }
+      }
+    }
+
+    // Clear face target for players who had this as pending attacker
+    if (entityType === "mob") {
+      // Check all players to see if they had this mob as their pending attacker
+      for (const player of this.world.entities.players.values()) {
+        // Use type guards for safe property access
+        const pendingAttacker = getPendingAttacker(player);
+        if (pendingAttacker === entityId) {
+          // Clear the pending attacker state using type guard helper
+          clearPendingAttacker(player);
+          // Tell client to stop facing this entity
+          this.emitTypedEvent(EventType.COMBAT_CLEAR_FACE_TARGET, {
+            playerId: player.id,
+          });
         }
       }
     }
@@ -1130,17 +1212,18 @@ export class CombatSystem extends SystemBase {
     };
 
     // Check if entities exist
-    const attacker = this.getEntity(attackerId, opts.attackerType);
-    const target = this.getEntity(targetId, opts.targetType);
+    const attacker = this.entityResolver.resolve(attackerId, opts.attackerType);
+    const target = this.entityResolver.resolve(targetId, opts.targetType);
 
     if (!attacker || !target) {
       return false;
     }
 
-    // CRITICAL: Cannot start combat with dead entities (RuneScape-style validation)
-    // This prevents mobs from starting combat with dead players (Issue #265)
-    const attackerAlive = this.isEntityAlive(attacker, opts.attackerType);
-    const targetAlive = this.isEntityAlive(target, opts.targetType);
+    const attackerAlive = this.entityResolver.isAlive(
+      attacker,
+      opts.attackerType,
+    );
+    const targetAlive = this.entityResolver.isAlive(target, opts.targetType);
 
     if (!attackerAlive) {
       return false;
@@ -1157,7 +1240,7 @@ export class CombatSystem extends SystemBase {
     // Use pre-allocated pooled tiles (zero GC)
     tilePool.setFromPosition(this._attackerTile, attackerPos);
     tilePool.setFromPosition(this._targetTile, targetPos);
-    const combatRangeTiles = this.getEntityCombatRange(
+    const combatRangeTiles = this.entityResolver.getCombatRange(
       attacker,
       opts.attackerType,
     );
@@ -1200,6 +1283,61 @@ export class CombatSystem extends SystemBase {
   }
 
   /**
+   * Check if a player can logout based on combat state
+   * OSRS-accurate: Cannot logout while actively in combat
+   * Uses the combat timeout window to determine if player is in active combat
+   *
+   * @param playerId - The player's entity ID
+   * @param currentTick - The current game tick
+   * @returns Object with allowed boolean and optional reason string
+   */
+  public canLogout(
+    playerId: string,
+    currentTick: number,
+  ): { allowed: boolean; reason?: string } {
+    const combatData = this.stateService.getCombatData(playerId);
+
+    // Player is in active combat if:
+    // 1. They have combat data with inCombat flag
+    // 2. Current tick is before their combat end tick
+    if (combatData?.inCombat && currentTick < combatData.combatEndTick) {
+      return {
+        allowed: false,
+        reason: "Cannot logout during combat",
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Update the last input tick for a player
+   * Called by PlayerSystem when player performs any action
+   * OSRS: Auto-retaliate disabled after 20 minutes of no input
+   *
+   * @param playerId - The player's entity ID
+   * @param currentTick - The current game tick
+   */
+  public updatePlayerInput(playerId: string, currentTick: number): void {
+    this.lastInputTick.set(playerId, currentTick);
+  }
+
+  /**
+   * Check if a player has been AFK too long (20 minutes)
+   * OSRS-accurate: Auto-retaliate disabled after 2000 ticks of no input
+   *
+   * @param playerId - The player's entity ID
+   * @param currentTick - The current game tick
+   * @returns true if player has been AFK too long
+   */
+  public isAFKTooLong(playerId: string, currentTick: number): boolean {
+    const lastInput = this.lastInputTick.get(playerId) ?? currentTick;
+    return (
+      currentTick - lastInput >= COMBAT_CONSTANTS.AFK_DISABLE_RETALIATE_TICKS
+    );
+  }
+
+  /**
    * Clean up all combat state for a disconnecting player
    * Called when a player disconnects to prevent orphaned combat states
    * and allow mobs to immediately retarget other players
@@ -1219,11 +1357,9 @@ export class CombatSystem extends SystemBase {
     // Clear player's equipment stats cache
     this.playerEquipmentStats.delete(playerId);
 
-    // Clean up anti-cheat tracking for disconnected player (Phase 6)
     this.antiCheat.cleanup(playerId);
-
-    // Clean up rate limiter state (Phase 6.5)
     this.rateLimiter.cleanup(playerId);
+    this.lastInputTick.delete(playerId);
 
     // Find all entities that were targeting this disconnected player
     const combatStatesMap = this.stateService.getCombatStatesMap();
@@ -1234,10 +1370,11 @@ export class CombatSystem extends SystemBase {
 
         // If attacker is a mob, reset its internal combat state
         if (state.attackerType === "mob") {
-          const mobEntity = this.world.entities.get(
-            String(attackerId),
-          ) as MobEntity;
-          if (mobEntity && typeof mobEntity.onTargetDied === "function") {
+          const mobEntity = this.world.entities.get(String(attackerId));
+          if (
+            isMobEntity(mobEntity) &&
+            typeof mobEntity.onTargetDied === "function"
+          ) {
             // Reuse the same method - disconnect is similar to death
             mobEntity.onTargetDied(playerId);
           }
@@ -1257,45 +1394,6 @@ export class CombatSystem extends SystemBase {
     }
   }
 
-  private getEntity(
-    entityId: string,
-    entityType: string,
-  ): Entity | MobEntity | null {
-    if (entityType === "mob") {
-      const entity = this.world.entities.get(entityId);
-      if (!entity) {
-        // Don't spam logs for entities that are being destroyed
-        // Only log if this is a new entity that should exist
-        return null;
-      }
-      return entity as MobEntity;
-    }
-
-    if (entityType === "player") {
-      // Look up players from world.entities.players (includes fake test players)
-      const player = this.world.entities.players.get(entityId);
-      if (!player) {
-        // Debug level - player disconnects are common and expected
-        this.logger.debug("Player entity not found (probably disconnected)", {
-          entityId,
-        });
-        return null;
-      }
-      return player;
-    }
-
-    if (!this.entityManager) {
-      this.logger.warn("Entity manager not available");
-      return null;
-    }
-    const entity = this.entityManager.getEntity(entityId);
-    if (!entity) {
-      this.logger.debug("Entity not found", { entityId });
-      return null;
-    }
-    return entity;
-  }
-
   // Combat update loop - DEPRECATED: Combat logic now handled by processCombatTick() via TickSystem
   // This method is kept for compatibility but does nothing - all combat runs through tick system
   update(_dt: number): void {
@@ -1308,6 +1406,8 @@ export class CombatSystem extends SystemBase {
    * Called by TickSystem at COMBAT priority (after movement, before AI)
    */
   public processCombatTick(tickNumber: number): void {
+    this.pidManager.update(tickNumber);
+
     // Process scheduled emote resets (tick-aligned animation timing)
     // Delegated to AnimationManager for better separation of concerns
     this.animationManager.processEmoteResets(tickNumber);
@@ -1316,9 +1416,10 @@ export class CombatSystem extends SystemBase {
     const combatStates = this.stateService.getAllCombatStates();
     const combatStatesMap = this.stateService.getCombatStatesMap();
 
-    // Process all active combat sessions
+    // Lower PID attacks first when multiple attacks on same tick
+    combatStates.sort((a, b) => this.pidManager.comparePriority(a[0], b[0]));
+
     for (const [entityId, combatState] of combatStates) {
-      // CRITICAL: Re-check if this combat state still exists
       if (!combatStatesMap.has(entityId)) {
         continue;
       }
@@ -1347,6 +1448,91 @@ export class CombatSystem extends SystemBase {
   }
 
   /**
+   * Process combat for a specific NPC on this tick
+   *
+   * OSRS-ACCURATE: Called by GameTickProcessor during NPC phase
+   * NPCs process BEFORE players, creating the damage asymmetry:
+   * - NPC → Player damage: Applied same tick
+   * - Player → NPC damage: Applied next tick
+   *
+   * @param mobId - The NPC entity ID to process
+   * @param tickNumber - Current tick number
+   */
+  public processNPCCombatTick(mobId: string, tickNumber: number): void {
+    const combatState = this.stateService.getCombatData(mobId);
+
+    if (!combatState) return;
+
+    // Check for combat timeout (8 ticks after last hit)
+    if (combatState.inCombat && tickNumber >= combatState.combatEndTick) {
+      this.endCombat({ entityId: mobId });
+      return;
+    }
+
+    // Skip if not in combat or doesn't have valid target
+    if (!combatState.inCombat || !combatState.targetId) return;
+
+    // Only process mob attackers (not mobs being attacked)
+    if (combatState.attackerType !== "mob") return;
+
+    // Process emote resets for this mob
+    this.animationManager.processEntityEmoteReset(mobId, tickNumber);
+
+    // Check if this mob can attack on this tick
+    if (tickNumber >= combatState.nextAttackTick) {
+      this.processAutoAttackOnTick(combatState, tickNumber);
+    }
+  }
+
+  /**
+   * Process combat for a specific player on this tick
+   *
+   * OSRS-ACCURATE: Called by GameTickProcessor during Player phase
+   * Players process AFTER NPCs, creating the damage asymmetry:
+   * - Player → NPC damage: Applied next tick (queued by GameTickProcessor)
+   * - NPC → Player damage: Applied same tick
+   *
+   * @param playerId - The player entity ID to process
+   * @param tickNumber - Current tick number
+   */
+  public processPlayerCombatTick(playerId: string, tickNumber: number): void {
+    const combatState = this.stateService.getCombatData(playerId);
+
+    if (!combatState) return;
+
+    // Check for combat timeout (8 ticks after last hit)
+    if (combatState.inCombat && tickNumber >= combatState.combatEndTick) {
+      this.endCombat({ entityId: playerId });
+      return;
+    }
+
+    // Skip if not in combat or doesn't have valid target
+    if (!combatState.inCombat || !combatState.targetId) return;
+
+    // Only process player attackers (not players being attacked)
+    if (combatState.attackerType !== "player") return;
+
+    // OSRS-ACCURATE: No movement suppression needed
+    // If player has combat state, they're either:
+    // 1. Standing still fighting
+    // 2. Combat following (chasing their target)
+    // In both cases, attacks should happen when in range and cooldown ready
+    // Wiki: "follow and attack while chasing it"
+    // The disengage event handles the "escape" case by clearing combat state
+
+    // Process emote resets for this player
+    this.animationManager.processEntityEmoteReset(playerId, tickNumber);
+
+    // OSRS-style: Check range EVERY tick and follow if needed
+    this.checkRangeAndFollow(combatState, tickNumber);
+
+    // Check if this player can attack on this tick
+    if (tickNumber >= combatState.nextAttackTick) {
+      this.processAutoAttackOnTick(combatState, tickNumber);
+    }
+  }
+
+  /**
    * OSRS-style: Check if player is in range of target, emit follow event if not
    * Called EVERY tick to ensure continuous pursuit of moving targets
    */
@@ -1357,14 +1543,25 @@ export class CombatSystem extends SystemBase {
     const attackerId = String(combatState.attackerId);
     const targetId = String(combatState.targetId);
 
-    const attacker = this.getEntity(attackerId, combatState.attackerType);
-    const target = this.getEntity(targetId, combatState.targetType);
+    // OSRS-ACCURATE: No movement suppression for following
+    // If player has combat state, they should continuously pursue their target
+    // Wiki: "follow and attack while chasing it"
+    // Movement during combat follow is normal - player is chasing their target
+
+    const attacker = this.entityResolver.resolve(
+      attackerId,
+      combatState.attackerType,
+    );
+    const target = this.entityResolver.resolve(
+      targetId,
+      combatState.targetType,
+    );
 
     if (!attacker || !target) return;
 
     // Don't follow dead targets - let combat timeout naturally
     // This prevents player getting stuck after killing a mob
-    if (!this.isEntityAlive(target, combatState.targetType)) {
+    if (!this.entityResolver.isAlive(target, combatState.targetType)) {
       return;
     }
 
@@ -1375,7 +1572,7 @@ export class CombatSystem extends SystemBase {
     // Use pre-allocated pooled tiles (zero GC)
     tilePool.setFromPosition(this._attackerTile, attackerPos);
     tilePool.setFromPosition(this._targetTile, targetPos);
-    const combatRangeTiles = this.getEntityCombatRange(
+    const combatRangeTiles = this.entityResolver.getCombatRange(
       attacker,
       combatState.attackerType,
     );
@@ -1388,7 +1585,10 @@ export class CombatSystem extends SystemBase {
         combatRangeTiles,
       )
     ) {
-      // Out of range - emit follow event to move player toward target
+      // Out of range - follow the target
+      // Note: If player clicked away, their combat would already be ended by
+      // COMBAT_PLAYER_DISENGAGE event (OSRS-accurate: clicking cancels action)
+      // So if we reach here, combat is still active and player should follow
       // Extend combat timeout while pursuing
       combatState.combatEndTick =
         tickNumber + COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS;
@@ -1403,64 +1603,86 @@ export class CombatSystem extends SystemBase {
   }
 
   /**
-   * Process auto-attack for a combatant on a specific tick (OSRS-accurate)
-   * This creates the continuous attack loop that makes combat feel like RuneScape
+   * Validate combat actors exist and are alive
    */
-  private processAutoAttackOnTick(
+  private validateCombatActors(
     combatState: CombatData,
-    tickNumber: number,
-  ): void {
+  ): { attacker: Entity | MobEntity; target: Entity | MobEntity } | null {
     const attackerId = String(combatState.attackerId);
     const targetId = String(combatState.targetId);
-    const typedAttackerId = combatState.attackerId;
 
-    const attacker = this.getEntity(attackerId, combatState.attackerType);
-    const target = this.getEntity(targetId, combatState.targetType);
+    const attacker = this.entityResolver.resolve(
+      attackerId,
+      combatState.attackerType,
+    );
+    const target = this.entityResolver.resolve(
+      targetId,
+      combatState.targetType,
+    );
 
-    // CRITICAL FIX FOR ISSUE #269: RuneScape-style combat timer
-    // If entity not found (dead mob, disconnected player, etc.), DON'T end combat immediately
-    // Let the 8-tick timeout expire naturally to keep health bars visible
+    // Let combat time out naturally if entities gone (health bars stay visible)
     if (!attacker || !target) {
-      return;
+      return null;
     }
 
     // Check if attacker is still alive (prevent dead attackers from auto-attacking)
-    if (!this.isEntityAlive(attacker, combatState.attackerType)) {
-      return;
+    if (!this.entityResolver.isAlive(attacker, combatState.attackerType)) {
+      return null;
     }
 
     // Check if target is still alive
-    if (!this.isEntityAlive(target, combatState.targetType)) {
-      return;
+    if (!this.entityResolver.isAlive(target, combatState.targetType)) {
+      return null;
     }
 
-    // MVP: Melee-only range check (tile-based, OSRS-style)
+    return { attacker, target };
+  }
+
+  /**
+   * Validate attacker is within melee range of target
+   * Uses pooled tiles for zero GC overhead
+   * @returns true if within range, false otherwise
+   */
+  private validateAttackRange(
+    attacker: Entity | MobEntity,
+    target: Entity | MobEntity,
+    attackerType: "player" | "mob",
+  ): boolean {
     const attackerPos = getEntityPosition(attacker);
     const targetPos = getEntityPosition(target);
-    if (!attackerPos || !targetPos) return; // Missing position
+    if (!attackerPos || !targetPos) return false;
 
     // MELEE: Must be within attacker's combat range (configurable per mob, minimum 1 tile)
     // OSRS-style: range 1 = cardinal only (N/S/E/W), range 2+ = diagonal allowed
     // Use pre-allocated pooled tiles (zero GC)
     tilePool.setFromPosition(this._attackerTile, attackerPos);
     tilePool.setFromPosition(this._targetTile, targetPos);
-    const combatRangeTiles = this.getEntityCombatRange(
+    const combatRangeTiles = this.entityResolver.getCombatRange(
       attacker,
-      combatState.attackerType,
+      attackerType,
     );
-    // OSRS-accurate melee range check (cardinal-only for range 1)
-    if (
-      !tilesWithinMeleeRange(
-        this._attackerTile,
-        this._targetTile,
-        combatRangeTiles,
-      )
-    ) {
-      // Out of melee range - skip this attack (follow is handled by checkRangeAndFollow every tick)
-      return;
-    }
 
-    // OSRS-STYLE: Update entity facing to face target (RuneScape entities always face combat target)
+    // OSRS-accurate melee range check (cardinal-only for range 1)
+    return tilesWithinMeleeRange(
+      this._attackerTile,
+      this._targetTile,
+      combatRangeTiles,
+    );
+  }
+
+  /**
+   * Execute the attack: rotation, animation, damage calculation, and application
+   * @returns The damage dealt (capped at target's current health)
+   */
+  private executeAttackDamage(
+    attackerId: string,
+    targetId: string,
+    attacker: Entity | MobEntity,
+    target: Entity | MobEntity,
+    combatState: CombatData,
+    tickNumber: number,
+  ): number {
+    // OSRS-STYLE: Update entity facing to face target
     this.rotationManager.rotateTowardsTarget(
       attackerId,
       targetId,
@@ -1468,7 +1690,7 @@ export class CombatSystem extends SystemBase {
       combatState.targetType,
     );
 
-    // Play attack animation (Issue #340: pass attack speed for proper animation duration)
+    // Play attack animation with attack speed for proper animation duration
     this.animationManager.setCombatEmote(
       attackerId,
       combatState.attackerType,
@@ -1480,7 +1702,7 @@ export class CombatSystem extends SystemBase {
     const rawDamage = this.calculateMeleeDamage(attacker, target);
 
     // OSRS-STYLE: Cap damage at target's current health (no overkill)
-    const currentHealth = this.getEntityHealth(target);
+    const currentHealth = this.entityResolver.getHealth(target);
     const damage = Math.min(rawDamage, currentHealth);
 
     // Apply capped damage
@@ -1491,23 +1713,134 @@ export class CombatSystem extends SystemBase {
     this.emitTypedEvent(EventType.COMBAT_DAMAGE_DEALT, {
       attackerId,
       targetId,
-      damage, // Capped damage - matches actual damage applied
+      damage,
       targetType: combatState.targetType,
       position: targetPosition,
     });
 
-    // Check if combat state still exists (target may have died)
-    if (!this.stateService.getCombatStatesMap().has(typedAttackerId)) {
-      return;
+    this.recordCombatEvent(GameEventType.COMBAT_ATTACK, attackerId, {
+      targetId,
+      attackerType: combatState.attackerType,
+      targetType: combatState.targetType,
+      attackSpeedTicks: combatState.attackSpeedTicks,
+    });
+
+    if (damage > 0) {
+      this.recordCombatEvent(GameEventType.COMBAT_DAMAGE, attackerId, {
+        targetId,
+        damage,
+        rawDamage,
+        targetHealth: currentHealth,
+        targetPosition: targetPosition
+          ? { x: targetPosition.x, y: targetPosition.y, z: targetPosition.z }
+          : undefined,
+      });
+    } else {
+      this.recordCombatEvent(GameEventType.COMBAT_MISS, attackerId, {
+        targetId,
+        rawDamage,
+      });
     }
 
-    // Update tick-based tracking (OSRS-accurate)
+    return damage;
+  }
+
+  /**
+   * Update combat state tick tracking after a successful attack
+   */
+  private updateCombatTickState(
+    combatState: CombatData,
+    typedAttackerId: EntityID,
+    tickNumber: number,
+  ): void {
     combatState.lastAttackTick = tickNumber;
     combatState.nextAttackTick = tickNumber + combatState.attackSpeedTicks;
     combatState.combatEndTick =
       tickNumber + COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS;
     this.nextAttackTicks.set(typedAttackerId, combatState.nextAttackTick);
+  }
 
+  /**
+   * Handle player auto-retaliation when attacked
+   * Creates retaliation state if player needs to fight back
+   */
+  private handlePlayerRetaliation(
+    targetId: string,
+    attackerId: string,
+    typedAttackerId: EntityID,
+    attackerType: "player" | "mob",
+    tickNumber: number,
+  ): void {
+    const targetPlayerState = this.stateService.getCombatData(targetId);
+    let shouldRetaliate =
+      this.playerSystem?.getPlayerAutoRetaliate(targetId) ?? true;
+
+    if (shouldRetaliate && this.isAFKTooLong(targetId, tickNumber)) {
+      shouldRetaliate = false;
+    }
+
+    // Player needs a new retaliation state if:
+    // 1. They have auto-retaliate ON, AND
+    // 2. They have no combat state, OR their current target is dead/invalid
+    if (!shouldRetaliate) return;
+
+    const needsNewTarget =
+      !targetPlayerState ||
+      !targetPlayerState.inCombat ||
+      !this.entityResolver.isAlive(
+        this.entityResolver.resolve(
+          String(targetPlayerState.targetId),
+          targetPlayerState.targetType,
+        ),
+        targetPlayerState.targetType,
+      );
+
+    if (!needsNewTarget) return;
+
+    // Create retaliation state for player targeting this attacker
+    const playerAttackSpeed = this.entityResolver.getAttackSpeed(
+      createEntityID(targetId),
+      "player",
+    );
+    const retaliationDelay = calculateRetaliationDelay(playerAttackSpeed);
+
+    this.stateService.createRetaliatorState(
+      createEntityID(targetId),
+      typedAttackerId,
+      "player",
+      attackerType,
+      tickNumber,
+      retaliationDelay,
+      playerAttackSpeed,
+    );
+
+    // Sync combat state to player entity
+    this.stateService.syncCombatStateToEntity(targetId, attackerId, "player");
+
+    // Face the attacker
+    this.rotationManager.rotateTowardsTarget(
+      targetId,
+      attackerId,
+      "player",
+      attackerType,
+    );
+
+    // Clear any server face target since player now has combat target
+    this.emitTypedEvent(EventType.COMBAT_CLEAR_FACE_TARGET, {
+      playerId: targetId,
+    });
+  }
+
+  /**
+   * Emit combat events for visual feedback and UI
+   */
+  private emitCombatEvents(
+    attackerId: string,
+    targetId: string,
+    target: Entity | MobEntity,
+    damage: number,
+    combatState: CombatData,
+  ): void {
     // MVP: Emit melee attack event for visual feedback
     this.emitTypedEvent(EventType.COMBAT_MELEE_ATTACK, {
       attackerId,
@@ -1520,260 +1853,193 @@ export class CombatSystem extends SystemBase {
     if (combatState.attackerType === "player") {
       this.emitTypedEvent(EventType.UI_MESSAGE, {
         playerId: attackerId,
-        message: `You hit the ${this.getTargetName(target)} for ${damage} damage!`,
+        message: `You hit the ${this.entityResolver.getDisplayName(target)} for ${damage} damage!`,
         type: "combat",
       });
     }
   }
 
   /**
-   * Get display name for a target entity
+   * Process auto-attack for a combatant on a specific tick
    */
-  private getTargetName(entity: Entity | MobEntity | null): string {
-    if (!entity) return "Unknown";
-    const mobEntity = entity as MobEntity;
-    if (mobEntity.getMobData) {
-      return mobEntity.getMobData().name;
+  private processAutoAttackOnTick(
+    combatState: CombatData,
+    tickNumber: number,
+  ): void {
+    const attackerId = String(combatState.attackerId);
+    const targetId = String(combatState.targetId);
+    const typedAttackerId = combatState.attackerId;
+
+    // Step 1: Validate combat actors exist and are alive
+    const actors = this.validateCombatActors(combatState);
+    if (!actors) return;
+    const { attacker, target } = actors;
+
+    // Step 2: Validate attack range
+    if (!this.validateAttackRange(attacker, target, combatState.attackerType)) {
+      return;
     }
-    return entity.name || "Enemy";
+
+    // Step 3: Execute attack (rotation, animation, damage)
+    const damage = this.executeAttackDamage(
+      attackerId,
+      targetId,
+      attacker,
+      target,
+      combatState,
+      tickNumber,
+    );
+
+    // Step 4: Check if combat state still exists (target may have died)
+    if (!this.stateService.getCombatStatesMap().has(typedAttackerId)) {
+      return;
+    }
+
+    // Step 5: Update combat tick state
+    this.updateCombatTickState(combatState, typedAttackerId, tickNumber);
+
+    // Step 6: Handle player retaliation if target is a player
+    if (combatState.targetType === "player") {
+      this.handlePlayerRetaliation(
+        targetId,
+        attackerId,
+        typedAttackerId,
+        combatState.attackerType,
+        tickNumber,
+      );
+    }
+
+    // Step 7: Emit combat events
+    this.emitCombatEvents(attackerId, targetId, target, damage, combatState);
   }
 
   /**
-   * Get current health of an entity
-   * Returns the current HP value to prevent damage overkill display
+   * Build GameStateInfo for event recording
    */
-  private getEntityHealth(entity: Entity | MobEntity | null): number {
-    if (!entity) {
-      return 0;
-    }
-
-    // All entities inherit getHealth() from Entity base class
-    try {
-      const health = entity.getHealth();
-      return Math.max(0, health);
-    } catch (err) {
-      return 0;
-    }
+  private buildGameStateInfo(): GameStateInfo {
+    const combatStatesMap = this.stateService.getCombatStatesMap();
+    return {
+      currentTick: this.world.currentTick,
+      playerCount: this.world.entities.players.size,
+      activeCombats: combatStatesMap.size,
+    };
   }
 
   /**
-   * Get attack speed in TICKS for an entity (OSRS-accurate)
-   * @returns Attack speed in game ticks (default: 4 ticks = 2.4 seconds)
+   * Build a full snapshot of combat state for replay
+   * Called periodically (every 100 ticks) for efficient replay start points
    */
-  private getAttackSpeedTicks(entityId: EntityID, entityType: string): number {
-    // For players, get equipment via EquipmentSystem
-    if (entityType === "player") {
-      const equipmentSystem = this.world.getSystem?.("equipment") as
-        | {
-            getPlayerEquipment?: (id: string) => {
-              weapon?: { item?: { attackSpeed?: number; id?: string } };
-            } | null;
-          }
-        | undefined;
+  private buildCombatSnapshot(): {
+    entities: Map<string, EntitySnapshot>;
+    combatStates: Map<string, CombatSnapshot>;
+    rngState: SeededRandomState;
+  } {
+    const entities = new Map<string, EntitySnapshot>();
+    const combatStates = new Map<string, CombatSnapshot>();
 
-      if (equipmentSystem?.getPlayerEquipment) {
-        const equipment = equipmentSystem.getPlayerEquipment(String(entityId));
+    // Snapshot all active combat participants
+    for (const [entityId, state] of this.stateService.getCombatStatesMap()) {
+      const attackerEntity = this.entityResolver.resolve(
+        String(entityId),
+        state.attackerType,
+      );
+      const targetEntity = this.entityResolver.resolve(
+        String(state.targetId),
+        state.targetType,
+      );
 
-        if (equipment?.weapon?.item) {
-          const weaponItem = equipment.weapon.item;
-
-          // First check if Item has attackSpeed directly
-          if (weaponItem.attackSpeed) {
-            return weaponItem.attackSpeed;
-          }
-
-          // Fallback: look up from ITEMS map
-          if (weaponItem.id) {
-            const itemData = getItem(weaponItem.id);
-            if (itemData?.attackSpeed) {
-              return itemData.attackSpeed;
-            }
-          }
-        }
+      // Snapshot attacker
+      if (attackerEntity) {
+        const pos = getEntityPosition(attackerEntity);
+        entities.set(String(entityId), {
+          id: String(entityId),
+          type: state.attackerType,
+          position: pos ? { x: pos.x, y: pos.y, z: pos.z } : undefined,
+          health: this.entityResolver.getHealth(attackerEntity),
+          maxHealth: attackerEntity.getMaxHealth?.() ?? 100,
+        });
       }
 
-      // Player with no weapon - use default
-      return COMBAT_CONSTANTS.DEFAULT_ATTACK_SPEED_TICKS;
-    }
-
-    // For mobs, check mob attack speed (stored in ticks in npcs.json)
-    const entity = this.getEntity(String(entityId), entityType);
-    if (entity) {
-      const mobEntity = entity as MobEntity;
-      if (mobEntity.getMobData) {
-        const mobData = mobEntity.getMobData();
-        const mobAttackSpeedTicks = (mobData as { attackSpeedTicks?: number })
-          .attackSpeedTicks;
-        if (mobAttackSpeedTicks) {
-          return mobAttackSpeedTicks;
-        }
+      // Snapshot target
+      if (targetEntity) {
+        const pos = getEntityPosition(targetEntity);
+        entities.set(String(state.targetId), {
+          id: String(state.targetId),
+          type: state.targetType,
+          position: pos ? { x: pos.x, y: pos.y, z: pos.z } : undefined,
+          health: this.entityResolver.getHealth(targetEntity),
+          maxHealth: targetEntity.getMaxHealth?.() ?? 100,
+        });
       }
+
+      // Snapshot combat state
+      combatStates.set(String(entityId), {
+        attackerId: String(entityId),
+        targetId: String(state.targetId),
+        startTick: state.lastAttackTick, // Use lastAttackTick as approximate start
+        lastAttackTick: state.lastAttackTick,
+      });
     }
 
-    // Default attack speed (4 ticks = 2.4 seconds)
-    return COMBAT_CONSTANTS.DEFAULT_ATTACK_SPEED_TICKS;
+    // Get RNG state for deterministic replay
+    const rngState = getGameRngState() ?? { state0: "0", state1: "0" };
+
+    return { entities, combatStates, rngState };
   }
 
   /**
-   * Get combat range for an entity in tiles
-   * Mobs use combatRange from manifest, players use equipped weapon's attackRange
+   * Record a combat event to the EventStore
+   * Includes RNG state for deterministic replay
    */
-  private getEntityCombatRange(
-    entity: Entity | MobEntity,
-    entityType: string,
-  ): number {
-    if (entityType === "mob") {
-      const mobEntity = entity as MobEntity;
-      if (typeof mobEntity.getCombatRange === "function") {
-        return mobEntity.getCombatRange();
-      }
-    }
+  private recordCombatEvent(
+    type: GameEventType,
+    entityId: string,
+    payload: unknown,
+  ): void {
+    if (!this.eventRecordingEnabled) return;
 
-    // Players: get weapon attackRange from equipped weapon via EquipmentSystem
-    if (entityType === "player") {
-      const equipmentSystem = this.world.getSystem?.("equipment") as
-        | {
-            getPlayerEquipment?: (id: string) => {
-              weapon?: { item?: { attackRange?: number; id?: string } };
-            } | null;
-          }
-        | undefined;
+    const tick = this.world.currentTick;
+    const stateInfo = this.buildGameStateInfo();
 
-      if (equipmentSystem?.getPlayerEquipment) {
-        const equipment = equipmentSystem.getPlayerEquipment(entity.id);
+    // Include snapshot data periodically (every 100 ticks)
+    const snapshot = tick % 100 === 0 ? this.buildCombatSnapshot() : undefined;
 
-        if (equipment?.weapon?.item) {
-          const weaponItem = equipment.weapon.item;
-
-          // First check if Item has attackRange directly
-          if (weaponItem.attackRange) {
-            return weaponItem.attackRange;
-          }
-
-          // Fallback: look up from ITEMS map
-          if (weaponItem.id) {
-            const itemData = getItem(weaponItem.id);
-            if (itemData?.attackRange) {
-              return itemData.attackRange;
-            }
-          }
-        }
-      }
-    }
-
-    // Default to 1 tile (punching/unarmed)
-    return 1;
-  }
-
-  /**
-   * Check if entity is alive
-   */
-  private isEntityAlive(
-    entity: Entity | MobEntity | null,
-    entityType: string,
-  ): boolean {
-    if (!entity) return false;
-    if (entityType === "player") {
-      // Check player health
-      const player = entity as Entity;
-      const healthComponent = player.getComponent("health");
-      if (healthComponent?.data) {
-        const health = healthComponent.data as {
-          current: number;
-          isDead?: boolean;
-        };
-        return health.current > 0 && !health.isDead;
-      }
-      const playerHealth = player.getHealth();
-      return playerHealth > 0;
-    }
-
-    if (entityType === "mob") {
-      // Check mob health
-      const mob = entity as MobEntity;
-
-      // Check if mob is marked as dead
-      if (mob.isDead()) {
-        return false;
-      }
-
-      // Check mob data if available
-      if (mob.getMobData) {
-        const mobData = mob.getMobData();
-        return mobData.health > 0;
-      }
-
-      // Fallback to health check
-      const mobHealth = mob.getHealth();
-      return mobHealth > 0;
-    }
-
-    return false;
+    this.eventStore.record(
+      {
+        tick,
+        type,
+        entityId,
+        payload: {
+          ...((payload as object) ?? {}),
+          rngState: getGameRngState(), // Include RNG state for replay
+        },
+      },
+      stateInfo,
+      snapshot,
+    );
   }
 
   destroy(): void {
-    // Clean up modular services
     this.stateService.destroy();
     this.animationManager.destroy();
-
-    // Clean up anti-cheat monitoring (Phase 6)
     this.antiCheat.destroy();
-
-    // Clean up rate limiter (Phase 6.5)
     this.rateLimiter.destroy();
-
-    // Release pooled tiles back to pool
+    this.eventStore.destroy();
     tilePool.release(this._attackerTile);
     tilePool.release(this._targetTile);
-
-    // Clear all attack cooldowns (tick-based)
     this.nextAttackTicks.clear();
-
-    // Call parent cleanup (handles autoCleanup)
     super.destroy();
   }
 
   /**
-   * Get anti-cheat stats for monitoring dashboard (Phase 6)
-   */
-  public getAntiCheatStats(): {
-    trackedPlayers: number;
-    playersAboveWarning: number;
-    playersAboveAlert: number;
-    totalViolationsLast5Min: number;
-  } {
-    return this.antiCheat.getStats();
-  }
-
-  /**
-   * Get anti-cheat report for a specific player (Phase 6)
-   */
-  public getAntiCheatPlayerReport(playerId: string): {
-    score: number;
-    recentViolations: Array<{
-      playerId: string;
-      type: string;
-      severity: number;
-      details: string;
-      timestamp: number;
-    }>;
-    attacksThisTick: number;
-  } {
-    return this.antiCheat.getPlayerReport(playerId);
-  }
-
-  /**
-   * Get players requiring admin attention (Phase 6)
-   */
-  public getPlayersRequiringReview(): string[] {
-    return this.antiCheat.getPlayersRequiringReview();
-  }
-
-  /**
-   * Decay anti-cheat scores (call periodically, e.g., every minute)
+   * Decay anti-cheat scores and clean stale XP history
+   * Call periodically (e.g., every minute) to prevent memory leaks
    */
   public decayAntiCheatScores(): void {
     this.antiCheat.decayScores();
+    // Also clean stale XP history to prevent memory leaks from disconnected players
+    const currentTick = this.world.currentTick ?? 0;
+    this.antiCheat.cleanupStaleXPHistory(currentTick);
   }
 
   /**
@@ -1788,19 +2054,5 @@ export class CombatSystem extends SystemBase {
     return {
       quaternions: quaternionPool.getStats(),
     };
-  }
-
-  /**
-   * Get anti-cheat configuration (for admin tools)
-   */
-  public getAntiCheatConfig(): {
-    warningThreshold: number;
-    alertThreshold: number;
-    scoreDecayPerMinute: number;
-    maxAttacksPerTick: number;
-    maxViolationsPerPlayer: number;
-    warningCooldownMs: number;
-  } {
-    return this.antiCheat.getConfig();
   }
 }

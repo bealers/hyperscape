@@ -20,11 +20,14 @@ import { MobAIState } from "../../types/entities";
 import {
   worldToTile,
   tilesEqual,
-  tilesWithinRange,
-  getBestCombatRangeTile,
+  tilesWithinMeleeRange,
+  tileChebyshevDistance,
+  getBestUnoccupiedMeleeTile,
   tileToWorld,
   type TileCoord,
 } from "../../systems/shared/movement/TileSystem";
+import type { IEntityOccupancy } from "../../systems/shared/movement/EntityOccupancyMap";
+import type { EntityID } from "../../types/core/identifiers";
 
 export interface AIStateContext {
   // Position & Movement
@@ -47,7 +50,8 @@ export interface AIStateContext {
   // Spawn & Leashing
   getSpawnPoint(): Position3D;
   getDistanceFromSpawn(): number;
-  getWanderRadius(): number;
+  getWanderRadius(): number; // For wander target generation (5 tiles default)
+  getLeashRange(): number; // For chase boundary (10 tiles default, OSRS two-tier range)
   getCombatRange(): number;
 
   // Wander
@@ -65,6 +69,29 @@ export interface AIStateContext {
   // State management
   markNetworkDirty(): void;
   emitEvent(eventType: string, data: unknown): void;
+
+  // Entity Occupancy (OSRS-accurate NPC collision)
+  /** Entity ID for occupancy exclusion */
+  getEntityId(): EntityID;
+  /** Entity occupancy map for collision checks */
+  getEntityOccupancy(): IEntityOccupancy;
+  /** Check if tile is walkable (terrain-based) */
+  isWalkable(tile: TileCoord): boolean;
+
+  // Same-tile step-out (OSRS-accurate)
+  /**
+   * Attempt to step out to a random cardinal-adjacent tile.
+   * Used when NPC is on same tile as target and cannot attack.
+   *
+   * OSRS behavior: pick random N/E/S/W, move if walkable, else do nothing.
+   * "In RS, they pick a random cardinal direction and try to move the NPC
+   * towards that by 1 tile, if it can. If not, the NPC does nothing that cycle."
+   *
+   * @returns true if movement was requested (server determines walkability)
+   *
+   * @see https://osrs-docs.com/docs/mechanics/entity-collision/
+   */
+  tryStepOutCardinal(): boolean;
 }
 
 /**
@@ -109,6 +136,14 @@ export class IdleState implements AIState {
   }
 
   update(context: AIStateContext, _deltaTime: number): MobAIState | null {
+    // LEASH CHECK: If mob is already beyond leash range, don't aggro - return home first
+    // This prevents the "twitch loop" where mob aggros → leashes → aggros → leashes
+    const spawnDistance = context.getDistanceFromSpawn();
+    const leashRange = context.getLeashRange();
+    if (spawnDistance > leashRange) {
+      return MobAIState.RETURN;
+    }
+
     // Check for nearby players (instant aggro)
     const nearbyPlayer = context.findNearbyPlayer();
     if (nearbyPlayer) {
@@ -158,6 +193,13 @@ export class WanderState implements AIState {
   }
 
   update(context: AIStateContext, deltaTime: number): MobAIState | null {
+    // LEASH CHECK: If mob wandered beyond leash range, return home before aggroing
+    const spawnDistance = context.getDistanceFromSpawn();
+    const leashRange = context.getLeashRange();
+    if (spawnDistance > leashRange) {
+      return MobAIState.RETURN;
+    }
+
     // Check for nearby players (instant aggro while wandering)
     const nearbyPlayer = context.findNearbyPlayer();
     if (nearbyPlayer) {
@@ -200,9 +242,14 @@ export class WanderState implements AIState {
  *
  * OSRS-STYLE COMBAT POSITIONING:
  * - Uses manifest combatRange to determine how close mob needs to get
- * - Mob chases until within combatRange tiles (Chebyshev distance 1-N)
+ * - Range 1 (standard melee): Cardinal only (N/S/E/W) - NO diagonal attacks
+ * - Range 2+ (halberd, spear): Allows diagonal attacks (Chebyshev distance)
  * - Mob paths to the nearest valid combat tile, not the exact player position
  * - This prevents entities from standing on top of each other
+ *
+ * IMPORTANT: Must use tilesWithinMeleeRange (not tilesWithinRange) to match
+ * CombatSystem's OSRS-accurate range validation. Using the wrong function
+ * causes mobs to get stuck when diagonally adjacent to players.
  *
  * @see https://oldschool.runescape.wiki/w/Attack_range
  */
@@ -214,13 +261,6 @@ export class ChaseState implements AIState {
   }
 
   update(context: AIStateContext, deltaTime: number): MobAIState | null {
-    // Check wander radius boundary (leashing)
-    const spawnDistance = context.getDistanceFromSpawn();
-    if (spawnDistance > context.getWanderRadius()) {
-      context.setTarget(null);
-      return MobAIState.RETURN;
-    }
-
     // Validate target still exists
     const targetId = context.getCurrentTarget();
     if (!targetId) {
@@ -230,39 +270,70 @@ export class ChaseState implements AIState {
     const targetPlayer = context.getPlayer(targetId);
     if (!targetPlayer) {
       context.setTarget(null);
-      return MobAIState.RETURN;
+      return MobAIState.IDLE;
+    }
+
+    // OSRS-ACCURATE: Check if PLAYER exceeded aggression range from SPAWN
+    // This is the key difference from before: we check PLAYER position, not MOB position
+    // Mob movement is capped at leashRange in MobTileMovementManager, so mob lingers at edge
+    // Target loss only happens when PLAYER moves beyond aggressionRange (leashRange + combatRange)
+    const spawnPoint = context.getSpawnPoint();
+    const leashRange = context.getLeashRange();
+    const combatRange = context.getCombatRange();
+    const aggressionRange = leashRange + combatRange;
+
+    const spawnTile = worldToTile(spawnPoint.x, spawnPoint.z);
+    const playerTile = worldToTile(
+      targetPlayer.position.x,
+      targetPlayer.position.z,
+    );
+    const playerDistFromSpawn = tileChebyshevDistance(spawnTile, playerTile);
+
+    if (playerDistFromSpawn > aggressionRange) {
+      context.setTarget(null);
+      context.exitCombat();
+      return MobAIState.IDLE;
     }
 
     // TILE-BASED COMBAT RANGE CHECK (OSRS-style)
     const currentPos = context.getPosition();
     const currentTile = worldToTile(currentPos.x, currentPos.z);
-    const targetTile = worldToTile(
-      targetPlayer.position.x,
-      targetPlayer.position.z,
-    );
+    const targetTile = playerTile; // Reuse already computed tile
 
     // Check if already in combat range (uses manifest combatRange)
+    // OSRS-accurate: Range 1 = cardinal only, Range 2+ = allows diagonal
     const combatRangeTiles = context.getCombatRange();
-    if (tilesWithinRange(currentTile, targetTile, combatRangeTiles)) {
-      return MobAIState.ATTACK;
-    }
-
-    // If somehow on same tile as target (shouldn't happen), also switch to attack
-    // But log a warning as this indicates a positioning bug
-    if (tilesEqual(currentTile, targetTile)) {
-      console.warn(
-        `[ChaseState] On same tile as target! This shouldn't happen. Switching to ATTACK.`,
-      );
-      return MobAIState.ATTACK;
-    }
-
-    // PATH TO COMBAT RANGE TILE (not exact player position)
-    // Find the best tile within combat range that's closest to us
-    const combatTile = getBestCombatRangeTile(
-      targetTile,
+    const inMeleeRange = tilesWithinMeleeRange(
       currentTile,
+      targetTile,
       combatRangeTiles,
     );
+
+    if (inMeleeRange) {
+      return MobAIState.ATTACK;
+    }
+
+    // If on same tile as target, transition to ATTACK state
+    // ATTACK state will handle step-out behavior (OSRS-accurate)
+    // This happens when player walks into mob's tile during chase
+    if (tilesEqual(currentTile, targetTile)) {
+      return MobAIState.ATTACK;
+    }
+
+    // PATH TO COMBAT RANGE TILE (considering entity occupancy)
+    // Find the best tile within combat range that's:
+    // 1. Closest to attacker
+    // 2. Not blocked by another entity
+    // 3. Terrain-walkable
+    const combatTile = getBestUnoccupiedMeleeTile(
+      currentTile,
+      targetTile,
+      context.getEntityOccupancy(),
+      context.getEntityId(),
+      (tile) => context.isWalkable(tile),
+      combatRangeTiles,
+    );
+
     if (combatTile) {
       // Convert combat tile to world position and move towards it
       const combatWorld = tileToWorld(combatTile);
@@ -270,11 +341,8 @@ export class ChaseState implements AIState {
         { x: combatWorld.x, y: currentPos.y, z: combatWorld.z },
         deltaTime,
       );
-    } else {
-      // Fallback: no valid combat tile, try moving closer anyway
-      // This handles edge cases like all combat tiles being blocked
-      context.moveTowards(targetPlayer.position, deltaTime);
     }
+    // If no combat tile available, mob waits (all tiles blocked)
 
     return null; // Stay in CHASE
   }
@@ -289,10 +357,21 @@ export class ChaseState implements AIState {
  *
  * OSRS-STYLE MELEE COMBAT:
  * - Stay on current tile (don't move closer)
- * - Attack when on adjacent tile to target
- * - Switch to CHASE if target moves away (no longer adjacent)
+ * - Range 1 (standard melee): Cardinal only (N/S/E/W) - NO diagonal attacks
+ * - Range 2+ (halberd, spear): Allows diagonal attacks (Chebyshev distance)
+ * - Switch to CHASE if target moves away (no longer in valid attack range)
+ *
+ * SAME-TILE HANDLING (OSRS-accurate):
+ * - NPC cannot attack from same tile (own tile not in attack range)
+ * - Pick random cardinal direction and try to step out
+ * - If blocked, do nothing that tick (try again next tick)
+ *
+ * IMPORTANT: Must use tilesWithinMeleeRange (not tilesWithinRange) to match
+ * CombatSystem's OSRS-accurate range validation. Using the wrong function
+ * causes mobs to get stuck when diagonally adjacent to players.
  *
  * @see https://oldschool.runescape.wiki/w/Attack_range
+ * @see https://osrs-docs.com/docs/mechanics/entity-collision/
  */
 export class AttackState implements AIState {
   readonly name = MobAIState.ATTACK;
@@ -302,13 +381,6 @@ export class AttackState implements AIState {
   }
 
   update(context: AIStateContext, _deltaTime: number): MobAIState | null {
-    // Check wander radius boundary (can leash even while attacking)
-    const spawnDistance = context.getDistanceFromSpawn();
-    if (spawnDistance > context.getWanderRadius()) {
-      context.setTarget(null);
-      return MobAIState.RETURN;
-    }
-
     // Validate target
     const targetId = context.getCurrentTarget();
     if (!targetId) {
@@ -321,29 +393,56 @@ export class AttackState implements AIState {
       return MobAIState.IDLE;
     }
 
-    // TILE-BASED RANGE CHECK (uses manifest combatRange)
-    const currentPos = context.getPosition();
-    const currentTile = worldToTile(currentPos.x, currentPos.z);
-    const targetTile = worldToTile(
+    // OSRS-ACCURATE: Check if PLAYER exceeded aggression range from SPAWN
+    // This is the key difference from before: we check PLAYER position, not MOB position
+    // Mob movement is capped at leashRange in MobTileMovementManager, so mob lingers at edge
+    // Target loss only happens when PLAYER moves beyond aggressionRange (leashRange + combatRange)
+    const spawnPoint = context.getSpawnPoint();
+    const leashRange = context.getLeashRange();
+    const combatRangeTiles = context.getCombatRange();
+    const aggressionRange = leashRange + combatRangeTiles;
+
+    const spawnTile = worldToTile(spawnPoint.x, spawnPoint.z);
+    const playerTile = worldToTile(
       targetPlayer.position.x,
       targetPlayer.position.z,
     );
+    const playerDistFromSpawn = tileChebyshevDistance(spawnTile, playerTile);
 
-    // Check if still in combat range
-    // Also allow attacking if on same tile (edge case that shouldn't happen)
-    const combatRangeTiles = context.getCombatRange();
-    const isInRange = tilesWithinRange(
+    if (playerDistFromSpawn > aggressionRange) {
+      context.setTarget(null);
+      context.exitCombat();
+      return MobAIState.IDLE;
+    }
+
+    // TILE-BASED RANGE CHECK (uses manifest combatRange)
+    const currentPos = context.getPosition();
+    const currentTile = worldToTile(currentPos.x, currentPos.z);
+    const targetTile = playerTile; // Reuse already computed tile
+    const isInRange = tilesWithinMeleeRange(
       currentTile,
       targetTile,
       combatRangeTiles,
     );
     const isSameTile = tilesEqual(currentTile, targetTile);
 
-    if (!isInRange && !isSameTile) {
+    // OSRS-ACCURATE SAME-TILE HANDLING
+    // When on same tile, NPC cannot attack - must step out first
+    // "The tile underneath the NPC itself is not part of the attack range"
+    if (isSameTile) {
+      // Try to step out to a cardinal tile (checks all 4 directions)
+      // Returns false if ALL directions are blocked (terrain or entities)
+      context.tryStepOutCardinal();
+      // Stay in ATTACK state - we're still in combat, just repositioning
+      return null;
+    }
+
+    // Not in melee range - need to chase
+    if (!isInRange) {
       return MobAIState.CHASE;
     }
 
-    // Perform attack if cooldown ready (TICK-BASED, OSRS-accurate)
+    // In valid attack range - perform attack if cooldown ready
     const currentTick = context.getCurrentTick();
     if (context.canAttack(currentTick)) {
       context.performAttack(targetId, currentTick);
@@ -362,12 +461,20 @@ export class AttackState implements AIState {
 }
 
 /**
- * RETURN State - Walking back to spawn (leashed)
+ * RETURN State - Walking back to spawn (RETREAT ONLY, not for leashing)
  *
- * IMPORTANT: Uses TILE-BASED distance check for arrival detection.
+ * IMPORTANT: This state is for EXPLICIT RETREAT scenarios only:
+ * - Mob stuck for too long (production safety)
+ * - Low HP retreat behavior (future feature)
+ * - Scripted boss retreat mechanics (future feature)
+ *
+ * Normal LEASHING does NOT use this state. When an NPC exceeds its leash range:
+ * - OSRS behavior: NPC stops in place → IDLE → resumes wandering
+ * - Our implementation: CHASE/ATTACK → IDLE (not RETURN)
+ *
+ * Uses TILE-BASED distance check for arrival detection.
  * Movement is tile-based (600ms ticks), so we must check if we're on the
- * same tile as spawn, not world-space distance. This prevents infinite
- * loops when spawn is on the same tile but different world position.
+ * same tile as spawn, not world-space distance.
  */
 export class ReturnState implements AIState {
   readonly name = MobAIState.RETURN;

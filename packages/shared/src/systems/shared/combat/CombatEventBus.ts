@@ -1,39 +1,5 @@
-/**
- * CombatEventBus - Typed event system for combat events
- *
- * Provides type-safe event emission and subscription for combat events,
- * with optional tracing support for debugging.
- *
- * Benefits:
- * - Type-safe event handling (no string-based event names)
- * - Easier debugging with event tracing
- * - Decoupled from World event system
- * - Immutable event data
- *
- * Usage:
- *   const bus = new CombatEventBus();
- *
- *   // Subscribe to events
- *   const unsub = bus.onDamageDealt((event) => {
- *     console.log(`${event.attackerId} dealt ${event.damage} to ${event.targetId}`);
- *   });
- *
- *   // Emit events
- *   bus.emitDamageDealt({
- *     attackerId: "player1",
- *     targetId: "mob1",
- *     damage: 15,
- *     targetType: "mob",
- *     tick: 100,
- *   });
- *
- *   // Unsubscribe when done
- *   unsub();
- */
+/** Type-safe event bus for combat events, decoupled from World */
 
-/**
- * Position in 3D space
- */
 export interface Position3D {
   x: number;
   y: number;

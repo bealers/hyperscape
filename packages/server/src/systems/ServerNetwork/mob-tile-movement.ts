@@ -24,15 +24,22 @@ import {
   World,
   TILES_PER_TICK_WALK,
   worldToTile,
+  worldToTileInto,
   tileToWorld,
   tilesEqual,
   tilesWithinMeleeRange,
+  tileChebyshevDistance,
   chaseStep,
+  getChasePathfinder,
+  MobEntity,
+  getBestUnoccupiedMeleeTile,
+  tileKey,
 } from "@hyperscape/shared";
 import type {
   TileCoord,
   TileMovementState,
   Position3D,
+  EntityID,
 } from "@hyperscape/shared";
 
 /**
@@ -91,6 +98,47 @@ export class MobTileMovementManager {
   private _tempQuat = new THREE.Quaternion();
   // Debug mode - set to true for verbose logging (disabled in production)
   private readonly DEBUG_MODE = false;
+
+  // ============================================================================
+  // PRE-ALLOCATED BUFFERS (Zero-allocation hot path support)
+  // ============================================================================
+
+  /** Zero-allocation chase pathfinder */
+  private readonly _chasePathfinder = getChasePathfinder();
+
+  /** Reusable tile for current position during path calculation */
+  private readonly _currentPosTile: TileCoord = { x: 0, z: 0 };
+
+  /** Reusable tile for target position */
+  private readonly _targetTile: TileCoord = { x: 0, z: 0 };
+
+  /** Reusable tile for actual entity position */
+  private readonly _actualTile: TileCoord = { x: 0, z: 0 };
+
+  /** Pre-allocated path buffer (max 4 tiles per tick for running speed) */
+  private readonly _pathBuffer: TileCoord[] = [
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+  ];
+
+  /** Pre-allocated network path buffer for sending to clients */
+  private readonly _networkPathBuffer: Array<{ x: number; z: number }> = [
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+  ];
+
+  /**
+   * Destination claims for current tick (prevents multiple mobs targeting same tile)
+   *
+   * When a mob selects a melee tile as its destination, it's added here.
+   * Other mobs in the same tick will see it as "claimed" and pick a different tile.
+   * Cleared at the start of each onTick() call.
+   */
+  private readonly _claimedDestinations: Set<string> = new Set();
 
   constructor(
     private world: World,
@@ -251,12 +299,30 @@ export class MobTileMovementManager {
     const chasePath: TileCoord[] = [];
     let currentPos = { ...state.currentTile };
 
+    // OSRS-ACCURATE LEASH RANGE CAP: Get spawn point and leash range
+    // Mobs cannot move beyond leashRange from their spawn point
+    const mobEntity = entity instanceof MobEntity ? entity : null;
+    const spawnPoint = mobEntity?.getSpawnPoint();
+    const leashRange = mobEntity?.getLeashRange() ?? 10;
+    const spawnTile = spawnPoint
+      ? worldToTile(spawnPoint.x, spawnPoint.z)
+      : null;
+
     for (let step = 0; step < tilesPerTick; step++) {
       const nextTile = chaseStep(currentPos, targetTile, (tile) =>
         this.isTileWalkable(tile),
       );
 
       if (!nextTile) break; // Blocked
+
+      // OSRS-ACCURATE: Check if this step would exceed leash range from spawn
+      // If so, stop at current position (mob lingers at edge)
+      if (spawnTile) {
+        const nextDistFromSpawn = tileChebyshevDistance(nextTile, spawnTile);
+        if (nextDistFromSpawn > leashRange) {
+          break; // Would exceed leash range - stop at edge
+        }
+      }
 
       chasePath.push(nextTile);
       currentPos = nextTile;
@@ -356,9 +422,15 @@ export class MobTileMovementManager {
   onTick(tickNumber: number): void {
     const terrain = this.getTerrain();
 
+    // Clear destination claims from previous tick
+    // This prevents mobs from claiming the same melee tile in the same tick
+    this._claimedDestinations.clear();
+
     if (this.DEBUG_MODE && this.mobStates.size > 0) {
+      // Log occupancy stats at tick start
+      const stats = this.world.entityOccupancy.getStats();
       console.log(
-        `[MobTileMovement] onTick #${tickNumber}: Processing ${this.mobStates.size} mobs`,
+        `[MobTileMovement] onTick #${tickNumber}: Processing ${this.mobStates.size} mobs, occupancy: ${stats.occupiedTileCount} tiles, ${stats.trackedEntityCount} entities`,
       );
     }
 
@@ -374,10 +446,16 @@ export class MobTileMovementManager {
         continue;
       }
 
-      if (this.DEBUG_MODE)
+      if (this.DEBUG_MODE) {
+        // Log mob's actual position vs state position (zero-allocation)
+        worldToTileInto(entity.position.x, entity.position.z, this._actualTile);
+        const tileMatch =
+          this._actualTile.x === state.currentTile.x &&
+          this._actualTile.z === state.currentTile.z;
         console.log(
-          `[MobTileMovement] onTick: Mob ${mobId} - hasDestination=${state.hasDestination}, pathLen=${state.path.length}, pathIndex=${state.pathIndex}`,
+          `[MobTileMovement] onTick: Mob ${mobId} - stateTile=(${state.currentTile.x},${state.currentTile.z}), actualTile=(${this._actualTile.x},${this._actualTile.z}), match=${tileMatch}, hasDestination=${state.hasDestination}, isChasing=${state.isChasing}`,
         );
+      }
 
       // OSRS-STYLE DUMB PATHFINDER FOR CHASE MODE
       // Instead of expensive BFS repathing every tick, NPCs use a simple algorithm:
@@ -394,9 +472,11 @@ export class MobTileMovementManager {
         const targetEntity =
           targetPlayer || this.world.entities.get(state.targetEntityId);
         if (targetEntity) {
-          const currentTargetTile = worldToTile(
+          // Zero-allocation: use pre-allocated buffer for target tile
+          worldToTileInto(
             targetEntity.position.x,
             targetEntity.position.z,
+            this._targetTile,
           );
 
           // OSRS COMBAT POSITIONING: Check if we're already in combat range
@@ -406,16 +486,16 @@ export class MobTileMovementManager {
           if (
             tilesWithinMeleeRange(
               state.currentTile,
-              currentTargetTile,
+              this._targetTile,
               combatRange,
             )
           ) {
             // Already in combat range - stop moving and clear path
+            if (this.DEBUG_MODE)
+              console.log(
+                `[MobTileMovement] IN RANGE: Mob ${mobId} at (${state.currentTile.x},${state.currentTile.z}) is in combat range (${combatRange}) of target at (${this._targetTile.x},${this._targetTile.z}), skipping movement`,
+              );
             if (state.path.length > 0 || state.hasDestination) {
-              if (this.DEBUG_MODE)
-                console.log(
-                  `[MobTileMovement] Already in combat range (${combatRange}) of target at (${currentTargetTile.x},${currentTargetTile.z}), stopping`,
-                );
               state.path = [];
               state.pathIndex = 0;
               state.hasDestination = false;
@@ -436,15 +516,62 @@ export class MobTileMovementManager {
             continue; // Skip movement processing - we're in attack range
           }
 
-          // NOT in combat range - use chase pathfinder to calculate steps toward target
-          // Calculate up to tilesPerTick steps (O(1) per step, unlike BFS which is O(tiles²))
-          const chasePath: TileCoord[] = [];
-          let currentPos = { ...state.currentTile };
+          // NOT in combat range - find best unoccupied melee tile and path toward it
+          // This prevents all mobs from trying to reach the same tile around the player
+          // Also check claimed destinations to prevent multiple mobs targeting same tile in same tick
+          const destinationTile = getBestUnoccupiedMeleeTile(
+            state.currentTile,
+            this._targetTile,
+            this.world.entityOccupancy,
+            mobId as EntityID,
+            (tile) =>
+              this.isTileWalkable(tile) &&
+              !this._claimedDestinations.has(tileKey(tile)),
+            combatRange,
+          );
+
+          // If no unoccupied melee tile available, wait (creates queuing behavior)
+          if (!destinationTile) {
+            if (this.DEBUG_MODE)
+              console.log(
+                `[MobTileMovement] WAIT: Mob ${mobId} at (${state.currentTile.x},${state.currentTile.z}) - all melee tiles around target (${this._targetTile.x},${this._targetTile.z}) are occupied or claimed, waiting`,
+              );
+            state.path = [];
+            state.pathIndex = 0;
+            state.hasDestination = false;
+            continue; // Skip movement - wait for a tile to open up
+          }
+
+          // Claim this destination so other mobs in this tick won't target it
+          this._claimedDestinations.add(tileKey(destinationTile));
+
+          if (this.DEBUG_MODE)
+            console.log(
+              `[MobTileMovement] DESTINATION: Mob ${mobId} targeting unoccupied melee tile (${destinationTile.x},${destinationTile.z}) around player at (${this._targetTile.x},${this._targetTile.z})`,
+            );
+
+          // Calculate up to tilesPerTick steps toward the unoccupied melee tile
+          // Zero-allocation: use pre-allocated currentPos tile and ChasePathfinder
+          let pathLength = 0;
+          this._currentPosTile.x = state.currentTile.x;
+          this._currentPosTile.z = state.currentTile.z;
+
+          // OSRS-ACCURATE LEASH RANGE CAP: Get spawn point and leash range
+          // Mobs cannot move beyond leashRange from their spawn point
+          const mobEntity = entity instanceof MobEntity ? entity : null;
+          const spawnPoint = mobEntity?.getSpawnPoint();
+          const leashRange = mobEntity?.getLeashRange() ?? 10;
+          const spawnTile = spawnPoint
+            ? worldToTile(spawnPoint.x, spawnPoint.z)
+            : null;
 
           for (let step = 0; step < state.tilesPerTick; step++) {
-            // Check if this step would put us in combat range
-            const nextTile = chaseStep(currentPos, currentTargetTile, (tile) =>
-              this.isTileWalkable(tile),
+            // Check if this step would put us in combat range (path toward destination tile, not player)
+            // Zero-allocation: use pre-allocated ChasePathfinder
+            const nextTile = this._chasePathfinder.chaseStep(
+              this._currentPosTile,
+              destinationTile,
+              (tile) => this.isTileWalkable(tile),
             );
 
             if (!nextTile) {
@@ -452,35 +579,66 @@ export class MobTileMovementManager {
               break;
             }
 
-            chasePath.push(nextTile);
-            currentPos = nextTile;
+            // OSRS-ACCURATE: Check if this step would exceed leash range from spawn
+            // If so, stop at current position (mob lingers at edge)
+            if (spawnTile) {
+              const nextDistFromSpawn = tileChebyshevDistance(
+                nextTile,
+                spawnTile,
+              );
+              if (nextDistFromSpawn > leashRange) {
+                break; // Would exceed leash range - stop at edge
+              }
+            }
+
+            // Zero-allocation: copy to pre-allocated path buffer
+            this._pathBuffer[pathLength].x = nextTile.x;
+            this._pathBuffer[pathLength].z = nextTile.z;
+            pathLength++;
+
+            // Update current position for next iteration (zero-allocation)
+            this._currentPosTile.x = nextTile.x;
+            this._currentPosTile.z = nextTile.z;
 
             // Stop early if we'll be in combat range after this step (OSRS melee rules)
             if (
-              tilesWithinMeleeRange(nextTile, currentTargetTile, combatRange)
+              tilesWithinMeleeRange(nextTile, this._targetTile, combatRange)
             ) {
               break;
             }
           }
 
-          if (chasePath.length > 0) {
-            state.path = chasePath;
+          if (pathLength > 0) {
+            // Copy path buffer to state.path (slice to exact length needed)
+            state.path = this._pathBuffer.slice(0, pathLength);
             state.pathIndex = 0;
             state.hasDestination = true;
-            state.lastTargetTile = { ...currentTargetTile };
+            // Zero-allocation: copy values instead of spread
+            if (!state.lastTargetTile) {
+              state.lastTargetTile = { x: 0, z: 0 };
+            }
+            state.lastTargetTile.x = this._targetTile.x;
+            state.lastTargetTile.z = this._targetTile.z;
 
             // CRITICAL: Increment moveSeq and send tileMovementStart with new path
             // Without this, the client only receives entityTileUpdate (sync packets)
             // and has no path to interpolate through, causing teleporting
             state.moveSeq = (state.moveSeq || 0) + 1;
+
+            // Zero-allocation: copy path to pre-allocated network buffer
+            for (let i = 0; i < pathLength; i++) {
+              this._networkPathBuffer[i].x = this._pathBuffer[i].x;
+              this._networkPathBuffer[i].z = this._pathBuffer[i].z;
+            }
+
             this.sendFn("tileMovementStart", {
               id: mobId,
               startTile: { x: state.currentTile.x, z: state.currentTile.z },
-              path: chasePath.map((t) => ({ x: t.x, z: t.z })),
+              path: this._networkPathBuffer.slice(0, pathLength),
               running: state.isRunning,
               destinationTile: {
-                x: chasePath[chasePath.length - 1].x,
-                z: chasePath[chasePath.length - 1].z,
+                x: this._pathBuffer[pathLength - 1].x,
+                z: this._pathBuffer[pathLength - 1].z,
               },
               moveSeq: state.moveSeq,
               isMob: true,
@@ -488,10 +646,14 @@ export class MobTileMovementManager {
               tilesPerTick: state.tilesPerTick, // Mob-specific speed for client interpolation
             });
 
-            if (this.DEBUG_MODE)
+            if (this.DEBUG_MODE) {
+              const pathStr = state.path
+                .map((t) => `(${t.x},${t.z})`)
+                .join(" -> ");
               console.log(
-                `[MobTileMovement] Chase: ${chasePath.length} steps toward target (${currentTargetTile.x},${currentTargetTile.z})`,
+                `[MobTileMovement] CHASE PATH: Mob ${mobId} from (${state.currentTile.x},${state.currentTile.z}) path: ${pathStr} toward destination (${destinationTile.x},${destinationTile.z}) [player at (${this._targetTile.x},${this._targetTile.z})]`,
               );
+            }
           } else {
             // All directions blocked - NPC is stuck (safespotted!)
             // This is intentional behavior - NPCs don't search around obstacles
@@ -569,6 +731,29 @@ export class MobTileMovementManager {
           break;
         }
 
+        // OSRS-ACCURATE ENTITY COLLISION: Check if tile is blocked by another NPC
+        // Per OSRS: Pathfinder IGNORES entity collision - it's checked HERE at movement time
+        // If blocked: movement fails, path is RETAINED for retry next tick
+        // This creates the "waiting behind" behavior seen in OSRS
+        const isBlocked = this.world.entityOccupancy.isBlocked(
+          nextTile,
+          mobId as EntityID,
+        );
+        if (isBlocked) {
+          if (this.DEBUG_MODE) {
+            const occupant = this.world.entityOccupancy.getOccupant(nextTile);
+            console.log(
+              `[MobTileMovement] COLLISION: Mob ${mobId} at (${state.currentTile.x},${state.currentTile.z}) cannot move to (${nextTile.x},${nextTile.z}) - blocked by ${occupant?.entityId}`,
+            );
+          }
+          // Path is RETAINED - will retry next tick (OSRS-accurate)
+          break;
+        } else if (this.DEBUG_MODE) {
+          console.log(
+            `[MobTileMovement] MOVE OK: ${mobId} moving to (${nextTile.x},${nextTile.z})`,
+          );
+        }
+
         state.currentTile = { ...nextTile };
         state.pathIndex++;
       }
@@ -593,6 +778,16 @@ export class MobTileMovementManager {
       entity.position.set(worldPos.x, worldPos.y, worldPos.z);
       if (entity.data) {
         entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
+      }
+
+      // Update entity occupancy after movement (OSRS-accurate tile collision)
+      // This updates the EntityOccupancyMap to reflect the mob's new position
+      if (entity instanceof MobEntity) {
+        if (this.DEBUG_MODE)
+          console.log(
+            `[MobTileMovement] OCCUPANCY UPDATE: ${mobId} now at tile (${state.currentTile.x},${state.currentTile.z})`,
+          );
+        entity.updateOccupancy();
       }
 
       // Calculate rotation based on movement direction
@@ -667,6 +862,231 @@ export class MobTileMovementManager {
             },
           });
         }
+      }
+    }
+  }
+
+  /**
+   * Process movement for a specific mob on this tick
+   *
+   * OSRS-ACCURATE: Called by GameTickProcessor during NPC phase
+   * This processes just one mob's movement instead of all mobs.
+   * NPCs process BEFORE players in OSRS, which creates damage asymmetry.
+   *
+   * @param mobId - The mob to process movement for
+   * @param tickNumber - Current tick number
+   */
+  processMobTick(mobId: string, tickNumber: number): void {
+    const state = this.mobStates.get(mobId);
+    if (!state) return;
+
+    const entity = this.world.entities.get(mobId);
+    if (!entity) {
+      this.mobStates.delete(mobId);
+      return;
+    }
+
+    const terrain = this.getTerrain();
+
+    // OSRS-STYLE DUMB PATHFINDER FOR CHASE MODE
+    if (state.isChasing && state.targetEntityId) {
+      const targetPlayer = this.world.getPlayer?.(state.targetEntityId);
+      const targetEntity =
+        targetPlayer || this.world.entities.get(state.targetEntityId);
+
+      if (targetEntity) {
+        const currentTargetTile = worldToTile(
+          targetEntity.position.x,
+          targetEntity.position.z,
+        );
+
+        // Check if we're already in combat range
+        const combatRange = state.combatRange || 1;
+        if (
+          tilesWithinMeleeRange(
+            state.currentTile,
+            currentTargetTile,
+            combatRange,
+          )
+        ) {
+          return; // In range, no need to move
+        }
+
+        // Find best unoccupied melee tile (prevents stacking)
+        // Also check claimed destinations to prevent multiple mobs targeting same tile
+        const destinationTile = getBestUnoccupiedMeleeTile(
+          state.currentTile,
+          currentTargetTile,
+          this.world.entityOccupancy,
+          mobId as EntityID,
+          (tile) =>
+            this.isTileWalkable(tile) &&
+            !this._claimedDestinations.has(tileKey(tile)),
+          combatRange,
+        );
+
+        // If no unoccupied melee tile available, wait
+        if (!destinationTile) {
+          return; // All melee tiles occupied or claimed - wait for one to open up
+        }
+
+        // Claim this destination so other mobs in this tick won't target it
+        this._claimedDestinations.add(tileKey(destinationTile));
+
+        // Calculate chase path toward the unoccupied melee tile
+        const newPath: TileCoord[] = [];
+        let currentPos = { ...state.currentTile };
+
+        // OSRS-ACCURATE LEASH RANGE CAP: Get spawn point and leash range
+        // Mobs cannot move beyond leashRange from their spawn point
+        const mobEntity = entity instanceof MobEntity ? entity : null;
+        const spawnPoint = mobEntity?.getSpawnPoint();
+        const leashRange = mobEntity?.getLeashRange() ?? 10;
+        const spawnTile = spawnPoint
+          ? worldToTile(spawnPoint.x, spawnPoint.z)
+          : null;
+
+        for (let step = 0; step < state.tilesPerTick; step++) {
+          const nextTile = chaseStep(currentPos, destinationTile, (tile) =>
+            this.isTileWalkable(tile),
+          );
+
+          if (!nextTile) break;
+
+          // OSRS-ACCURATE: Check if this step would exceed leash range from spawn
+          // If so, stop at current position (mob lingers at edge)
+          if (spawnTile) {
+            const nextDistFromSpawn = tileChebyshevDistance(
+              nextTile,
+              spawnTile,
+            );
+            if (nextDistFromSpawn > leashRange) {
+              break; // Would exceed leash range - stop at edge
+            }
+          }
+
+          newPath.push(nextTile);
+          currentPos = nextTile;
+
+          if (tilesWithinMeleeRange(nextTile, currentTargetTile, combatRange))
+            break;
+        }
+
+        if (newPath.length === 0) {
+          return; // Blocked - safespotted
+        }
+
+        state.path = newPath;
+        state.pathIndex = 0;
+        state.lastTargetTile = { ...currentTargetTile };
+      }
+    }
+
+    // Skip if no path or at end
+    if (state.path.length === 0 || state.pathIndex >= state.path.length) {
+      return;
+    }
+
+    // Store previous position for rotation
+    const prevTile = { ...state.currentTile };
+
+    // Move up to tilesPerTick tiles
+    for (let i = 0; i < state.tilesPerTick; i++) {
+      if (state.pathIndex >= state.path.length) break;
+      const nextTile = state.path[state.pathIndex];
+
+      // OSRS-ACCURATE ENTITY COLLISION: Check if tile is blocked by another NPC
+      // Per OSRS: Pathfinder IGNORES entity collision - it's checked HERE at movement time
+      // If blocked: movement fails, path is RETAINED for retry next tick
+      if (this.world.entityOccupancy.isBlocked(nextTile, mobId as EntityID)) {
+        // Path is RETAINED - will retry next tick (OSRS-accurate)
+        break;
+      }
+
+      state.currentTile = { ...nextTile };
+      state.pathIndex++;
+    }
+
+    // Convert tile to world position
+    const worldPos = tileToWorld(state.currentTile);
+
+    // Get terrain height
+    if (terrain) {
+      const height = terrain.getHeightAt(worldPos.x, worldPos.z);
+      if (height !== null && Number.isFinite(height)) {
+        worldPos.y = (height as number) + 0.1;
+      }
+    }
+
+    // Update entity position on server
+    entity.position.set(worldPos.x, worldPos.y, worldPos.z);
+    if (entity.data) {
+      entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
+    }
+
+    // Update entity occupancy after movement (OSRS-accurate tile collision)
+    if (entity instanceof MobEntity) {
+      entity.updateOccupancy();
+    }
+
+    // Calculate rotation based on movement direction
+    const prevWorld = tileToWorld(prevTile);
+    const dx = worldPos.x - prevWorld.x;
+    const dz = worldPos.z - prevWorld.z;
+
+    if (Math.abs(dx) + Math.abs(dz) > 0.01) {
+      const yaw = Math.atan2(-dx, -dz);
+      this._tempQuat.setFromAxisAngle(this._up, yaw);
+
+      if (entity.node) {
+        entity.node.quaternion.copy(this._tempQuat);
+      }
+      if (entity.data) {
+        entity.data.quaternion = [
+          this._tempQuat.x,
+          this._tempQuat.y,
+          this._tempQuat.z,
+          this._tempQuat.w,
+        ];
+      }
+    }
+
+    // Broadcast tile position update
+    this.sendFn("entityTileUpdate", {
+      id: mobId,
+      tile: state.currentTile,
+      worldPos: [worldPos.x, worldPos.y, worldPos.z],
+      quaternion: entity.data?.quaternion,
+      emote: "walk",
+      tickNumber,
+      moveSeq: state.moveSeq,
+      isMob: true,
+    });
+
+    // Check if arrived at destination
+    if (state.pathIndex >= state.path.length) {
+      state.hasDestination = false;
+
+      this.sendFn("tileMovementEnd", {
+        id: mobId,
+        tile: state.currentTile,
+        worldPos: [worldPos.x, worldPos.y, worldPos.z],
+        moveSeq: state.moveSeq,
+        isMob: true,
+      });
+
+      state.path = [];
+      state.pathIndex = 0;
+
+      if (!state.isChasing) {
+        this.sendFn("entityModified", {
+          id: mobId,
+          changes: {
+            p: [worldPos.x, worldPos.y, worldPos.z],
+            v: [0, 0, 0],
+            e: "idle",
+          },
+        });
       }
     }
   }

@@ -111,9 +111,16 @@ import { COMBAT_CONSTANTS } from "../../constants/CombatConstants";
 import { AggroManager } from "../managers/AggroManager";
 import {
   worldToTile,
+  tileToWorld,
   TICK_DURATION_MS,
+  tileChebyshevDistance,
+  getBestStepOutTile,
+  type TileCoord,
 } from "../../systems/shared/movement/TileSystem";
-import { attackSpeedSecondsToTicks } from "../../utils/game/CombatCalculations";
+import type { EntityID } from "../../types/core/identifiers";
+import { getNPCSize, getOccupiedTiles } from "./LargeNPCSupport";
+import { getGameRng } from "../../utils/SeededRandom";
+import { isTerrainSystem } from "../../utils/typeGuards";
 
 // Polyfill ProgressEvent for Node.js server environment
 if (typeof ProgressEvent === "undefined") {
@@ -139,14 +146,12 @@ if (typeof ProgressEvent === "undefined") {
 export class MobEntity extends CombatantEntity {
   protected config: MobEntityConfig;
 
-  // ===== COMPONENTS (Clean Separation of Concerns) =====
   private deathManager: DeathStateManager;
   private combatManager: CombatStateManager;
   private aiStateMachine: AIStateMachine;
   private respawnManager: RespawnManager;
   private aggroManager: AggroManager;
 
-  // ===== RENDERING =====
   private _avatarInstance: VRMAvatarInstance | null = null;
   private _currentEmote: string | null = null;
   private _serverEmote: string | null = null; // Server-forced one-shot emote (e.g., combat)
@@ -164,36 +169,279 @@ export class MobEntity extends CombatantEntity {
   // Placeholder hitbox for click detection before VRM loads (RuneScape-style: entity is functional immediately)
   private _placeholderHitbox: THREE.Mesh | null = null;
 
-  // ===== PATROL SYSTEM (Can be componentized later) =====
   private patrolPoints: Array<{ x: number; z: number }> = [];
   private currentPatrolIndex = 0;
 
-  // ===== MOVEMENT (Can be componentized later) =====
   private _wanderTarget: { x: number; z: number } | null = null;
   private _lastPosition: THREE.Vector3 | null = null;
   private _stuckTimer = 0;
-  private readonly WANDER_MIN_DISTANCE = 1; // Minimum wander distance
-  private readonly WANDER_MAX_DISTANCE = 5; // Maximum wander distance
   private readonly STUCK_TIMEOUT = 3000; // Give up after 3 seconds stuck
   // Tile movement throttling - prevent emitting duplicate move requests
   // Uses tick-based throttling (aligned with 600ms server ticks) instead of time-based
   private _lastRequestedTargetTile: { x: number; z: number } | null = null;
   private _lastMoveRequestTick: number = -1;
 
-  // ===== SPAWN TRACKING =====
-  // Track the mob's CURRENT spawn location (changes on respawn)
+  // Pre-allocated buffers for zero-allocation hot path operations
+  /** Reusable buffer for occupied tiles (max 5x5 = 25 tiles for large bosses) */
+  private readonly _occupiedTilesBuffer: TileCoord[] = Array.from(
+    { length: 25 },
+    () => ({ x: 0, z: 0 }),
+  );
+
+  /** Reusable buffer for cardinal step-out tiles */
+  private readonly _cardinalBuffer: TileCoord[] = [
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+  ];
+
+  /** Pre-allocated tile for current position */
+  private readonly _currentTile: TileCoord = { x: 0, z: 0 };
+
+  /** Shuffle indices for random cardinal selection (avoids array allocation) */
+  private readonly _shuffleIndices: number[] = [0, 1, 2, 3];
+
+  /** Cached NPC size (avoid repeated lookups) */
+  private _cachedNPCSize: { width: number; depth: number } | null = null;
+
+  /** Track if occupancy is currently registered */
+  private _occupancyRegistered = false;
+
+  /** Reusable tile for spawn checking */
+  private readonly _spawnCheckTile: TileCoord = { x: 0, z: 0 };
+
+  /** Max spiral search radius for unoccupied spawn tile */
+  private readonly MAX_SPAWN_SEARCH_RADIUS = 10;
+
+  /**
+   * Find an unoccupied tile for spawning using spiral search
+   *
+   * OSRS Mechanic: If spawn tile is occupied, search outward in expanding rings
+   * until an unoccupied tile is found. Uses Chebyshev distance (8-connected).
+   *
+   * @param centerX - Center tile X coordinate
+   * @param centerZ - Center tile Z coordinate
+   * @returns Unoccupied tile coordinates, or null if none found within radius
+   */
+  private findUnoccupiedSpawnTile(
+    centerX: number,
+    centerZ: number,
+  ): TileCoord | null {
+    // Cache NPC size on first call
+    if (!this._cachedNPCSize) {
+      this._cachedNPCSize = getNPCSize(this.config.mobType);
+    }
+
+    // Check center tile first
+    this._spawnCheckTile.x = centerX;
+    this._spawnCheckTile.z = centerZ;
+
+    // For multi-tile NPCs, check all tiles they would occupy
+    const tileCount = getOccupiedTiles(
+      this._spawnCheckTile,
+      this._cachedNPCSize,
+      this._occupiedTilesBuffer,
+    );
+
+    // Check if center is unoccupied (check all tiles for multi-tile NPCs)
+    let centerOccupied = false;
+    for (let i = 0; i < tileCount; i++) {
+      if (this.world.entityOccupancy.isOccupied(this._occupiedTilesBuffer[i])) {
+        centerOccupied = true;
+        break;
+      }
+    }
+    if (!centerOccupied) {
+      return { x: centerX, z: centerZ };
+    }
+
+    // Spiral search outward in expanding rings (Chebyshev distance)
+    // Ring order: distance 1 (8 tiles), distance 2 (16 tiles), etc.
+    for (let dist = 1; dist <= this.MAX_SPAWN_SEARCH_RADIUS; dist++) {
+      // Check all tiles at this Chebyshev distance
+      // Iterate the ring: top row, bottom row, left column, right column (excluding corners already covered)
+      for (let dx = -dist; dx <= dist; dx++) {
+        for (let dz = -dist; dz <= dist; dz++) {
+          // Only check tiles at exactly this distance (ring, not filled square)
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== dist) continue;
+
+          const checkX = centerX + dx;
+          const checkZ = centerZ + dz;
+
+          this._spawnCheckTile.x = checkX;
+          this._spawnCheckTile.z = checkZ;
+
+          // Get occupied tiles for this candidate position
+          const candTileCount = getOccupiedTiles(
+            this._spawnCheckTile,
+            this._cachedNPCSize,
+            this._occupiedTilesBuffer,
+          );
+
+          // Check if all tiles are unoccupied
+          let isValid = true;
+          for (let i = 0; i < candTileCount; i++) {
+            if (
+              this.world.entityOccupancy.isOccupied(
+                this._occupiedTilesBuffer[i],
+              )
+            ) {
+              isValid = false;
+              break;
+            }
+          }
+
+          if (isValid) {
+            return { x: checkX, z: checkZ };
+          }
+        }
+      }
+    }
+
+    // No unoccupied tile found within radius - shouldn't happen in normal gameplay
+    console.warn(
+      `[MobEntity] No unoccupied spawn tile found within ${this.MAX_SPAWN_SEARCH_RADIUS} tiles for ${this.config.name}`,
+    );
+    return null;
+  }
+
+  /**
+   * Register this mob's tile occupancy in EntityOccupancyMap
+   *
+   * Called after spawn/respawn to set collision flags on tiles this mob occupies.
+   * Uses pre-allocated buffers to avoid hot path allocations.
+   *
+   * OSRS Mechanic: Flags set when entity spawns/moves TO a tile
+   * If spawn tile is occupied, finds nearby unoccupied tile first.
+   */
+  private registerOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    // Cache NPC size on first call (avoids repeated lookups)
+    if (!this._cachedNPCSize) {
+      this._cachedNPCSize = getNPCSize(this.config.mobType);
+    }
+
+    // Get current world position and convert to tile
+    const pos = this.getPosition();
+    this._currentTile.x = Math.floor(pos.x);
+    this._currentTile.z = Math.floor(pos.z);
+
+    // Check if spawn tile is already occupied by another mob
+    // If so, find an unoccupied tile nearby (OSRS-accurate: NPCs don't stack)
+    const unoccupiedTile = this.findUnoccupiedSpawnTile(
+      this._currentTile.x,
+      this._currentTile.z,
+    );
+
+    if (
+      unoccupiedTile &&
+      (unoccupiedTile.x !== this._currentTile.x ||
+        unoccupiedTile.z !== this._currentTile.z)
+    ) {
+      // Relocate mob to unoccupied tile
+      const worldPos = tileToWorld(unoccupiedTile);
+      this.position.x = worldPos.x;
+      this.position.z = worldPos.z;
+      // Update current tile to the new position
+      this._currentTile.x = unoccupiedTile.x;
+      this._currentTile.z = unoccupiedTile.z;
+    }
+
+    // Fill occupied tiles buffer (zero-allocation using pre-allocated buffer)
+    const tileCount = getOccupiedTiles(
+      this._currentTile,
+      this._cachedNPCSize,
+      this._occupiedTilesBuffer,
+    );
+
+    // Check if this mob should ignore collision (bosses, special NPCs)
+    const ignoresCollision = this.config.ignoresEntityCollision === true;
+
+    // Register with EntityOccupancyMap
+    this.world.entityOccupancy.occupy(
+      this.id as EntityID,
+      this._occupiedTilesBuffer,
+      tileCount,
+      "mob",
+      ignoresCollision,
+    );
+
+    this._occupancyRegistered = true;
+  }
+
+  /**
+   * Remove this mob's tile occupancy from EntityOccupancyMap
+   *
+   * Called when mob dies or despawns to clear collision flags.
+   *
+   * OSRS Mechanic: Flags removed when entity despawns/dies
+   */
+  private unregisterOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    if (!this._occupancyRegistered) return;
+
+    this.world.entityOccupancy.vacate(this.id as EntityID);
+    this._occupancyRegistered = false;
+  }
+
+  /**
+   * Update this mob's tile occupancy after movement
+   *
+   * Called after successful movement to update collision flags.
+   * Uses atomic move() to avoid race conditions.
+   *
+   * OSRS Mechanic: Flags removed from old tiles, added to new tiles (in order)
+   * Called by MobTileMovementManager after successful movement.
+   */
+  public updateOccupancy(): void {
+    // Server-only: occupancy tracking is authoritative
+    if (!this.world.isServer) return;
+
+    if (!this._occupancyRegistered) {
+      // If not registered, register instead of update
+      this.registerOccupancy();
+      return;
+    }
+
+    // Cache NPC size on first call
+    if (!this._cachedNPCSize) {
+      this._cachedNPCSize = getNPCSize(this.config.mobType);
+    }
+
+    // Get current world position and convert to tile
+    const pos = this.getPosition();
+    this._currentTile.x = Math.floor(pos.x);
+    this._currentTile.z = Math.floor(pos.z);
+
+    // Fill occupied tiles buffer
+    const tileCount = getOccupiedTiles(
+      this._currentTile,
+      this._cachedNPCSize,
+      this._occupiedTilesBuffer,
+    );
+
+    // Atomic move (removes old, adds new)
+    this.world.entityOccupancy.move(
+      this.id as EntityID,
+      this._occupiedTilesBuffer,
+      tileCount,
+    );
+  }
+
+  // Track the mob's current spawn location (changes on respawn)
   // This is different from respawnManager.getSpawnAreaCenter() which is fixed
   private _currentSpawnPoint: Position3D;
 
-  // ===== DEBUG TRACKING =====
   private _justRespawned = false; // Track if we just respawned (for one-time logging)
 
-  // ===== TICK-ALIGNED AI =====
   // AI runs once per server tick (600ms), not every frame (~16ms)
-  // This prevents excessive movement requests and aligns with OSRS tick system
   private _lastAITick: number = -1;
 
-  // ===== HEALTH BAR (HealthBars system - atlas-based instanced mesh) =====
   private _healthBarHandle: HealthBarHandle | null = null; // Handle to HealthBars system
   private _healthBarVisibleUntil: number = 0; // Timestamp when health bar should hide
   private _lastKnownHealth: number = 0; // Track previous health to detect damage
@@ -264,12 +512,16 @@ export class MobEntity extends CombatantEntity {
     super(world, combatConfig);
     this.config = config;
 
+    // Entity constructor defaults to 100/100 - sync with config
+    this.health = config.currentHealth;
+    this.maxHealth = config.maxHealth;
+    this.data.health = this.health;
+    (this.data as { maxHealth?: number }).maxHealth = this.maxHealth;
+
     // Manifest is source of truth for respawnTime - no minimum enforcement
     if (!this.config.respawnTime) {
       this.config.respawnTime = 15000; // Default 15s if not specified
     }
-
-    // ===== INITIALIZE COMPONENTS =====
 
     // Death State Manager
     this.deathManager = new DeathStateManager({
@@ -333,10 +585,19 @@ export class MobEntity extends CombatantEntity {
       }
     });
 
-    // CRITICAL: Use RespawnManager for INITIAL spawn too (not just respawn)
-    // This ensures the mob spawns at a random location within the spawn area
-    // instead of always at the same fixed point
-    const initialSpawnPoint = this.respawnManager.generateSpawnPoint();
+    // CRITICAL: Server uses RespawnManager to generate random spawn position
+    // Client uses position from config (which comes from network data - the server's authoritative position)
+    // This prevents client from generating its own random position that differs from server
+    let initialSpawnPoint: Position3D;
+
+    if (this.world.isServer) {
+      // Server: Generate random position within spawn area
+      initialSpawnPoint = this.respawnManager.generateSpawnPoint();
+    } else {
+      // Client: Use position from network data (via config.spawnPoint)
+      // The server already determined the correct position, client should not randomize
+      initialSpawnPoint = { ...this.config.spawnPoint };
+    }
 
     // Track current spawn location for AI (patrol, leashing, return)
     this._currentSpawnPoint = { ...initialSpawnPoint };
@@ -351,6 +612,10 @@ export class MobEntity extends CombatantEntity {
       initialSpawnPoint.y,
       initialSpawnPoint.z,
     );
+
+    // Register tile occupancy for OSRS-accurate NPC collision
+    // Called after position is set (server-only, no-op on client)
+    this.registerOccupancy();
 
     this.generatePatrolPoints();
 
@@ -768,13 +1033,10 @@ export class MobEntity extends CombatantEntity {
       return;
     }
 
-    // ===== PHASE 1: CREATE PLACEHOLDER HITBOX IMMEDIATELY =====
-    // RuneScape-style: Entity is functional (clickable, attackable) before visuals load
-    // This fixes the race condition where mobs spawned before VRM loads are "glitched"
+    // Create placeholder hitbox for immediate click detection before VRM loads
     this.createPlaceholderHitbox();
 
-    // ===== PHASE 2: LOAD VRM MODEL IN BACKGROUND (NON-BLOCKING) =====
-    // Try to load 3D model if available
+    // Load 3D model in background (non-blocking)
     if (this.config.model && this.world.loader) {
       try {
         // Check if this is a VRM file
@@ -803,8 +1065,7 @@ export class MobEntity extends CombatantEntity {
         this.mesh = scene;
         this.mesh.name = `Mob_${this.config.mobType}_${this.id}`;
 
-        // CRITICAL: Scale the root mesh transform, then bind skeleton
-        // Apply cm→m conversion (100x) multiplied by manifest scale
+        // Scale root mesh (cm to meters) and apply manifest scale
         const modelScale = 100; // cm to meters
         const configScale = this.config.scale;
         this.mesh.scale.set(
@@ -873,11 +1134,7 @@ export class MobEntity extends CombatantEntity {
       }
     }
 
-    // ===== PHASE 3: UPGRADE TO VISIBLE PLACEHOLDER =====
-    // No model or model loading failed - make placeholder visible for debugging
-    // The invisible placeholder is already functional (clickable/attackable)
-    // This replaces it with a visible colored capsule for mobs without models
-
+    // No model available - create visible placeholder capsule
     // Remove invisible placeholder (if it's still the current mesh)
     if (this.mesh === this._placeholderHitbox) {
       this.removePlaceholderHitbox();
@@ -1041,8 +1298,9 @@ export class MobEntity extends CombatantEntity {
       // CRITICAL: Return mob's current spawn point (changes on respawn)
       // NOT the spawn area center (which is fixed)
       getSpawnPoint: () => this._currentSpawnPoint,
-      getDistanceFromSpawn: () => this.getDistance2D(this._currentSpawnPoint),
+      getDistanceFromSpawn: () => this.getSpawnDistanceTiles(), // OSRS Chebyshev tiles
       getWanderRadius: () => this.respawnManager.getSpawnAreaRadius(),
+      getLeashRange: () => this.config.leashRange ?? 7, // OSRS-accurate: 7 tiles max range from spawn
       getCombatRange: () => this.config.combatRange,
 
       // Wander
@@ -1067,39 +1325,106 @@ export class MobEntity extends CombatantEntity {
       emitEvent: (eventType, data) => {
         this.world.emit(eventType as EventType, data);
       },
+
+      // Entity Occupancy (OSRS-accurate NPC collision)
+      getEntityId: () => this.id as EntityID,
+      getEntityOccupancy: () => this.world.entityOccupancy,
+      isWalkable: (tile) => {
+        // Check terrain walkability using TerrainSystem if available
+        const terrain = this.world.getSystem("terrain");
+        if (isTerrainSystem(terrain)) {
+          const worldPos = tileToWorld(tile);
+          const result = terrain.isPositionWalkable(worldPos.x, worldPos.z);
+          return result.walkable;
+        }
+        // Fallback: assume walkable if no terrain system
+        return true;
+      },
+
+      // Same-tile step-out (OSRS-accurate)
+      // When NPC is on same tile as target, it cannot attack.
+      // Tries all 4 cardinal directions in shuffled order, picking the first
+      // valid tile (walkable terrain + no entity blocking).
+      // Returns false if ALL directions are blocked (mob is stuck).
+      tryStepOutCardinal: (): boolean => {
+        const currentPos = this.getPosition();
+        const currentTile = worldToTile(currentPos.x, currentPos.z);
+
+        // Use game RNG for deterministic shuffled direction order
+        const rng = getGameRng();
+
+        // Find best step-out tile (checks walkability + entity occupancy)
+        // Uses shuffled order for OSRS-style randomness
+        const stepOutTile = getBestStepOutTile(
+          currentTile,
+          this.world.entityOccupancy,
+          this.id as EntityID,
+          (tile) => {
+            // Check terrain walkability using type guard
+            const terrain = this.world.getSystem?.("terrain");
+            if (isTerrainSystem(terrain)) {
+              const worldPos = tileToWorld(tile);
+              const result = terrain.isPositionWalkable(worldPos.x, worldPos.z);
+              return result.walkable;
+            }
+            // Fallback: assume walkable if no terrain system
+            return true;
+          },
+          rng,
+        );
+
+        // If no valid tile found, all directions are blocked
+        if (!stepOutTile) {
+          // All cardinal tiles blocked - wait for next tick
+          // In OSRS, mob would be stuck until a tile opens up
+          return false;
+        }
+
+        // Convert to world position
+        const targetWorld = tileToWorld(stepOutTile);
+        const targetPos = {
+          x: targetWorld.x,
+          y: currentPos.y,
+          z: targetWorld.z,
+        };
+
+        // Emit movement request
+        this.world.emit(EventType.MOB_NPC_MOVE_REQUEST, {
+          mobId: this.id,
+          targetPos: targetPos,
+          targetEntityId: undefined, // Not chasing - just stepping out
+          tilesPerTick: 1, // Single tile step
+        });
+
+        return true; // Valid tile found and movement requested
+      },
     };
   }
 
   /**
-   * Generate a random wander target within wander radius
+   * Generate a random wander target within wander radius (OSRS-accurate)
+   *
+   * OSRS generates wander targets relative to SPAWN, not current position.
+   * This ensures NPCs naturally drift back toward spawn over time,
+   * even after being leashed far from their spawn point.
+   *
    * Uses CURRENT spawn point (changes on respawn), not fixed config.spawnPoint
    */
   private generateWanderTarget(): Position3D {
-    const currentPos = this.getPosition();
-    const angle = Math.random() * Math.PI * 2;
-    const distance =
-      this.WANDER_MIN_DISTANCE +
-      Math.random() * (this.WANDER_MAX_DISTANCE - this.WANDER_MIN_DISTANCE);
+    const spawn = this._currentSpawnPoint;
+    const radius = this.config.wanderRadius;
 
-    let targetX = currentPos.x + Math.cos(angle) * distance;
-    let targetZ = currentPos.z + Math.sin(angle) * distance;
+    // OSRS-accurate: Random tile within [-radius, +radius] of spawn
+    // This creates a square wander area centered on spawn
+    const range = 2 * radius + 1;
+    const offsetX = Math.floor(Math.random() * range) - radius;
+    const offsetZ = Math.floor(Math.random() * range) - radius;
 
-    // Ensure target is within wander radius from CURRENT spawn point
-    const distFromSpawn = Math.sqrt(
-      Math.pow(targetX - this._currentSpawnPoint.x, 2) +
-        Math.pow(targetZ - this._currentSpawnPoint.z, 2),
-    );
-
-    if (distFromSpawn > this.config.wanderRadius) {
-      // Clamp to wander radius boundary
-      const toTargetX = targetX - this._currentSpawnPoint.x;
-      const toTargetZ = targetZ - this._currentSpawnPoint.z;
-      const scale = this.config.wanderRadius / distFromSpawn;
-      targetX = this._currentSpawnPoint.x + toTargetX * scale;
-      targetZ = this._currentSpawnPoint.z + toTargetZ * scale;
-    }
-
-    return { x: targetX, y: currentPos.y, z: targetZ };
+    return {
+      x: spawn.x + offsetX,
+      y: this.getPosition().y,
+      z: spawn.z + offsetZ,
+    };
   }
 
   /**
@@ -1159,6 +1484,9 @@ export class MobEntity extends CombatantEntity {
     this.node.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
     this.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
 
+    // Register tile occupancy at new spawn location
+    this.registerOccupancy();
+
     // Update userData
     if (this.mesh?.userData) {
       const userData = this.mesh.userData as MeshUserData;
@@ -1207,8 +1535,6 @@ export class MobEntity extends CombatantEntity {
     super.serverUpdate(deltaTime);
     this.serverUpdateCalls++;
 
-    // ===== COMPONENT-BASED UPDATE LOGIC =====
-
     // Handle death state (position locking during death animation)
     if (this.deathManager.isCurrentlyDead()) {
       // Use Date.now() for consistent millisecond timing (world.getTime() has inconsistent units)
@@ -1253,12 +1579,7 @@ export class MobEntity extends CombatantEntity {
       }
     }
 
-    // ===== TICK-ALIGNED AI UPDATE =====
-    // Only run AI once per server tick (600ms), not every frame (~16ms)
-    // This aligns with OSRS tick system and prevents excessive movement requests
-    //
-    // world.currentTick is set by ServerNetwork's TickSystem at the start of each tick
-    // On client, currentTick is always 0, so AI won't run (client mobs are visual only)
+    // AI runs once per server tick (600ms), not every frame
     const currentTick = this.world.currentTick;
     if (currentTick === this._lastAITick) {
       // Same tick as last AI update - skip AI processing
@@ -1469,16 +1790,26 @@ export class MobEntity extends CombatantEntity {
         if (targetPlayer && targetPlayer.position) {
           const dx = targetPlayer.position.x - this.position.x;
           const dz = targetPlayer.position.z - this.position.z;
-          let angle = Math.atan2(dx, dz);
+          const distanceSquared = dx * dx + dz * dz;
 
-          // VRM 1.0+ models have 180° base rotation, so we need to compensate
-          // Otherwise entities face AWAY from each other instead of towards
-          angle += Math.PI;
+          // OSRS-ACCURATE: Skip rotation when on same tile (distance too small)
+          // Prevents 180° flips from floating-point instability when dx ≈ 0, dz ≈ 0
+          // Threshold: 0.25 = 0.5^2 (half a tile)
+          const MIN_ROTATION_DISTANCE_SQ = 0.25;
 
-          // Apply rotation to node quaternion
-          const tempQuat = new THREE.Quaternion();
-          tempQuat.setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
-          this.node.quaternion.copy(tempQuat);
+          if (distanceSquared >= MIN_ROTATION_DISTANCE_SQ) {
+            let angle = Math.atan2(dx, dz);
+
+            // VRM 1.0+ models have 180° base rotation, so we need to compensate
+            // Otherwise entities face AWAY from each other instead of towards
+            angle += Math.PI;
+
+            // Apply rotation to node quaternion
+            const tempQuat = new THREE.Quaternion();
+            tempQuat.setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+            this.node.quaternion.copy(tempQuat);
+          }
+          // else: preserve current facing direction (no rotation update)
         }
       }
 
@@ -1599,9 +1930,7 @@ export class MobEntity extends CombatantEntity {
       return;
     }
 
-    // ===== PLACEHOLDER MODE: VRM still loading in background =====
-    // If mesh is the placeholder hitbox, VRM is still loading asynchronously
-    // Skip animation updates - placeholder doesn't animate
+    // If mesh is the placeholder hitbox, skip animation (VRM still loading)
     if (this.mesh === this._placeholderHitbox) {
       // Just update position from terrain while waiting for VRM to load
       const terrain = this.world.getSystem("terrain");
@@ -1680,7 +2009,7 @@ export class MobEntity extends CombatantEntity {
 
   /**
    * Calculate 2D horizontal distance (XZ plane only, ignoring Y)
-   * Used for spawn/wander radius checks to avoid Y-axis terrain height issues
+   * @deprecated Use getSpawnDistanceTiles() for leash/spawn checks - OSRS uses Chebyshev distance
    */
   private getDistance2D(point: Position3D): number {
     const pos = this.getPosition();
@@ -1689,9 +2018,40 @@ export class MobEntity extends CombatantEntity {
     return Math.sqrt(dx * dx + dz * dz);
   }
 
-  takeDamage(damage: number, attackerId?: string): boolean {
-    // ===== COMPONENT-BASED DAMAGE HANDLING =====
+  /**
+   * Calculate tile-based Chebyshev distance from spawn point (OSRS-accurate)
+   *
+   * OSRS uses Chebyshev distance (max of dx, dz) for tile-based checks.
+   * This is critical for diagonal positions:
+   * - Euclidean: (6,6) from (0,0) = 8.49 tiles (WRONG)
+   * - Chebyshev: (6,6) from (0,0) = 6 tiles (CORRECT)
+   */
+  private getSpawnDistanceTiles(): number {
+    const pos = this.getPosition();
+    const spawn = this._currentSpawnPoint;
+    const currentTile = worldToTile(pos.x, pos.z);
+    const spawnTile = worldToTile(spawn.x, spawn.z);
+    return tileChebyshevDistance(currentTile, spawnTile);
+  }
 
+  /**
+   * Get the mob's current spawn point (public accessor for movement capping)
+   * Used by MobTileMovementManager to enforce OSRS-accurate leash range
+   */
+  getSpawnPoint(): Position3D {
+    return this._currentSpawnPoint;
+  }
+
+  /**
+   * Get the mob's leash range (max tiles from spawn during chase)
+   * OSRS-accurate default: 7 tiles max range from spawn
+   * @see https://oldschool.runescape.wiki/w/Aggressiveness
+   */
+  getLeashRange(): number {
+    return this.config.leashRange ?? 7;
+  }
+
+  takeDamage(damage: number, attackerId?: string): boolean {
     // Already dead - ignore damage
     if (this.deathManager.isCurrentlyDead()) {
       return false;
@@ -1746,7 +2106,8 @@ export class MobEntity extends CombatantEntity {
   }
 
   die(): void {
-    // ===== COMPONENT-BASED DEATH HANDLING =====
+    // Unregister tile occupancy (dead NPCs don't block tiles)
+    this.unregisterOccupancy();
 
     // Use Date.now() for consistent millisecond timing (world.getTime() has inconsistent units)
     const currentTime = Date.now();
@@ -1952,7 +2313,22 @@ export class MobEntity extends CombatantEntity {
 
     const currentPos = this.getPosition();
     const players = this.world.getPlayers();
-    return this.aggroManager.findNearbyPlayer(currentPos, players);
+
+    // OSRS-Accurate Aggression Range:
+    // The aggression range origin is the static spawn point of the NPC.
+    // Aggression range = max range (leash) + attack range (combat range)
+    // Players must be within this distance of SPAWN to be attacked.
+    // @see https://oldschool.runescape.wiki/w/Aggressiveness
+    const leashRange = this.config.leashRange ?? 7;
+    const attackRange = Math.max(1, this.config.combatRange);
+    const aggressionRange = leashRange + attackRange;
+
+    return this.aggroManager.findNearbyPlayer(
+      currentPos,
+      players,
+      this._currentSpawnPoint, // Spawn point for OSRS-accurate aggression check
+      aggressionRange, // Max attack distance from spawn
+    );
   }
 
   /**
@@ -2029,6 +2405,7 @@ export class MobEntity extends CombatantEntity {
       attack: this.config.attack,
       attackPower: this.config.attackPower,
       defense: this.config.defense,
+      defenseBonus: this.config.defenseBonus ?? 0,
       attackSpeedTicks: this.config.attackSpeedTicks,
       xpReward: this.config.xpReward,
       aiState: this.mapAIStateToInterface(this.config.aiState),
@@ -2078,8 +2455,6 @@ export class MobEntity extends CombatantEntity {
   // Network data override
   getNetworkData(): Record<string, unknown> {
     const baseData = super.getNetworkData();
-
-    // ===== COMPONENT-BASED NETWORK SYNC =====
 
     // Handle death state separately
     if (this.deathManager.isCurrentlyDead()) {
@@ -2174,8 +2549,6 @@ export class MobEntity extends CombatantEntity {
    * Override modify to handle network updates from server
    */
   override modify(data: Partial<EntityData>): void {
-    // ===== COMPONENT-BASED CLIENT-SIDE NETWORK UPDATES =====
-
     // Handle AI state changes
     if ("aiState" in data) {
       const newState = data.aiState as MobAIState;
@@ -2327,10 +2700,7 @@ export class MobEntity extends CombatantEntity {
       }
     }
 
-    // ===== POSITION HANDLING =====
-    // The base Entity.modify() does NOT handle position - we must do it here
     // Handle position for living mobs (non-death, non-respawn cases)
-    // Death/respawn position is handled above in the aiState logic
     if (!this.deathManager.shouldLockPosition()) {
       // Check if TileInterpolator is controlling position - if so, skip position updates
       // TileInterpolator handles position smoothly for tile-based movement

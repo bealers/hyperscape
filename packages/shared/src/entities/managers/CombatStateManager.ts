@@ -1,27 +1,12 @@
 /**
- * CombatStateManager - Manages mob combat state and attack logic (TICK-BASED)
- *
- * Responsibilities:
- * - Track combat state (in combat vs peaceful)
- * - Manage attack cooldowns using game ticks (OSRS-accurate)
- * - Validate attack conditions
- * - Prevent teleporting while in combat
- * - Track last attacker
- *
- * Combat state is used to prevent exploits:
- * - Prevents safety teleport while fighting
- * - Prevents mob from resetting mid-combat
- * - Tracks who gets loot/XP credit
- *
+ * Tracks mob combat state and attack timing.
+ * First attack delayed one tick after entering range.
  * @see https://oldschool.runescape.wiki/w/Attack_speed
  */
 
 export interface CombatStateConfig {
-  /** Attack power/damage */
   attackPower: number;
-  /** Attack speed in TICKS (e.g., 4 = attack every 4 ticks / 2.4 seconds) */
   attackSpeedTicks: number;
-  /** Attack range in units */
   attackRange: number;
 }
 
@@ -32,7 +17,9 @@ export class CombatStateManager {
   private lastAttackerId: string | null = null;
   private config: CombatStateConfig;
 
-  // Callbacks
+  private _pendingFirstAttack = false;
+  private _firstAttackTick = -1;
+
   private onAttackCallback?: (targetId: string) => void;
   private onCombatStartCallback?: () => void;
   private onCombatEndCallback?: () => void;
@@ -41,9 +28,6 @@ export class CombatStateManager {
     this.config = config;
   }
 
-  /**
-   * Mark as in combat (called when taking damage or attacking)
-   */
   enterCombat(attackerId?: string): void {
     const wasInCombat = this.inCombat;
     this.inCombat = true;
@@ -57,45 +41,53 @@ export class CombatStateManager {
     }
   }
 
-  /**
-   * Exit combat (called when mob resets or respawns)
-   */
   exitCombat(): void {
     const wasInCombat = this.inCombat;
     this.inCombat = false;
     this.lastAttackTick = -Infinity;
     this.nextAttackTick = 0;
     this.lastAttackerId = null;
+    this._pendingFirstAttack = false;
+    this._firstAttackTick = -1;
 
     if (wasInCombat && this.onCombatEndCallback) {
       this.onCombatEndCallback();
     }
   }
 
-  /**
-   * Check if currently in combat
-   */
+  /** First attack happens next tick, not immediately */
+  onEnterCombatRange(currentTick: number): void {
+    if (!this.inCombat) {
+      this.inCombat = true;
+      this._pendingFirstAttack = true;
+      this._firstAttackTick = currentTick + 1;
+
+      if (this.onCombatStartCallback) {
+        this.onCombatStartCallback();
+      }
+    }
+  }
+
   isInCombat(): boolean {
     return this.inCombat;
   }
 
-  /**
-   * Check if mob can attack on this tick (TICK-BASED)
-   * @param currentTick - Current server tick number
-   */
   canAttack(currentTick: number): boolean {
+    if (this._pendingFirstAttack) {
+      return currentTick >= this._firstAttackTick;
+    }
     return currentTick >= this.nextAttackTick;
   }
 
-  /**
-   * Perform attack (validates cooldown and sets next attack tick)
-   * Returns true if attack was performed, false if on cooldown
-   * @param targetId - ID of the target entity
-   * @param currentTick - Current server tick number
-   */
+  /** Returns false if on cooldown */
   performAttack(targetId: string, currentTick: number): boolean {
     if (!this.canAttack(currentTick)) {
       return false;
+    }
+
+    if (this._pendingFirstAttack) {
+      this._pendingFirstAttack = false;
+      this._firstAttackTick = -1;
     }
 
     this.lastAttackTick = currentTick;
@@ -109,100 +101,70 @@ export class CombatStateManager {
     return true;
   }
 
-  /**
-   * Called when mob is attacked - sets OSRS retaliation timing
-   * Formula: ceil(attack_speed / 2) + 1 ticks after being hit
-   * @see https://oldschool.runescape.wiki/w/Auto_Retaliate
-   *
-   * @param currentTick - Current server tick number
-   */
+  /** Retaliate timing: ceil(speed/2)+1 ticks. @see https://oldschool.runescape.wiki/w/Auto_Retaliate */
   onReceiveAttack(currentTick: number): void {
     const retaliationDelay = Math.ceil(this.config.attackSpeedTicks / 2) + 1;
     const retaliationTick = currentTick + retaliationDelay;
 
-    // Only set if not already attacking sooner
     if (!this.inCombat || retaliationTick < this.nextAttackTick) {
       this.nextAttackTick = retaliationTick;
     }
   }
 
-  /**
-   * Get last attacker ID (for death event / loot)
-   */
   getLastAttackerId(): string | null {
     return this.lastAttackerId;
   }
 
-  /**
-   * Get attack power
-   */
   getAttackPower(): number {
     return this.config.attackPower;
   }
 
-  /**
-   * Get attack range
-   */
   getAttackRange(): number {
     return this.config.attackRange;
   }
 
-  /**
-   * Get attack speed in ticks
-   */
   getAttackSpeedTicks(): number {
     return this.config.attackSpeedTicks;
   }
 
-  /**
-   * Get last attack tick (for network sync)
-   */
   getLastAttackTick(): number {
     return this.lastAttackTick;
   }
 
-  /**
-   * Get next attack tick (for network sync)
-   */
   getNextAttackTick(): number {
     return this.nextAttackTick;
   }
 
-  /**
-   * Set next attack tick (from network sync)
-   */
   setNextAttackTick(tick: number): void {
     this.nextAttackTick = tick;
   }
 
-  /**
-   * Register callback for when attack is performed
-   */
   onAttack(callback: (targetId: string) => void): void {
     this.onAttackCallback = callback;
   }
 
-  /**
-   * Register callback for combat start
-   */
   onCombatStart(callback: () => void): void {
     this.onCombatStartCallback = callback;
   }
 
-  /**
-   * Register callback for combat end
-   */
   onCombatEnd(callback: () => void): void {
     this.onCombatEndCallback = callback;
   }
 
-  /**
-   * Reset to initial state
-   */
   reset(): void {
     this.inCombat = false;
     this.lastAttackTick = -Infinity;
     this.nextAttackTick = 0;
     this.lastAttackerId = null;
+    this._pendingFirstAttack = false;
+    this._firstAttackTick = -1;
+  }
+
+  isPendingFirstAttack(): boolean {
+    return this._pendingFirstAttack;
+  }
+
+  getFirstAttackTick(): number {
+    return this._firstAttackTick;
   }
 }

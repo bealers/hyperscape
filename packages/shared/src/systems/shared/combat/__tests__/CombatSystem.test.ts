@@ -67,10 +67,12 @@ function createMockPlayer(
 }
 
 // Mock mob entity
+// NOTE: Default position (1, 0, 0) is CARDINAL adjacent to player at (0, 0, 0)
+// OSRS melee range 1 requires cardinal adjacency (no diagonal attacks)
 function createMockMob(
   id: string,
   health: number = 50,
-  position = { x: 1, y: 0, z: 1 },
+  position = { x: 1, y: 0, z: 0 },
 ) {
   let currentHealth = health;
   return {
@@ -137,9 +139,23 @@ function createMockWorld(
     },
     getPlayer: (id: string) => players.get(id),
     getSystem: (name: string) => {
+      if (name === "entity-manager") {
+        // Required by CombatSystem.init()
+        return {
+          getEntity: (id: string) => entities.get(id) || players.get(id),
+        };
+      }
       if (name === "equipment") {
         return {
           getPlayerEquipment: () => ({ weapon: null }),
+        };
+      }
+      if (name === "player") {
+        return {
+          damagePlayer: vi.fn(),
+          getPlayer: (id: string) => players.get(id),
+          // Critical: Return auto-retaliate setting (default true)
+          getPlayerAutoRetaliate: () => true,
         };
       }
       if (name === "mob-npc") {
@@ -170,7 +186,7 @@ describe("CombatSystem", () => {
   let mockPlayers: Map<string, any>;
   let mockMobs: Map<string, any>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockPlayers = new Map();
     mockMobs = new Map();
     mockWorld = createMockWorld({
@@ -180,6 +196,8 @@ describe("CombatSystem", () => {
     });
 
     combatSystem = new CombatSystem(mockWorld as any);
+    // CRITICAL: Call init() to cache playerSystem for auto-retaliate checks
+    await combatSystem.init();
   });
 
   afterEach(() => {
@@ -192,7 +210,7 @@ describe("CombatSystem", () => {
     });
 
     it("initializes anti-cheat system", () => {
-      const stats = combatSystem.getAntiCheatStats();
+      const stats = combatSystem.antiCheat.getStats();
       expect(stats.trackedPlayers).toBe(0);
     });
 
@@ -357,7 +375,7 @@ describe("CombatSystem", () => {
 
     it("cleans up anti-cheat tracking on disconnect", () => {
       // Record a violation first
-      const antiCheatStats = combatSystem.getAntiCheatStats();
+      const antiCheatStats = combatSystem.antiCheat.getStats();
       // The cleanup should work even with no violations
       expect(() => {
         combatSystem.cleanupPlayerDisconnect("player1");
@@ -366,8 +384,8 @@ describe("CombatSystem", () => {
   });
 
   describe("anti-cheat integration", () => {
-    it("getAntiCheatStats returns stats", () => {
-      const stats = combatSystem.getAntiCheatStats();
+    it("antiCheat.getStats returns stats", () => {
+      const stats = combatSystem.antiCheat.getStats();
 
       expect(stats).toHaveProperty("trackedPlayers");
       expect(stats).toHaveProperty("playersAboveWarning");
@@ -375,16 +393,16 @@ describe("CombatSystem", () => {
       expect(stats).toHaveProperty("totalViolationsLast5Min");
     });
 
-    it("getAntiCheatPlayerReport returns report", () => {
-      const report = combatSystem.getAntiCheatPlayerReport("player1");
+    it("antiCheat.getPlayerReport returns report", () => {
+      const report = combatSystem.antiCheat.getPlayerReport("player1");
 
       expect(report).toHaveProperty("score");
       expect(report).toHaveProperty("recentViolations");
       expect(report).toHaveProperty("attacksThisTick");
     });
 
-    it("getPlayersRequiringReview returns array", () => {
-      const players = combatSystem.getPlayersRequiringReview();
+    it("antiCheat.getPlayersRequiringReview returns array", () => {
+      const players = combatSystem.antiCheat.getPlayersRequiringReview();
       expect(Array.isArray(players)).toBe(true);
     });
 
@@ -394,8 +412,8 @@ describe("CombatSystem", () => {
       }).not.toThrow();
     });
 
-    it("getAntiCheatConfig returns configuration", () => {
-      const config = combatSystem.getAntiCheatConfig();
+    it("antiCheat.getConfig returns configuration", () => {
+      const config = combatSystem.antiCheat.getConfig();
 
       expect(config).toHaveProperty("warningThreshold");
       expect(config).toHaveProperty("alertThreshold");

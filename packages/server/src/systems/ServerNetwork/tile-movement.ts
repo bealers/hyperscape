@@ -16,6 +16,7 @@ import {
   THREE,
   TerrainSystem,
   World,
+  EventType,
   // Tile movement utilities
   TILES_PER_TICK_WALK,
   TILES_PER_TICK_RUN,
@@ -161,6 +162,9 @@ export class TileMovementManager {
       state.path = [];
       state.pathIndex = 0;
 
+      // RS3-style: Clear movement flag so combat can resume
+      playerEntity.data.tileMovementActive = false;
+
       // Broadcast idle state
       const curr = playerEntity.position;
       this.sendFn("entityModified", {
@@ -203,6 +207,24 @@ export class TileMovementManager {
     // Increment movement sequence for packet ordering
     // Client uses this to ignore stale packets from previous movements
     state.moveSeq = (state.moveSeq || 0) + 1;
+
+    // Set movement flag for tracking active tile movement
+    if (path.length > 0) {
+      playerEntity.data.tileMovementActive = true;
+
+      // OSRS-accurate: Clicking ground cancels your attack
+      // Player is walking away - they're no longer attacking their target
+      // The mob continues chasing them, and auto-retaliate can trigger if hit
+      this.world.emit(EventType.COMBAT_PLAYER_DISENGAGE, {
+        playerId: playerId,
+      });
+
+      // Cancel any pending attack - player chose a different destination
+      // This handles the case where player was walking to a mob but changed their mind
+      this.world.emit(EventType.PENDING_ATTACK_CANCEL, {
+        playerId: playerId,
+      });
+    }
 
     // Immediately rotate player toward destination and send first tile update
     if (path.length > 0) {
@@ -382,6 +404,9 @@ export class TileMovementManager {
         state.path = [];
         state.pathIndex = 0;
 
+        // RS3-style: Clear movement flag so combat can resume
+        entity.data.tileMovementActive = false;
+
         // Broadcast idle state
         this.sendFn("entityModified", {
           id: playerId,
@@ -392,6 +417,123 @@ export class TileMovementManager {
           },
         });
       }
+    }
+  }
+
+  /**
+   * Process movement for a specific player on this tick
+   *
+   * OSRS-ACCURATE: Called by GameTickProcessor during player phase
+   * This processes just one player's movement instead of all players.
+   *
+   * @param playerId - The player to process movement for
+   * @param tickNumber - Current tick number
+   */
+  processPlayerTick(playerId: string, tickNumber: number): void {
+    const state = this.playerStates.get(playerId);
+    if (!state) return;
+
+    // Skip if no path or at end
+    if (state.path.length === 0 || state.pathIndex >= state.path.length) {
+      return;
+    }
+
+    const entity = this.world.entities.get(playerId);
+    if (!entity) {
+      this.playerStates.delete(playerId);
+      return;
+    }
+
+    const terrain = this.getTerrain();
+
+    // Store previous position for rotation calculation
+    const prevTile = { ...state.currentTile };
+
+    // Move 1 tile (walk) or 2 tiles (run) per tick
+    const tilesToMove = state.isRunning
+      ? TILES_PER_TICK_RUN
+      : TILES_PER_TICK_WALK;
+
+    for (let i = 0; i < tilesToMove; i++) {
+      if (state.pathIndex >= state.path.length) break;
+
+      const nextTile = state.path[state.pathIndex];
+      state.currentTile = { ...nextTile };
+      state.pathIndex++;
+    }
+
+    // Convert tile to world position
+    const worldPos = tileToWorld(state.currentTile);
+
+    // Get terrain height
+    if (terrain) {
+      const height = terrain.getHeightAt(worldPos.x, worldPos.z);
+      if (height !== null && Number.isFinite(height)) {
+        worldPos.y = (height as number) + 0.1;
+      }
+    }
+
+    // Update entity position on server
+    entity.position.set(worldPos.x, worldPos.y, worldPos.z);
+    entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
+
+    // Calculate rotation based on movement direction
+    const prevWorld = tileToWorld(prevTile);
+    const dx = worldPos.x - prevWorld.x;
+    const dz = worldPos.z - prevWorld.z;
+
+    if (Math.abs(dx) + Math.abs(dz) > 0.01) {
+      const yaw = Math.atan2(-dx, -dz);
+      this._tempQuat.setFromAxisAngle(this._up, yaw);
+
+      if (entity.node) {
+        entity.node.quaternion.copy(this._tempQuat);
+      }
+      entity.data.quaternion = [
+        this._tempQuat.x,
+        this._tempQuat.y,
+        this._tempQuat.z,
+        this._tempQuat.w,
+      ];
+    }
+
+    // Broadcast tile position update to clients
+    this.sendFn("entityTileUpdate", {
+      id: playerId,
+      tile: state.currentTile,
+      worldPos: [worldPos.x, worldPos.y, worldPos.z],
+      quaternion: entity.data.quaternion,
+      emote: state.isRunning ? "run" : "walk",
+      tickNumber,
+      moveSeq: state.moveSeq,
+    });
+
+    // Check if arrived at destination
+    if (state.pathIndex >= state.path.length) {
+      // Broadcast movement end
+      this.sendFn("tileMovementEnd", {
+        id: playerId,
+        tile: state.currentTile,
+        worldPos: [worldPos.x, worldPos.y, worldPos.z],
+        moveSeq: state.moveSeq,
+      });
+
+      // Clear path
+      state.path = [];
+      state.pathIndex = 0;
+
+      // RS3-style: Clear movement flag so combat can resume
+      entity.data.tileMovementActive = false;
+
+      // Broadcast idle state
+      this.sendFn("entityModified", {
+        id: playerId,
+        changes: {
+          p: [worldPos.x, worldPos.y, worldPos.z],
+          v: [0, 0, 0],
+          e: "idle",
+        },
+      });
     }
   }
 
@@ -436,6 +578,13 @@ export class TileMovementManager {
       state.path = [];
       state.pathIndex = 0;
       state.moveSeq = (state.moveSeq || 0) + 1; // Increment to invalidate stale client packets
+
+      // RS3-style: Clear movement flag so combat can resume
+      const entity = this.world.entities.get(playerId);
+      if (entity?.data) {
+        entity.data.tileMovementActive = false;
+      }
+
       console.log(
         `[TileMovement] Synced ${playerId} position to tile (${newTile.x},${newTile.z}) after respawn/teleport`,
       );
@@ -554,6 +703,9 @@ export class TileMovementManager {
     state.pathIndex = 0;
     state.isRunning = running;
     state.moveSeq = (state.moveSeq || 0) + 1;
+
+    // RS3-style: Set movement flag to suppress combat while moving
+    entity.data.tileMovementActive = true;
 
     // Broadcast movement start
     const nextTile = path[0];

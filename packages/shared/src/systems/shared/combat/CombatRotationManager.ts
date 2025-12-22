@@ -1,17 +1,9 @@
-/**
- * CombatRotationManager - Entity rotation during combat
- *
- * Single Responsibility: Handle entity facing/rotation towards targets
- * Uses pooled quaternions to avoid allocations in hot paths.
- */
+/** Handles entity facing/rotation towards targets using pooled quaternions */
 
 import type { World } from "../../../core/World";
 import { quaternionPool } from "../../../utils/pools/QuaternionPool";
 import { getEntityPosition } from "../../../utils/game/EntityPositionUtils";
 
-/**
- * Position interface for entities
- */
 interface Position3D {
   x: number;
   y: number;
