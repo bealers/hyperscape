@@ -1,3 +1,4 @@
+
 # Implementation Plan: Combat Styles System
 
 > **Issue**: Select multiple combat styles to train multiple combat skills at once #453

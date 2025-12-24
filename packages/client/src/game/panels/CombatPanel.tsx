@@ -48,11 +48,6 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     return true; // OSRS default: ON
   });
 
-  // Debug logging for style changes
-  useEffect(() => {
-    console.log(`[CombatPanel] Current style state: ${style}`);
-  }, [style]);
-
   // Calculate combat level using OSRS formula (melee-only MVP)
   const combatLevel = stats?.skills
     ? (() => {
@@ -89,12 +84,7 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     actions?.actionMethods?.getAttackStyleInfo?.(
       playerId,
       (info: { style: string; cooldown?: number }) => {
-        console.log(
-          "[CombatPanel] getAttackStyleInfo callback received:",
-          info,
-        );
         if (info) {
-          console.log(`[CombatPanel] Setting initial style to: ${info.style}`);
           // Update cache for instant display on panel reopen
           combatStyleCache.set(playerId, info.style);
           setStyle(info.style);
@@ -105,7 +95,6 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
 
     // Initialize auto-retaliate state from server
     actions?.actionMethods?.getAutoRetaliate?.(playerId, (enabled: boolean) => {
-      console.log("[CombatPanel] getAutoRetaliate callback received:", enabled);
       autoRetaliateCache.set(playerId, enabled);
       setAutoRetaliate(enabled);
     });
@@ -123,29 +112,15 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     }
 
     const onUpdate = (data: unknown) => {
-      console.log("[CombatPanel] onUpdate event received:", data);
       const d = data as { playerId: string; currentStyle: { id: string } };
-      if (d.playerId !== playerId) {
-        console.log(
-          `[CombatPanel] Ignoring update for different player: ${d.playerId} vs ${playerId}`,
-        );
-        return;
-      }
-      console.log("[CombatPanel] Setting style to:", d.currentStyle.id);
+      if (d.playerId !== playerId) return;
       // Update cache for instant display on panel reopen
       combatStyleCache.set(playerId, d.currentStyle.id);
       setStyle(d.currentStyle.id);
     };
     const onChanged = (data: unknown) => {
-      console.log("[CombatPanel] onChanged event received:", data);
       const d = data as { playerId: string; currentStyle: { id: string } };
-      if (d.playerId !== playerId) {
-        console.log(
-          `[CombatPanel] Ignoring change for different player: ${d.playerId} vs ${playerId}`,
-        );
-        return;
-      }
-      console.log("[CombatPanel] Setting style to:", d.currentStyle.id);
+      if (d.playerId !== playerId) return;
       // Update cache for instant display on panel reopen
       combatStyleCache.set(playerId, d.currentStyle.id);
       setStyle(d.currentStyle.id);
@@ -178,7 +153,6 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     const onAutoRetaliateChanged = (data: unknown) => {
       const d = data as { playerId: string; enabled: boolean };
       if (d.playerId !== playerId) return;
-      console.log("[CombatPanel] Auto-retaliate changed:", d.enabled);
       autoRetaliateCache.set(playerId, d.enabled);
       setAutoRetaliate(d.enabled);
     };
@@ -233,14 +207,7 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
 
   const changeStyle = (next: string) => {
     const playerId = world.entities?.player?.id;
-    console.log(
-      `[CombatPanel] changeStyle called: ${next}, playerId: ${playerId}, current: ${style}`,
-    );
-
-    if (!playerId) {
-      console.error("[CombatPanel] No playerId found!");
-      return;
-    }
+    if (!playerId) return;
 
     const actions = world.getSystem("actions") as {
       actionMethods?: {
@@ -248,14 +215,8 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       };
     } | null;
 
-    if (!actions?.actionMethods?.changeAttackStyle) {
-      console.error("[CombatPanel] changeAttackStyle action method not found!");
-      return;
-    }
+    if (!actions?.actionMethods?.changeAttackStyle) return;
 
-    console.log(
-      `[CombatPanel] Calling changeAttackStyle(${playerId}, ${next})`,
-    );
     actions.actionMethods.changeAttackStyle(playerId, next);
   };
 
@@ -269,14 +230,9 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       };
     } | null;
 
-    if (!actions?.actionMethods?.setAutoRetaliate) {
-      console.error("[CombatPanel] setAutoRetaliate action method not found!");
-      return;
-    }
+    if (!actions?.actionMethods?.setAutoRetaliate) return;
 
-    const newValue = !autoRetaliate;
-    console.log(`[CombatPanel] Toggling auto-retaliate to: ${newValue}`);
-    actions.actionMethods.setAutoRetaliate(playerId, newValue);
+    actions.actionMethods.setAutoRetaliate(playerId, !autoRetaliate);
   };
 
   // All possible combat styles with their XP training info
@@ -429,10 +385,7 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
         {styles.map((s) => (
           <button
             key={s.id}
-            onClick={() => {
-              console.log(`[CombatPanel] Changing attack style to: ${s.id}`);
-              changeStyle(s.id);
-            }}
+            onClick={() => changeStyle(s.id)}
             disabled={cooldown > 0}
             className="rounded-md py-1 px-1 cursor-pointer transition-all text-[10px] hover:brightness-110"
             style={{
