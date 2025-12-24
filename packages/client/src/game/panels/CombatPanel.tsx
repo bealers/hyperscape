@@ -1,12 +1,73 @@
 import { useEffect, useState, useMemo } from "react";
 import { COLORS } from "../../constants";
-import { EventType, getAvailableStyles, WeaponType } from "@hyperscape/shared";
+import {
+  EventType,
+  getAvailableStyles,
+  WeaponType,
+  type CombatStyle,
+} from "@hyperscape/shared";
 import type {
   ClientWorld,
   PlayerStats,
   PlayerEquipmentItems,
   PlayerHealth,
 } from "../../types";
+
+// Event data interfaces for type-safe event handling
+interface StyleUpdateEvent {
+  playerId: string;
+  currentStyle: { id: string };
+}
+
+interface TargetChangedEvent {
+  targetId: string | null;
+  targetName?: string;
+  targetHealth?: PlayerHealth;
+}
+
+interface TargetHealthEvent {
+  targetId: string;
+  health: PlayerHealth;
+}
+
+interface AutoRetaliateEvent {
+  playerId: string;
+  enabled: boolean;
+}
+
+// Type guards for runtime validation
+function isStyleUpdateEvent(data: unknown): data is StyleUpdateEvent {
+  if (typeof data !== "object" || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.playerId === "string" &&
+    typeof d.currentStyle === "object" &&
+    d.currentStyle !== null &&
+    typeof (d.currentStyle as Record<string, unknown>).id === "string"
+  );
+}
+
+function isTargetChangedEvent(data: unknown): data is TargetChangedEvent {
+  if (typeof data !== "object" || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return d.targetId === null || typeof d.targetId === "string";
+}
+
+function isTargetHealthEvent(data: unknown): data is TargetHealthEvent {
+  if (typeof data !== "object" || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.targetId === "string" &&
+    typeof d.health === "object" &&
+    d.health !== null
+  );
+}
+
+function isAutoRetaliateEvent(data: unknown): data is AutoRetaliateEvent {
+  if (typeof data !== "object" || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return typeof d.playerId === "string" && typeof d.enabled === "boolean";
+}
 
 interface CombatPanelProps {
   world: ClientWorld;
@@ -112,30 +173,26 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     }
 
     const onUpdate = (data: unknown) => {
-      const d = data as { playerId: string; currentStyle: { id: string } };
-      if (d.playerId !== playerId) return;
+      if (!isStyleUpdateEvent(data)) return;
+      if (data.playerId !== playerId) return;
       // Update cache for instant display on panel reopen
-      combatStyleCache.set(playerId, d.currentStyle.id);
-      setStyle(d.currentStyle.id);
+      combatStyleCache.set(playerId, data.currentStyle.id);
+      setStyle(data.currentStyle.id);
     };
     const onChanged = (data: unknown) => {
-      const d = data as { playerId: string; currentStyle: { id: string } };
-      if (d.playerId !== playerId) return;
+      if (!isStyleUpdateEvent(data)) return;
+      if (data.playerId !== playerId) return;
       // Update cache for instant display on panel reopen
-      combatStyleCache.set(playerId, d.currentStyle.id);
-      setStyle(d.currentStyle.id);
+      combatStyleCache.set(playerId, data.currentStyle.id);
+      setStyle(data.currentStyle.id);
     };
 
     // Listen for combat target updates
     const onTargetChanged = (data: unknown) => {
-      const d = data as {
-        targetId: string | null;
-        targetName?: string;
-        targetHealth?: PlayerHealth;
-      };
-      if (d.targetId) {
-        setTargetName(d.targetName || d.targetId);
-        setTargetHealth(d.targetHealth || null);
+      if (!isTargetChangedEvent(data)) return;
+      if (data.targetId) {
+        setTargetName(data.targetName || data.targetId);
+        setTargetHealth(data.targetHealth || null);
       } else {
         setTargetName(null);
         setTargetHealth(null);
@@ -143,18 +200,18 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
     };
 
     const onTargetHealthUpdate = (data: unknown) => {
-      const d = data as { targetId: string; health: PlayerHealth };
-      if (d.targetId && targetName) {
-        setTargetHealth(d.health);
+      if (!isTargetHealthEvent(data)) return;
+      if (data.targetId && targetName) {
+        setTargetHealth(data.health);
       }
     };
 
     // Listen for auto-retaliate changes from server
     const onAutoRetaliateChanged = (data: unknown) => {
-      const d = data as { playerId: string; enabled: boolean };
-      if (d.playerId !== playerId) return;
-      autoRetaliateCache.set(playerId, d.enabled);
-      setAutoRetaliate(d.enabled);
+      if (!isAutoRetaliateEvent(data)) return;
+      if (data.playerId !== playerId) return;
+      autoRetaliateCache.set(playerId, data.enabled);
+      setAutoRetaliate(data.enabled);
     };
 
     world.on(EventType.UI_ATTACK_STYLE_UPDATE, onUpdate, undefined);
@@ -249,7 +306,9 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
       ? (equipment.weapon.weaponType.toLowerCase() as WeaponType)
       : WeaponType.NONE;
     const availableStyleIds = getAvailableStyles(weaponType);
-    return allStyles.filter((s) => availableStyleIds.includes(s.id as never));
+    return allStyles.filter((s) =>
+      (availableStyleIds as readonly string[]).includes(s.id),
+    );
   }, [equipment?.weapon?.weaponType]);
 
   const healthPercent = Math.round((health.current / health.max) * 100);
