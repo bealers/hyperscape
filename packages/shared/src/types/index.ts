@@ -60,7 +60,8 @@ export type {
 } from "./core/core";
 
 // Re-export additional core types that are needed by many modules
-export { AttackType, CombatStyle, ItemType, WeaponType } from "./core/core";
+export { AttackType, ItemType, WeaponType } from "./core/core";
+export type { CombatStyle } from "./core/core";
 
 export type {
   AnimationTask,

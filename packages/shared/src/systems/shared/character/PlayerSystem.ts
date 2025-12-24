@@ -1670,8 +1670,10 @@ export class PlayerSystem extends SystemBase {
       return;
     }
 
-    // Apply damage modifier from attack style
-    const finalDamage = Math.floor(baseDamage * attackStyle.damageModifier);
+    // Apply damage modifier from attack style (default to 1.0 = no modification)
+    const finalDamage = Math.floor(
+      baseDamage * (attackStyle.damageModifier ?? 1.0),
+    );
     data.callback(finalDamage);
   }
 
@@ -1697,10 +1699,10 @@ export class PlayerSystem extends SystemBase {
       return;
     }
 
-    // Apply accuracy modifier from attack style
+    // Apply accuracy modifier from attack style (default to 1.0 = no modification)
     const finalAccuracy = Math.min(
       1.0,
-      baseAccuracy * attackStyle.accuracyModifier,
+      baseAccuracy * (attackStyle.accuracyModifier ?? 1.0),
     );
     data.callback(finalAccuracy);
   }

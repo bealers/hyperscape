@@ -25,7 +25,7 @@ export {
 export type { EquipmentSlotType } from "../game/item-types";
 
 // Re-export from combat-types
-export { CombatStyle } from "../game/combat-types";
+export type { CombatStyle } from "../game/combat-types";
 
 // All other interfaces from core.ts bundled here
 // (Due to time constraints, including ALL remaining interfaces in one file)

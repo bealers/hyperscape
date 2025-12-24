@@ -5,14 +5,19 @@
 
 import type { Position3D } from "../core/base-types";
 import type { AttackType } from "../game/item-types";
+import type { CombatStyle } from "../../utils/game/CombatCalculations";
 
-export enum CombatStyle {
-  AGGRESSIVE = "aggressive",
-  CONTROLLED = "controlled",
-  DEFENSIVE = "defensive",
-  ACCURATE = "accurate",
-  LONGRANGE = "longrange",
-}
+// Re-export CombatStyle from CombatCalculations (single source of truth)
+// This includes the 4 melee styles: accurate, aggressive, defensive, controlled
+export type { CombatStyle };
+
+// Extended combat style type that includes ranged (for future use)
+export type CombatStyleExtended =
+  | "accurate"
+  | "aggressive"
+  | "defensive"
+  | "controlled"
+  | "longrange";
 
 export interface CombatData {
   attackerId: string;
@@ -54,8 +59,11 @@ export interface AttackStyle {
     defense: number;
     constitution: number;
   };
-  damageModifier: number; // Multiplier for damage calculation
-  accuracyModifier: number; // Multiplier for hit chance
+  // Note: damageModifier and accuracyModifier are kept for potential future use
+  // (e.g., prayers, potions, special attacks that use event-based multipliers).
+  // Current implementation uses OSRS-accurate invisible stat boosts in calculateDamage().
+  damageModifier?: number; // Multiplier for damage calculation (unused - see note)
+  accuracyModifier?: number; // Multiplier for hit chance (unused - see note)
   icon: string;
 }
 
