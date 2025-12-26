@@ -16,10 +16,6 @@ export const COMBAT_CONSTANTS = {
   // Pickup range (server-side validation, slightly larger than client to account for movement)
   PICKUP_RANGE: 2.5,
 
-  // Attack timing (RuneScape-style speeds)
-  ATTACK_COOLDOWN_MS: 2400, // 2.4 seconds - standard weapon attack speed (4 ticks)
-  COMBAT_TIMEOUT_MS: 4800, // 4.8 seconds (8 ticks) - OSRS in-combat timer after last hit
-
   // OSRS Constants
   TICK_DURATION_MS: 600, // 0.6 seconds per game tick
 
@@ -110,6 +106,29 @@ export const COMBAT_CONSTANTS = {
   UNTRADEABLE_DESPAWN_TICKS: 300, // 3 minutes (180 seconds / 0.6) - untradeable items
   LOOT_PROTECTION_TICKS: 100, // 1 minute (60 seconds / 0.6) - killer exclusivity
   CORPSE_DESPAWN_TICKS: 200, // 2 minutes - mob corpse despawn
+
+  // Player death timing constants in ticks (OSRS-accurate)
+  // @see https://oldschool.runescape.wiki/w/Death
+  // Use ticksToMs() to convert to milliseconds at point of use
+  DEATH: {
+    /** Death animation duration before respawn screen (8 ticks = 4.8s, OSRS-accurate) */
+    ANIMATION_TICKS: 8,
+
+    /** Cooldown between deaths to prevent spam/exploits (17 ticks = 10.2s) */
+    COOLDOWN_TICKS: 17,
+
+    /** Delay before auto-respawn after reconnecting (1 tick = 0.6s minimum) */
+    RECONNECT_RESPAWN_DELAY_TICKS: 1,
+
+    /** Maximum age of death lock before considered stale (6000 ticks = 1 hour) */
+    STALE_LOCK_AGE_TICKS: 6000,
+
+    /** Default respawn position (Central Haven spawn) */
+    DEFAULT_RESPAWN_POSITION: { x: 0, y: 0, z: 0 } as const,
+
+    /** Default respawn town name */
+    DEFAULT_RESPAWN_TOWN: "Central Haven",
+  } as const,
 
   BASE_CONSTANT: 64, // Added to equipment bonuses in formulas
   EFFECTIVE_LEVEL_CONSTANT: 8, // Added to effective levels
