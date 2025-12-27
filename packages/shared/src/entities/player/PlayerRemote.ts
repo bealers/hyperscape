@@ -129,6 +129,11 @@ export class PlayerRemote extends Entity implements HotReloadable {
     combatTarget: null as string | null,
   };
 
+  /** Combat level for OSRS-style display and PvP range checks */
+  get combatLevel(): number {
+    return (this.data.combatLevel as number) || 3; // Default to OSRS minimum
+  }
+
   // Guard to prevent double initialization
   private _initialized: boolean = false;
 
@@ -182,9 +187,10 @@ export class PlayerRemote extends Entity implements HotReloadable {
 
     this.aura = createNode("group") as Group;
 
-    // Create nametag for name display only (no health - that's now in HealthBars system)
+    // Create nametag with name and combat level (OSRS format: "Name (level-XX)")
     this.nametag = createNode("nametag", {
       label: this.data.name || "",
+      level: (this.data.combatLevel as number) || 3, // Default to OSRS minimum
       active: true,
     }) as Nametag;
     // Set world context for nametag (needed for mounting to Nametags system)
@@ -744,6 +750,11 @@ export class PlayerRemote extends Entity implements HotReloadable {
     if (data.name !== undefined) {
       this.data.name = data.name as string;
       this.nametag.label = (data.name as string) || "";
+    }
+    // Update combat level on nametag (OSRS format: "Name (level-XX)")
+    if (data.combatLevel !== undefined) {
+      this.data.combatLevel = data.combatLevel as number;
+      this.nametag.level = data.combatLevel as number;
     }
     if (data.health !== undefined) {
       const currentHealth = data.health as number;
