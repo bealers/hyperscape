@@ -118,6 +118,7 @@ const names = [
   // Combat packets
   'attackMob',
   'attackPlayer',  // PvP attack
+  'followPlayer',  // Follow another player (OSRS-style)
   'changeAttackStyle',
   'setAutoRetaliate',
   'autoRetaliateChanged',

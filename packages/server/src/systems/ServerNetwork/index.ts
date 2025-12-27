@@ -137,6 +137,8 @@ import {
   handleDialogueClose,
 } from "./handlers/dialogue";
 import { PendingAttackManager } from "./PendingAttackManager";
+import { FollowManager } from "./FollowManager";
+import { handleFollowPlayer } from "./handlers/player";
 
 const defaultSpawn = '{ "position": [0, 50, 0], "quaternion": [0, 0, 0, 1] }';
 
@@ -202,6 +204,7 @@ export class ServerNetwork extends System implements NetworkWithSocket {
   private tileMovementManager!: TileMovementManager;
   private mobTileMovementManager!: MobTileMovementManager;
   private pendingAttackManager!: PendingAttackManager;
+  private followManager!: FollowManager;
   private actionQueue!: ActionQueue;
   private tickSystem!: TickSystem;
   private socketManager!: SocketManager;
@@ -338,6 +341,18 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     this.tickSystem.onTick((tickNumber) => {
       this.pendingAttackManager.processTick(tickNumber);
     }, TickPriority.MOVEMENT); // Same priority as movement, runs after player moves
+
+    // Follow manager - server-authoritative tracking of players following other players
+    // OSRS-style: follower walks behind leader, re-paths when leader moves
+    this.followManager = new FollowManager(
+      this.world,
+      this.tileMovementManager,
+    );
+
+    // Register follow processing (same priority as movement)
+    this.tickSystem.onTick(() => {
+      this.followManager.processTick();
+    }, TickPriority.MOVEMENT);
 
     // Register combat system to process on each tick (after movement, before AI)
     // This is OSRS-accurate: combat runs on the game tick, not per-frame
@@ -541,10 +556,11 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       this.world as { interactionSessionManager?: InteractionSessionManager }
     ).interactionSessionManager = this.interactionSessionManager;
 
-    // Clean up interaction sessions and pending attacks when player disconnects
+    // Clean up interaction sessions, pending attacks, and follows when player disconnects
     this.world.on(EventType.PLAYER_LEFT, (event: { playerId: string }) => {
       this.interactionSessionManager.onPlayerDisconnect(event.playerId);
       this.pendingAttackManager.onPlayerDisconnect(event.playerId);
+      this.followManager.onPlayerDisconnect(event.playerId);
     });
 
     // Initialization manager
@@ -628,9 +644,10 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     // Route movement and combat through action queue for OSRS-style tick processing
     // Actions are queued and processed on tick boundaries, not immediately
     this.handlers["onMoveRequest"] = (socket, data) => {
-      // Cancel any pending attack when player moves elsewhere (OSRS behavior)
+      // Cancel any pending attack or follow when player moves elsewhere (OSRS behavior)
       if (socket.player) {
         this.pendingAttackManager.cancelPendingAttack(socket.player.id);
+        this.followManager.stopFollowing(socket.player.id);
       }
       this.actionQueue.queueMovement(socket, data);
     };
@@ -643,9 +660,10 @@ export class ServerNetwork extends System implements NetworkWithSocket {
         runMode?: boolean;
       };
       if (payload.type === "click" && Array.isArray(payload.target)) {
-        // Cancel any pending attack when player moves elsewhere (OSRS behavior)
+        // Cancel any pending attack or follow when player moves elsewhere (OSRS behavior)
         if (socket.player) {
           this.pendingAttackManager.cancelPendingAttack(socket.player.id);
+          this.followManager.stopFollowing(socket.player.id);
         }
         this.actionQueue.queueMovement(socket, {
           target: payload.target,
@@ -724,6 +742,18 @@ export class ServerNetwork extends System implements NetworkWithSocket {
 
       // Validate and forward to combat handler
       handleAttackPlayer(socket, data, this.world);
+    };
+
+    // Follow another player (OSRS-style)
+    this.handlers["onFollowPlayer"] = (socket, data) => {
+      const playerEntity = socket.player;
+      if (!playerEntity) return;
+
+      // Cancel any pending attack when starting to follow
+      this.pendingAttackManager.cancelPendingAttack(playerEntity.id);
+
+      // Validate and start following
+      handleFollowPlayer(socket, data, this.world, this.followManager);
     };
 
     this.handlers["onChangeAttackStyle"] = (socket, data) =>
