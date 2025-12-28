@@ -710,8 +710,17 @@ export class CombatSystem extends SystemBase {
 
   /**
    * OSRS-accurate: Handle player clicking to move (disengage from combat)
-   * In OSRS, clicking anywhere else cancels your current action including combat.
-   * This allows players to walk away from fights regardless of auto-retaliate setting.
+   * In OSRS, clicking anywhere else cancels YOUR current action including combat.
+   *
+   * CRITICAL: This only affects the DISENGAGING player's combat state.
+   * The player who was attacking them (their target) keeps their combat state
+   * and continues chasing. This is correct OSRS behavior:
+   * - "Deliberate movement out of the opponent's weapon range to force them to follow
+   *    is called dragging." - OSRS Wiki (Free-to-play PvP techniques)
+   * - Pathfinding recalculates every tick when targeting a moving entity
+   *
+   * @see https://oldschool.runescape.wiki/w/Free-to-play_PvP_techniques
+   * @see https://oldschool.runescape.wiki/w/Pathfinding
    */
   private handlePlayerDisengage(playerId: string): void {
     // Check if player is currently attacking something
@@ -721,18 +730,30 @@ export class CombatSystem extends SystemBase {
     }
 
     const targetId = String(combatState.targetId);
+    const typedPlayerId = createEntityID(playerId);
 
-    // End the player's attacking combat state
-    this.forceEndCombat(playerId);
+    // OSRS-ACCURATE: Only remove THIS player's combat state
+    // DO NOT call forceEndCombat() as it removes BOTH players' states!
+    // The target (who may be attacking this player) keeps their combat state
+    // and continues chasing this player. This enables the "dragging" PvP technique.
 
-    // Mark player as "in combat without target" - the mob is still attacking them
+    // Reset emote for disengaging player only
+    this.animationManager.resetEmote(playerId, "player");
+
+    // Clear combat UI state from this player's entity only
+    this.stateService.clearCombatStateFromEntity(playerId, "player");
+
+    // Remove ONLY this player's combat state - NOT the target's!
+    this.stateService.removeCombatState(typedPlayerId);
+
+    // Mark player as "in combat without target" - the attacker is still chasing them
     // This keeps the combat timer active but player won't auto-attack
-    // If auto-retaliate is ON and mob catches up and hits, player will start fighting again
+    // If auto-retaliate is ON and attacker catches up and hits, player will start fighting again
     this.stateService.markInCombatWithoutTarget(playerId, targetId);
 
-    // OSRS-ACCURATE: Do NOT face the mob when walking away
+    // OSRS-ACCURATE: Do NOT face the target when walking away
     // Player should face their walking direction (handled by tile movement)
-    // Only face mob when auto-retaliate triggers (handled by enterCombat)
+    // Only face target when auto-retaliate triggers (handled by enterCombat)
   }
 
   /**
