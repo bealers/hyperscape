@@ -18,7 +18,7 @@ import type { World } from "../../../core/World";
 import type { InventoryItem } from "../../../types/core/core";
 import type { GroundItemSystem } from "../economy/GroundItemSystem";
 import type { DeathStateManager } from "./DeathStateManager";
-import { ZoneType } from "../../../types/death";
+import { ZoneType, type TransactionContext } from "../../../types/death";
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
 import { ticksToMs } from "../../../utils/game/CombatCalculations";
 
@@ -53,7 +53,7 @@ export class WildernessDeathHandler {
     items: InventoryItem[],
     killedBy: string,
     zoneType: ZoneType,
-    tx?: any, // Transaction context for atomic death processing
+    tx?: TransactionContext,
   ): Promise<void> {
     // CRITICAL: Server authority check - prevent client from spawning fake ground items
     if (!this.world.isServer) {

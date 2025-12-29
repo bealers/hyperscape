@@ -19,7 +19,7 @@ import type { InventoryItem } from "../../../types/core/core";
 import type { GroundItemSystem } from "../economy/GroundItemSystem";
 import type { DeathStateManager } from "./DeathStateManager";
 import type { EntityManager } from "..";
-import { ZoneType } from "../../../types/death";
+import { ZoneType, type TransactionContext } from "../../../types/death";
 import { EntityType, InteractionType } from "../../../types/entities";
 import type { HeadstoneEntityConfig } from "../../../types/entities";
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
@@ -63,7 +63,7 @@ export class SafeAreaDeathHandler {
     position: { x: number; y: number; z: number },
     items: InventoryItem[],
     killedBy: string,
-    tx?: any, // Transaction context for atomic death processing
+    tx?: TransactionContext,
   ): Promise<void> {
     // CRITICAL: Server authority check - prevent client from spawning fake gravestones
     if (!this.world.isServer) {

@@ -5,6 +5,37 @@
 
 import type { InventoryItem } from "../core/core";
 
+// =============================================================================
+// DATABASE TRANSACTION SUPPORT
+// =============================================================================
+
+/**
+ * Opaque transaction context type for database operations
+ *
+ * This is a branded type that provides type safety without exposing
+ * the underlying database implementation (Drizzle, Knex, etc.).
+ *
+ * Benefits over `any`:
+ * - Type-distinct: Can't accidentally pass unrelated values
+ * - Self-documenting: Clearly indicates transaction semantics
+ * - Future-proof: Can add methods if needed without breaking changes
+ *
+ * The actual implementation is injected by the server's DatabaseSystem.
+ * On the server, this is a Drizzle transaction handle (NodePgDatabase).
+ *
+ * @example
+ * ```typescript
+ * async handleDeath(playerId: string, ..., tx?: TransactionContext): Promise<void> {
+ *   // Pass tx through to database operations for atomic execution
+ *   await this.databaseSystem.saveDeathLockAsync(data, tx);
+ * }
+ * ```
+ */
+export type TransactionContext = {
+  /** Brand to make this type distinct from other object types */
+  readonly __brand: unique symbol;
+};
+
 /**
  * Zone types for death handling
  */

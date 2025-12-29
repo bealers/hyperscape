@@ -26,7 +26,7 @@ import type { GroundItemSystem } from "../economy/GroundItemSystem";
 import { DeathStateManager } from "../death/DeathStateManager";
 import { SafeAreaDeathHandler } from "../death/SafeAreaDeathHandler";
 import { WildernessDeathHandler } from "../death/WildernessDeathHandler";
-import { ZoneType } from "../../../types/death";
+import { ZoneType, type TransactionContext } from "../../../types/death";
 import type { InventorySystem } from "../character/InventorySystem";
 import { getEntityPosition } from "../../../utils/game/EntityPositionUtils";
 
@@ -35,7 +35,9 @@ interface PlayerSystemLike {
 }
 
 interface DatabaseSystemLike {
-  executeInTransaction: (fn: (tx: unknown) => Promise<void>) => Promise<void>;
+  executeInTransaction: (
+    fn: (tx: TransactionContext) => Promise<void>,
+  ) => Promise<void>;
 }
 
 interface EquipmentSystemLike {
@@ -428,74 +430,76 @@ export class PlayerDeathSystem extends SystemBase {
     let itemsToDrop: InventoryItem[] = [];
 
     try {
-      await databaseSystem.executeInTransaction(async (tx: unknown) => {
-        const inventory = inventorySystem.getInventory(playerId);
-        if (!inventory) {
-          console.warn(`[PlayerDeathSystem] No inventory for ${playerId}`);
-        }
+      await databaseSystem.executeInTransaction(
+        async (tx: TransactionContext) => {
+          const inventory = inventorySystem.getInventory(playerId);
+          if (!inventory) {
+            console.warn(`[PlayerDeathSystem] No inventory for ${playerId}`);
+          }
 
-        const inventoryItems =
-          inventory?.items.map((item, index) => ({
-            id: `death_${playerId}_${Date.now()}_${index}`,
-            itemId: item.itemId,
-            quantity: item.quantity,
-            slot: item.slot,
-            metadata: null,
-          })) || [];
+          const inventoryItems =
+            inventory?.items.map((item, index) => ({
+              id: `death_${playerId}_${Date.now()}_${index}`,
+              itemId: item.itemId,
+              quantity: item.quantity,
+              slot: item.slot,
+              metadata: null,
+            })) || [];
 
-        let equipmentItems: InventoryItem[] = [];
-        if (equipmentSystem) {
-          const equipment = equipmentSystem.getPlayerEquipment(playerId);
-          if (equipment) {
-            equipmentItems = this.convertEquipmentToInventoryItems(
-              equipment,
-              playerId,
+          let equipmentItems: InventoryItem[] = [];
+          if (equipmentSystem) {
+            const equipment = equipmentSystem.getPlayerEquipment(playerId);
+            if (equipment) {
+              equipmentItems = this.convertEquipmentToInventoryItems(
+                equipment,
+                playerId,
+              );
+            }
+          } else {
+            console.warn(
+              "[PlayerDeathSystem] EquipmentSystem not available, only inventory items will drop",
             );
           }
-        } else {
-          console.warn(
-            "[PlayerDeathSystem] EquipmentSystem not available, only inventory items will drop",
-          );
-        }
 
-        itemsToDrop = [...inventoryItems, ...equipmentItems];
-        const zoneType = this.zoneDetection.getZoneType(deathPosition);
+          itemsToDrop = [...inventoryItems, ...equipmentItems];
+          const zoneType = this.zoneDetection.getZoneType(deathPosition);
 
-        if (zoneType === ZoneType.SAFE_AREA) {
-          this.pendingGravestones.set(playerId, {
-            position: deathPosition,
-            items: itemsToDrop,
-            killedBy,
-            zoneType,
-          });
-
-          await this.deathStateManager.createDeathLock(
-            playerId,
-            {
-              gravestoneId: "",
+          if (zoneType === ZoneType.SAFE_AREA) {
+            this.pendingGravestones.set(playerId, {
               position: deathPosition,
-              zoneType: ZoneType.SAFE_AREA,
-              itemCount: itemsToDrop.length,
-            },
-            tx,
-          );
-        } else {
-          await this.wildernessHandler.handleDeath(
-            playerId,
-            deathPosition,
-            itemsToDrop,
-            killedBy,
-            zoneType,
-            tx,
-          );
-        }
+              items: itemsToDrop,
+              killedBy,
+              zoneType,
+            });
 
-        await inventorySystem.clearInventoryImmediate(playerId);
+            await this.deathStateManager.createDeathLock(
+              playerId,
+              {
+                gravestoneId: "",
+                position: deathPosition,
+                zoneType: ZoneType.SAFE_AREA,
+                itemCount: itemsToDrop.length,
+              },
+              tx,
+            );
+          } else {
+            await this.wildernessHandler.handleDeath(
+              playerId,
+              deathPosition,
+              itemsToDrop,
+              killedBy,
+              zoneType,
+              tx,
+            );
+          }
 
-        if (equipmentSystem && equipmentSystem.clearEquipmentImmediate) {
-          await equipmentSystem.clearEquipmentImmediate(playerId);
-        }
-      });
+          await inventorySystem.clearInventoryImmediate(playerId);
+
+          if (equipmentSystem && equipmentSystem.clearEquipmentImmediate) {
+            await equipmentSystem.clearEquipmentImmediate(playerId);
+          }
+        },
+      );
 
       this.postDeathCleanup(playerId, deathPosition, itemsToDrop, killedBy);
     } catch (error) {
