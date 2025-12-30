@@ -988,6 +988,117 @@ export class DatabaseSystem extends SystemBase {
     this.trackAsyncOperation(this.incrementNPCKillAsync(playerId, npcId));
   }
 
+  // ============================================================================
+  // MAINTENANCE METHODS
+  // ============================================================================
+
+  /**
+   * Clean up old sessions asynchronously
+   *
+   * Deletes sessions older than the specified number of days.
+   * Used for maintenance to keep the database clean.
+   *
+   * @param daysOld - Delete sessions older than this many days
+   * @returns Number of sessions deleted
+   */
+  async cleanupOldSessionsAsync(daysOld: number): Promise<number> {
+    return this.sessionRepository.cleanupOldSessionsAsync(daysOld);
+  }
+
+  /**
+   * Clean up old sessions (synchronous wrapper)
+   *
+   * @param daysOld - Delete sessions older than this many days
+   * @returns 0 (actual count available via async method)
+   */
+  cleanupOldSessions(daysOld: number): number {
+    this.trackAsyncOperation(this.cleanupOldSessionsAsync(daysOld));
+    return 0; // Sync version can't return actual count
+  }
+
+  /**
+   * Clean up old chunk activity records asynchronously
+   *
+   * Deletes chunk activity records older than the specified number of days.
+   * Used for maintenance to keep the database clean.
+   *
+   * @param daysOld - Delete records older than this many days
+   * @returns Number of records deleted
+   */
+  async cleanupOldChunkActivityAsync(daysOld: number): Promise<number> {
+    return this.worldChunkRepository.cleanupOldChunkActivityAsync(daysOld);
+  }
+
+  /**
+   * Clean up old chunk activity records (synchronous wrapper)
+   *
+   * @param daysOld - Delete records older than this many days
+   * @returns 0 (actual count available via async method)
+   */
+  cleanupOldChunkActivity(daysOld: number): number {
+    this.trackAsyncOperation(this.cleanupOldChunkActivityAsync(daysOld));
+    return 0; // Sync version can't return actual count
+  }
+
+  /**
+   * Get database statistics asynchronously
+   *
+   * Returns counts of various database entities for monitoring.
+   *
+   * @returns Database statistics
+   */
+  async getDatabaseStatsAsync(): Promise<{
+    playerCount: number;
+    activeSessionCount: number;
+    chunkCount: number;
+    activeChunkCount: number;
+    totalActivityRecords: number;
+  }> {
+    const [
+      playerCount,
+      activeSessionCount,
+      chunkCount,
+      activeChunkCount,
+      totalActivityRecords,
+    ] = await Promise.all([
+      this.playerRepository.getPlayerCountAsync(),
+      this.sessionRepository.getActiveSessionCountAsync(),
+      this.worldChunkRepository.getChunkCountAsync(),
+      this.worldChunkRepository.getActiveChunkCountAsync(),
+      this.worldChunkRepository.getTotalActivityRecordsAsync(),
+    ]);
+
+    return {
+      playerCount,
+      activeSessionCount,
+      chunkCount,
+      activeChunkCount,
+      totalActivityRecords,
+    };
+  }
+
+  /**
+   * Get database statistics (synchronous wrapper)
+   *
+   * @returns Default statistics (use async method for real data)
+   */
+  getDatabaseStats(): {
+    playerCount: number;
+    activeSessionCount: number;
+    chunkCount: number;
+    activeChunkCount: number;
+    totalActivityRecords: number;
+  } {
+    // Sync version can't return actual data, return defaults
+    return {
+      playerCount: 0,
+      activeSessionCount: 0,
+      chunkCount: 0,
+      activeChunkCount: 0,
+      totalActivityRecords: 0,
+    };
+  }
+
   /**
    * Clean up database system resources
    *

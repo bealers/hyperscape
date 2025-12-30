@@ -120,6 +120,7 @@ export class SkySystem extends System {
   private skyMesh: THREE.Mesh | null = null;
   private clouds: THREE.InstancedMesh | null = null;
   private moon: THREE.Mesh | null = null;
+  private moonGlow: THREE.Mesh | null = null;
   private sun: THREE.Mesh | null = null;
   private sunGlow: THREE.Mesh | null = null;
 
@@ -310,9 +311,10 @@ export class SkySystem extends System {
     this.group.add(this.sun);
 
     // Sun glow effect (larger, softer circle behind sun) - replaces Lensflare
-    const glowGeom = new THREE.CircleGeometry(450, 32);
+    // Size 800 creates a prominent halo visible at distance 4000
+    const glowGeom = new THREE.CircleGeometry(800, 32);
 
-    // TSL glow color with gradual radial falloff
+    // TSL glow color with gradual radial falloff - large soft halo around sun
     const glowColorNode = Fn(() => {
       const uvCoord = uv();
       // Distance from center (0.5, 0.5)
@@ -326,13 +328,13 @@ export class SkySystem extends System {
         float(0.0),
         float(1.0),
       );
-      // Higher power = more gradual falloff across radius
-      const glowStrength = pow(falloff, float(3.0));
+      // Lower power = softer, wider falloff for visible halo
+      const glowStrength = pow(falloff, float(1.5));
       // Warm glow color
-      const glowColor = vec3(1.0, 0.9, 0.7);
+      const glowColor = vec3(1.0, 0.85, 0.6);
       return vec4(
         mul(glowColor, glowStrength),
-        mul(glowStrength, mul(uOpacity, float(0.3))),
+        mul(glowStrength, uOpacity), // Full opacity, no 0.3 damping
       );
     })();
 
@@ -386,6 +388,40 @@ export class SkySystem extends System {
     this.moon.name = "SkyMoon";
     this.moon.renderOrder = 2;
     this.group.add(this.moon);
+
+    // Moon glow effect - soft halo around moon
+    const moonGlowGeom = new THREE.CircleGeometry(600, 32);
+
+    const moonGlowColorNode = Fn(() => {
+      const uvCoord = uv();
+      const center = vec3(0.5, 0.5, 0.0);
+      const uvPos = vec3(uvCoord.x, uvCoord.y, float(0.0));
+      const dist = length(sub(uvPos, center));
+      const normalizedDist = mul(dist, float(2.0));
+      const falloff = clamp(
+        sub(float(1.0), normalizedDist),
+        float(0.0),
+        float(1.0),
+      );
+      // Soft glow falloff
+      const glowStrength = pow(falloff, float(1.5));
+      // Cool blue-white glow for moon
+      const glowColor = vec3(0.7, 0.8, 1.0);
+      return vec4(mul(glowColor, glowStrength), mul(glowStrength, uOpacity));
+    })();
+
+    const moonGlowMat = new MeshBasicNodeMaterial();
+    moonGlowMat.colorNode = moonGlowColorNode;
+    moonGlowMat.blending = THREE.AdditiveBlending;
+    moonGlowMat.depthWrite = false;
+    moonGlowMat.transparent = true;
+    moonGlowMat.side = THREE.DoubleSide;
+    moonGlowMat.fog = false;
+
+    this.moonGlow = new THREE.Mesh(moonGlowGeom, moonGlowMat);
+    this.moonGlow.name = "SkyMoonGlow";
+    this.moonGlow.renderOrder = 1;
+    this.group.add(this.moonGlow);
   }
 
   /**
@@ -771,6 +807,17 @@ export class SkySystem extends System {
       }
     }
 
+    // Position moon glow (halo behind moon)
+    if (this.moonGlow) {
+      this.moonGlow.position.set(
+        -this._sunDir.x * radius,
+        -this._sunDir.y * radius,
+        -this._sunDir.z * radius,
+      );
+      this.moonGlow.visible = !isDay;
+      this.moonGlow.quaternion.copy(this.world.camera.quaternion);
+    }
+
     // Update sky TSL uniforms (stored at class level for reliable updates)
     if (this.skyTSLUniforms) {
       this.skyTSLUniforms.uTime.value = this.elapsed;
@@ -822,9 +869,9 @@ export class SkySystem extends System {
 
   override lateUpdate(_delta: number): void {
     if (!this.group) return;
-    // Keep sky centered on rig for infinite effect
-    this.group.position.x = this.world.rig.position.x;
-    this.group.position.z = this.world.rig.position.z;
+    // Keep sky centered on camera for infinite effect - follow all 3 axes
+    // This ensures you can never "hit the edge" of the sky regardless of direction
+    this.group.position.copy(this.world.rig.position);
   }
 
   override destroy(): void {
@@ -855,6 +902,11 @@ export class SkySystem extends System {
       this.moon.geometry.dispose();
       (this.moon.material as THREE.Material).dispose();
       this.moon = null;
+    }
+    if (this.moonGlow) {
+      this.moonGlow.geometry.dispose();
+      (this.moonGlow.material as THREE.Material).dispose();
+      this.moonGlow = null;
     }
     this.sunMaterialUniforms = null;
     this.moonMaterialUniforms = null;

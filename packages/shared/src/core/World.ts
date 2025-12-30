@@ -1325,7 +1325,7 @@ export class World extends EventEmitter {
           resolved.startsWith("http://localhost")
         ) {
           const separator = resolved.includes("?") ? "&" : "?";
-          resolved = `${resolved}${separator}_cb=20251227`;
+          resolved = `${resolved}${separator}`;
         }
         return resolved;
       } else {

@@ -79,15 +79,36 @@ try {
   console.log(`${colors.yellow}⚠️  Shared build failed (will retry in watch mode)${colors.reset}`)
 }
 
-// 4. Start CDN
-console.log(`${colors.blue}Starting CDN...${colors.reset}`)
+// 4. Start CDN (non-blocking with timeout)
+console.log(`${colors.blue}Checking CDN...${colors.reset}`)
 try {
+  // Quick Docker check with timeout - if Docker isn't running, skip CDN
+  try {
+    execSync('docker info', { 
+      stdio: 'ignore', 
+      cwd: rootDir,
+      timeout: 5000 // 5 second timeout
+    })
+  } catch {
+    console.log(`${colors.yellow}⚠️  Docker not available - skipping CDN${colors.reset}`)
+    throw new Error('Docker not available')
+  }
+  
+  // Run CDN setup with a timeout
   execSync('bun scripts/cdn.mjs', {
     stdio: 'inherit',
-    cwd: rootDir
+    cwd: rootDir,
+    timeout: 30000 // 30 second timeout
   })
+  console.log(`${colors.green}✓ CDN started${colors.reset}`)
 } catch (e) {
-  console.log(`${colors.yellow}⚠️  CDN setup failed (non-fatal)${colors.reset}`)
+  if (e.message?.includes('Docker not available')) {
+    // Already logged
+  } else if (e.killed) {
+    console.log(`${colors.yellow}⚠️  CDN startup timed out (non-fatal)${colors.reset}`)
+  } else {
+    console.log(`${colors.yellow}⚠️  CDN setup failed (non-fatal)${colors.reset}`)
+  }
 }
 
 console.log(`\n${colors.bright}${colors.green}✓ Setup complete!${colors.reset}`)

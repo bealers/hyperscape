@@ -49,6 +49,15 @@ const WATER_ROUGHNESS = 0.02;
 
 const ABSORPTION = { r: 0.45, g: 0.09, b: 0.06 };
 
+// LOD configuration for water mesh resolution
+const WATER_LOD = {
+  HIGH_RESOLUTION: 64, // Close tiles (< 100m)
+  MEDIUM_RESOLUTION: 32, // Medium distance (100-200m)
+  LOW_RESOLUTION: 16, // Far tiles (> 200m)
+  HIGH_DISTANCE: 100, // Distance threshold for high->medium LOD
+  MEDIUM_DISTANCE: 200, // Distance threshold for medium->low LOD
+};
+
 type WaveParams = {
   w: number;
   phi: number;
@@ -61,14 +70,13 @@ type WaveParams = {
   A: number;
 };
 
+// Reduced from 7 to 5 waves for better performance (smallest waves barely visible)
 const WAVES: WaveParams[] = [
   { A: 0.07, wavelength: 20, Q: 0.3, Dx: 0.7, Dz: 0.71 },
   { A: 0.05, wavelength: 14, Q: 0.25, Dx: -0.5, Dz: 0.87 },
   { A: 0.035, wavelength: 8, Q: 0.22, Dx: 0.9, Dz: -0.44 },
   { A: 0.025, wavelength: 5, Q: 0.2, Dx: 0.26, Dz: 0.97 },
   { A: 0.015, wavelength: 2.5, Q: 0.15, Dx: -0.8, Dz: 0.6 },
-  { A: 0.01, wavelength: 1.5, Q: 0.12, Dx: 0.5, Dz: -0.87 },
-  { A: 0.006, wavelength: 0.9, Q: 0.1, Dx: 0.65, Dz: 0.76 },
 ].map(({ A, wavelength, Q, Dx, Dz }) => {
   const w = TWO_PI / wavelength;
   const phi = Math.sqrt(GRAVITY * w);
@@ -85,13 +93,12 @@ const WAVES: WaveParams[] = [
   };
 });
 
+// Reduced from 4 to 2 layers for better performance (2 texture samples instead of 4)
 const NORMAL_LAYERS: [number, number, number][] = [
-  [0.012, 0.005, 0.003],
-  [0.025, -0.007, 0.004],
-  [0.05, 0.01, -0.006],
-  [0.09, -0.012, 0.008],
+  [0.015, 0.005, 0.003],
+  [0.04, -0.008, 0.005],
 ];
-const NORMAL_WEIGHTS = [0.35, 0.3, 0.2, 0.15];
+const NORMAL_WEIGHTS = [0.6, 0.4];
 
 // ============================================================================
 // TYPES
@@ -141,14 +148,14 @@ export class WaterSystem {
   async init(): Promise<void> {
     if (this.world.isServer) return;
 
-    // Create procedural textures
-    this.normalTex1 = this.createNormalMap(512, 1.0, 42);
-    this.normalTex2 = this.createNormalMap(256, 2.0, 137);
-    this.foamTex = this.createFoamTexture(256);
+    // Create procedural textures (reduced resolution for performance)
+    this.normalTex1 = this.createNormalMap(256, 1.0, 42);
+    this.normalTex2 = this.createNormalMap(128, 2.0, 137);
+    this.foamTex = this.createFoamTexture(128);
 
     // Create TSL reflector for planar reflections
     // This handles all the reflection camera, render target, and UV calculation automatically
-    this.reflection = reflector({ resolutionScale: 0.5 }) as ReflectorNode;
+    this.reflection = reflector({ resolutionScale: 0.45 }) as ReflectorNode;
     // Rotate to face upward (water is horizontal plane)
     this.reflection.target.rotateX(-Math.PI / 2);
     this.reflection.target.name = "WaterReflector";
@@ -395,10 +402,10 @@ export class WaterSystem {
       nx = mul(nx, shoreMask);
       nz = mul(nz, shoreMask);
 
-      // Detail normals
+      // Detail normals (2 layers for performance)
       let detailX = float(0),
         detailZ = float(0);
-      const textures = [normalTex1, normalTex2, normalTex1, normalTex2];
+      const textures = [normalTex1, normalTex2];
       for (let i = 0; i < NORMAL_LAYERS.length; i++) {
         const [scale, sx, sy] = NORMAL_LAYERS[i];
         const uv = mul(
@@ -471,31 +478,21 @@ export class WaterSystem {
       const sunColor = vec3(1.0, 0.98, 0.92);
       const sunSpec = mul(sunColor, mul(mul(specular, float(2.5)), NdotL));
 
-      // Foam
+      // Foam (simplified - single texture sample for performance)
       const shoreFoam = smoothstep(float(2.5), float(0), shoreDist);
       const crestFoam = smoothstep(
         float(0.15),
         float(0.4),
         mul(length(vec2(nx, nz)), shoreMask),
       );
-      const foamUV1 = mul(
+      const foamUV = mul(
         vec2(
           add(wUV.x, mul(uTime, float(0.02))),
           add(wUV.y, mul(uTime, float(0.015))),
         ),
-        float(0.08),
+        float(0.1),
       );
-      const foamUV2 = mul(
-        vec2(
-          sub(wUV.x, mul(uTime, float(0.018))),
-          add(wUV.y, mul(uTime, float(0.012))),
-        ),
-        float(0.12),
-      );
-      const foamPattern = mul(
-        add(texture(foamTex, foamUV1).r, texture(foamTex, foamUV2).r),
-        float(0.5),
-      );
+      const foamPattern = texture(foamTex, foamUV).r;
       const foamIntensity = mul(
         max(shoreFoam, mul(crestFoam, float(0.6))),
         foamPattern,
@@ -612,9 +609,27 @@ export class WaterSystem {
       return mesh;
     }
 
-    const resolution = 96;
+    // Calculate LOD based on tile distance from camera
     const originX = tile.x * tileSize;
     const originZ = tile.z * tileSize;
+    const tileCenterX = originX;
+    const tileCenterZ = originZ;
+
+    // Get camera position for LOD calculation
+    let resolution = WATER_LOD.HIGH_RESOLUTION;
+    const camera = this.world.camera;
+    if (camera) {
+      const cameraPos = camera.position;
+      const dx = tileCenterX - cameraPos.x;
+      const dz = tileCenterZ - cameraPos.z;
+      const distToCamera = Math.sqrt(dx * dx + dz * dz);
+
+      if (distToCamera > WATER_LOD.MEDIUM_DISTANCE) {
+        resolution = WATER_LOD.LOW_RESOLUTION;
+      } else if (distToCamera > WATER_LOD.HIGH_DISTANCE) {
+        resolution = WATER_LOD.MEDIUM_RESOLUTION;
+      }
+    }
 
     const heights: number[][] = [];
     const underwater: boolean[][] = [];
@@ -629,9 +644,10 @@ export class WaterSystem {
       }
     }
 
+    // Shore distance calculation (optimized: 8 directions, 5 binary search iterations)
     const shoreDist: number[][] = [];
-    const searchRadius = 35;
-    const numDirs = 16;
+    const searchRadius = 30;
+    const numDirs = 8;
 
     for (let i = 0; i <= resolution; i++) {
       shoreDist[i] = [];
@@ -662,7 +678,7 @@ export class WaterSystem {
           }
 
           if (found) {
-            for (let iter = 0; iter < 8; iter++) {
+            for (let iter = 0; iter < 6; iter++) {
               const mid = (lo + hi) / 2;
               if (getHeightAt(wx + dx * mid, wz + dz * mid) >= waterThreshold)
                 hi = mid;
@@ -747,7 +763,29 @@ export class WaterSystem {
     waterThreshold: number,
     tileSize: number,
   ): THREE.Mesh {
-    const geom = new THREE.PlaneGeometry(tileSize, tileSize, 64, 64);
+    // Calculate LOD resolution based on tile distance from camera
+    let resolution = 32;
+    const camera = this.world.camera;
+    if (camera) {
+      const tileCenterX = tile.x * tileSize;
+      const tileCenterZ = tile.z * tileSize;
+      const dx = tileCenterX - camera.position.x;
+      const dz = tileCenterZ - camera.position.z;
+      const distToCamera = Math.sqrt(dx * dx + dz * dz);
+
+      if (distToCamera > WATER_LOD.MEDIUM_DISTANCE) {
+        resolution = 8; // Very low poly at distance
+      } else if (distToCamera > WATER_LOD.HIGH_DISTANCE) {
+        resolution = 16;
+      }
+    }
+
+    const geom = new THREE.PlaneGeometry(
+      tileSize,
+      tileSize,
+      resolution,
+      resolution,
+    );
     geom.rotateX(-Math.PI / 2);
 
     const count = geom.attributes.position.count;

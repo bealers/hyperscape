@@ -254,6 +254,7 @@ export class ModelCache {
   }> {
     const shareMaterials = options?.shareMaterials ?? true; // Default to sharing
     // Resolve asset:// URLs to actual URLs
+    // NOTE: World.resolveURL already adds cache-busting for localhost URLs
     let resolvedPath = world ? world.resolveURL(path) : path;
 
     // CRITICAL: If resolveURL failed (returned asset:// unchanged), manually resolve
@@ -265,15 +266,6 @@ export class ModelCache {
         world?.assetsUrl?.replace(/\/$/, "") ||
         "http://localhost:8080";
       resolvedPath = resolvedPath.replace("asset://", `${cdnUrl}/`);
-    }
-
-    // Add cache-busting for development to bypass stale browser cache
-    if (
-      typeof window !== "undefined" &&
-      resolvedPath.startsWith("http://localhost")
-    ) {
-      const separator = resolvedPath.includes("?") ? "&" : "?";
-      resolvedPath = `${resolvedPath}${separator}_cb=20251227`;
     }
 
     // Check cache first (use resolved path as key)
@@ -332,10 +324,27 @@ export class ModelCache {
     }
 
     // Load for the first time
+    // Use ClientLoader for file fetching to benefit from IndexedDB caching
+    const promise = (async (): Promise<CachedModel> => {
+      let gltf: Awaited<ReturnType<typeof this.gltfLoader.parseAsync>>;
 
-    // Use our own GLTFLoader to ensure pure THREE.js objects (not Hyperscape Nodes)
-    const promise = this.gltfLoader
-      .loadAsync(resolvedPath)
+      // Try to use ClientLoader for caching benefits (IndexedDB, deduplication)
+      if (world?.loader?.loadFile) {
+        const file = await world.loader.loadFile(resolvedPath);
+        if (file) {
+          const buffer = await file.arrayBuffer();
+          gltf = await this.gltfLoader.parseAsync(buffer, "");
+        } else {
+          // Fallback to direct load if file fetch failed
+          gltf = await this.gltfLoader.loadAsync(resolvedPath);
+        }
+      } else {
+        // No ClientLoader available, use direct load
+        gltf = await this.gltfLoader.loadAsync(resolvedPath);
+      }
+
+      return gltf;
+    })()
       .then((gltf) => {
         // CRITICAL: Verify we got a pure THREE.Object3D, not a Hyperscape Node
         if ("ctx" in gltf.scene || "isDirty" in gltf.scene) {

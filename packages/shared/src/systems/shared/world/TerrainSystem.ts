@@ -21,6 +21,10 @@ import { System } from "..";
 import { EventType } from "../../../types/events";
 import { NoiseGenerator } from "../../../utils/NoiseGenerator";
 import { InstancedMeshManager } from "../../../utils/rendering/InstancedMeshManager";
+import {
+  initKTX2Loader,
+  loadTextureWithKTX2Fallback,
+} from "../../../extras/three/ktx2TextureLoader";
 
 /**
  * Terrain System
@@ -168,8 +172,8 @@ export class TerrainSystem extends System {
    */
   private createTerrainTileMaterial(): THREE.Material {
     // Use TSL Node Material with vertex colors and custom fog
-    const FOG_NEAR = 500.0;
-    const FOG_FAR = 2000.0;
+    const FOG_NEAR = 150.0;
+    const FOG_FAR = 350.0;
 
     // Create color node that uses vertex colors with fog
     const colorNode = Fn(() => {
@@ -201,27 +205,71 @@ export class TerrainSystem extends System {
 
   /**
    * Load terrain textures and create the shared terrain material
+   * Automatically uses KTX2 GPU-compressed textures when available
    */
   private async loadTerrainTextures(): Promise<void> {
-    const loader = new THREE.TextureLoader();
+    // Initialize KTX2 loader if we have a renderer (client-side)
+    const renderer = this.world.graphics?.renderer;
+    if (renderer) {
+      try {
+        await initKTX2Loader(renderer);
+        console.log("[TerrainSystem] KTX2 loader initialized");
+      } catch (err) {
+        console.warn(
+          "[TerrainSystem] KTX2 loader init failed, will use PNG fallback:",
+          err,
+        );
+      }
+    }
 
-    const loadTexture = (path: string): Promise<THREE.Texture> => {
+    // Helper to load textures with KTX2 fallback
+    const loadTexture = async (path: string): Promise<THREE.Texture> => {
+      try {
+        const tex = await loadTextureWithKTX2Fallback(path, {
+          wrapS: THREE.RepeatWrapping,
+          wrapT: THREE.RepeatWrapping,
+          colorSpace: THREE.SRGBColorSpace,
+        });
+        tex.magFilter = THREE.LinearFilter;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.generateMipmaps = true;
+        return tex;
+      } catch (err) {
+        // On error, create a placeholder
+        console.warn(`[TerrainSystem] Failed to load texture: ${path}`, err);
+        const placeholder = new THREE.DataTexture(
+          new Uint8Array([128, 128, 128, 255]),
+          1,
+          1,
+          THREE.RGBAFormat,
+        );
+        placeholder.wrapS = placeholder.wrapT = THREE.RepeatWrapping;
+        placeholder.needsUpdate = true;
+        return placeholder;
+      }
+    };
+
+    // Helper to load PNG directly (for normal maps that don't have KTX2 versions)
+    const loadPNG = (path: string): Promise<THREE.Texture> => {
       return new Promise((resolve) => {
+        const loader = new THREE.TextureLoader();
         loader.load(
           path,
           (tex) => {
-            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.wrapS = THREE.RepeatWrapping;
+            tex.wrapT = THREE.RepeatWrapping;
+            tex.colorSpace = THREE.SRGBColorSpace;
             tex.magFilter = THREE.LinearFilter;
             tex.minFilter = THREE.LinearMipmapLinearFilter;
             tex.generateMipmaps = true;
+            tex.needsUpdate = true;
             resolve(tex);
           },
           undefined,
           () => {
             // On error, create a placeholder
-            console.warn(`[TerrainSystem] Failed to load texture: ${path}`);
             const placeholder = new THREE.DataTexture(
-              new Uint8Array([128, 128, 128, 255]),
+              new Uint8Array([128, 128, 255, 255]), // Blue-ish for normal map placeholder
               1,
               1,
               THREE.RGBAFormat,
@@ -235,23 +283,58 @@ export class TerrainSystem extends System {
     };
 
     // Load terrain textures from CDN assets folder
-    const cdnUrl = this.world.assetsUrl || "";
-    const [grassTex, dirtTex, rockTex, sandTex, snowTex] = await Promise.all([
-      loadTexture(`${cdnUrl}/textures/terrain/grass/stylized_grass_d.png`),
-      loadTexture(`${cdnUrl}/textures/terrain/dirt/dirt_ground_d.png`),
-      loadTexture(`${cdnUrl}/textures/terrain/rock/stylized_stone_d.png`),
-      loadTexture(`${cdnUrl}/textures/terrain/dirt/dirt_ground_d.png`), // Sand uses dirt
-      loadTexture(`${cdnUrl}/textures/terrain/snow/stylized_snow_d.png`),
+    // KTX2 for diffuse/roughness, PNG directly for normal maps (no KTX2 versions exist)
+    // Reduced set to stay under WebGPU 16 texture limit:
+    // 5 diffuse + 2 normal + 2 roughness + 1 noise = 10 textures
+    const baseUrl = (this.world.assetsUrl || "").replace(/\/$/, ""); // Remove trailing slash
+    const [
+      grassTex,
+      grassNormal,
+      grassRoughness,
+      dirtTex,
+      dirtNormal,
+      dirtRoughness,
+      rockTex,
+      _snowTex, // Loaded but unused - snow uses grass texture (tinted white in shader)
+    ] = await Promise.all([
+      loadTexture(
+        `${baseUrl}/terrain/textures/stylized_grass/stylized_grass_d.png`,
+      ),
+      loadPNG(
+        `${baseUrl}/terrain/textures/stylized_grass/stylized_grass_n.png`,
+      ), // Normal maps only exist as PNG
+      loadTexture(
+        `${baseUrl}/terrain/textures/stylized_grass/stylized_grass_r.png`,
+      ),
+      loadTexture(`${baseUrl}/terrain/textures/dirt/dirt_d.png`),
+      loadPNG(`${baseUrl}/terrain/textures/dirt/dirt_n.png`), // Normal maps only exist as PNG
+      loadTexture(`${baseUrl}/terrain/textures/dirt/dirt_r.png`),
+      loadTexture(
+        `${baseUrl}/terrain/textures/stylized_stone/stylized_stone_d.png`,
+      ),
+      loadTexture(
+        `${baseUrl}/terrain/textures/stylized_snow/stylized_snow_d.png`,
+      ),
     ]);
 
+    // Only store unique textures to minimize bindings
     this.terrainTextures.set("grass", grassTex);
+    this.terrainTextures.set("grass_n", grassNormal);
+    this.terrainTextures.set("grass_r", grassRoughness);
     this.terrainTextures.set("dirt", dirtTex);
+    this.terrainTextures.set("dirt_n", dirtNormal);
+    this.terrainTextures.set("dirt_r", dirtRoughness);
     this.terrainTextures.set("rock", rockTex);
-    this.terrainTextures.set("sand", sandTex);
-    this.terrainTextures.set("snow", snowTex);
+    // Rock/snow/sand reuse grass/dirt normal and roughness (handled in shader)
 
     // Create the shared terrain material
     this.terrainMaterial = createTerrainMaterial(this.terrainTextures);
+
+    // Setup for CSM shadows
+    if (this.world.setupMaterial) {
+      this.world.setupMaterial(this.terrainMaterial);
+    }
+
     console.log("[TerrainSystem] Terrain textures loaded and material created");
   }
 
@@ -433,6 +516,15 @@ export class TerrainSystem extends System {
     TILE_RESOLUTION: 64, // 64x64 vertices per tile for smooth terrain
     MAX_HEIGHT: 30, // 30m max height variation (OSRS-style: gentle, not dramatic)
     WATER_THRESHOLD: 5.4, // Water appears below 5.4m (0.18 * MAX_HEIGHT)
+
+    // Performance: Reduced draw distance
+    CAMERA_FAR: 400, // Match fog far + buffer
+    FOG_NEAR: 150,
+    FOG_FAR: 350,
+
+    // LOD (Level of Detail) - Resolution tiers based on distance
+    LOD_DISTANCES: [100, 200, 350], // Distance thresholds
+    LOD_RESOLUTIONS: [64, 32, 16, 8], // Resolution at each LOD level
 
     // Chunking - Only adjacent tiles
     VIEW_DISTANCE: 1, // Load only 1 tile in each direction (3x3 = 9 tiles)
@@ -748,6 +840,9 @@ export class TerrainSystem extends System {
     // Enable shadow receiving for CSM
     mesh.receiveShadow = true;
     mesh.castShadow = false; // Terrain doesn't cast shadows on itself
+
+    // Enable frustum culling (Three.js built-in)
+    mesh.frustumCulled = true;
 
     // Add userData for click-to-move detection and other systems
     mesh.userData = {
@@ -2933,5 +3028,12 @@ export class TerrainSystem extends System {
 
   public getTileSize(): number {
     return this.CONFIG.TILE_SIZE;
+  }
+
+  /**
+   * Get biome data by ID - used by VegetationSystem to get vegetation config
+   */
+  public getBiomeData(biomeId: string): (typeof BIOMES)[string] | null {
+    return BIOMES[biomeId] ?? null;
   }
 }

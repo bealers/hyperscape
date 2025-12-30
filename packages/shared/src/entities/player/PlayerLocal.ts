@@ -1812,7 +1812,11 @@ export class PlayerLocal extends Entity implements HotReloadable {
     if (this.moving) {
       this.running = this.runMode;
     }
-    // TODO: Update UI to show run/walk state
+    // Emit event for UI to update run/walk indicator
+    this.world.emit(EventType.MOVEMENT_TOGGLE_RUN, {
+      playerId: this.id,
+      isRunning: this.runMode,
+    });
   }
 
   // Update server authoritative position for reconciliation

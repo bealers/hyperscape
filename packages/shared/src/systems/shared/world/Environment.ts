@@ -24,36 +24,44 @@ function asString(value: unknown): string {
   return value as string;
 }
 
+// Shadow settings - optimized for WebGPU
+// maxFar should match fog distance (~150m) to avoid wasted shadow passes
 const csmLevels = {
   none: {
     cascades: 1,
-    shadowMapSize: 1024,
+    shadowMapSize: 512,
     castShadow: false,
     lightIntensity: 3,
+    shadowBias: -0.0005,
+    shadowNormalBias: 0.02,
+    maxFar: 50,
   },
   low: {
     cascades: 1,
-    shadowMapSize: 2048,
+    shadowMapSize: 1024,
     castShadow: true,
     lightIntensity: 3,
-    shadowBias: 0.0000009,
-    shadowNormalBias: 0.001,
+    shadowBias: -0.0005,
+    shadowNormalBias: 0.02,
+    maxFar: 80,
   },
   med: {
-    cascades: 3,
+    cascades: 2,
     shadowMapSize: 1024,
     castShadow: true,
     lightIntensity: 1,
-    shadowBias: 0.000002,
-    shadowNormalBias: 0.002,
+    shadowBias: -0.0005,
+    shadowNormalBias: 0.02,
+    maxFar: 100,
   },
   high: {
     cascades: 3,
     shadowMapSize: 2048,
     castShadow: true,
     lightIntensity: 1,
-    shadowBias: 0.000003,
-    shadowNormalBias: 0.002,
+    shadowBias: -0.0003,
+    shadowNormalBias: 0.01,
+    maxFar: 150,
   },
 };
 
@@ -294,10 +302,11 @@ export class Environment extends System {
     const fogColor = node?._fogColor ?? base.fogColor ?? "#d4c8b8";
 
     const n = ++this.skyN;
-    let bgTexture;
-    if (bgUrl) bgTexture = await this.world.loader?.load("texture", bgUrl);
-    let hdrTexture;
-    if (hdrUrl) hdrTexture = await this.world.loader?.load("hdr", hdrUrl);
+    // Load textures (kept for potential future use, currently SkySystem is active)
+    let _bgTexture;
+    if (bgUrl) _bgTexture = await this.world.loader?.load("texture", bgUrl);
+    let _hdrTexture;
+    if (hdrUrl) _hdrTexture = await this.world.loader?.load("hdr", hdrUrl);
     if (n !== this.skyN) return;
 
     // When using SkySystem, completely remove the legacy sky sphere from scene
@@ -581,16 +590,32 @@ export class Environment extends System {
         return;
       }
 
+      console.log(`[Environment] Creating CSM with options:`, options);
+
       this.csm = new CSM({
         mode: "practical",
-        maxCascades: 3,
-        maxFar: 100,
+        maxCascades: options.cascades,
+        maxFar: options.maxFar || 100,
         lightDirection: _sunDirection.normalize(),
         fade: true,
         parent: scene,
         camera: camera,
-        ...options,
+        castShadow: options.castShadow ?? true,
+        shadowMapSize: options.shadowMapSize,
+        shadowBias: options.shadowBias,
+        shadowNormalBias: options.shadowNormalBias,
+        lightIntensity: options.lightIntensity,
       });
+
+      console.log(
+        `[Environment] CSM created with ${this.csm.lights.length} lights`,
+      );
+      for (let i = 0; i < this.csm.lights.length; i++) {
+        const light = this.csm.lights[i];
+        console.log(
+          `[Environment] Light ${i}: castShadow=${light.castShadow}, intensity=${light.intensity}, shadow bias=${light.shadow.bias}`,
+        );
+      }
 
       if (!options.castShadow) {
         for (const light of this.csm.lights) {

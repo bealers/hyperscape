@@ -19,6 +19,7 @@
 
 import { GLTFLoader } from "../../libs/gltfloader/GLTFLoader";
 import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import * as THREE from "three";
 import { EventType } from "../../types/events";
 import { SystemBase } from "../shared/infrastructure/SystemBase";
@@ -56,7 +57,7 @@ interface PlayerEquipmentVisuals {
 }
 
 export class EquipmentVisualSystem extends SystemBase {
-  private loader = new GLTFLoader();
+  private loader: GLTFLoader;
   private playerEquipment = new Map<string, PlayerEquipmentVisuals>();
 
   // Cache loaded weapon models to avoid reloading
@@ -77,6 +78,9 @@ export class EquipmentVisualSystem extends SystemBase {
       },
       autoCleanup: true,
     });
+    // Initialize loader with meshopt decoder for compressed GLB files
+    this.loader = new GLTFLoader();
+    this.loader.setMeshoptDecoder(MeshoptDecoder);
   }
 
   async init(): Promise<void> {

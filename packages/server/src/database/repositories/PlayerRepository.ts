@@ -13,7 +13,7 @@
  * Used by: ServerNetwork, game systems that modify player state
  */
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { BaseRepository } from "./BaseRepository";
 import * as schema from "../schema";
 import type { PlayerRow } from "../../shared/types";
@@ -188,5 +188,22 @@ export class PlayerRepository extends BaseRepository {
       console.error("[PlayerRepository] UPDATE FAILED:", err);
       throw err;
     }
+  }
+
+  /**
+   * Get count of all players
+   *
+   * Returns the total number of characters in the database.
+   *
+   * @returns Total number of players
+   */
+  async getPlayerCountAsync(): Promise<number> {
+    this.ensureDatabase();
+
+    const result = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.characters);
+
+    return result[0]?.count ?? 0;
   }
 }

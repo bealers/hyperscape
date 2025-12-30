@@ -202,6 +202,18 @@ async function registerStaticFiles(
   });
   console.log(`[HTTP] ✅ Registered /assets/ → ${config.assetsDir}`);
 
+  // Register manifests at /manifests/ for DataManager compatibility
+  const manifestsDir = path.join(config.assetsDir, "manifests");
+  await fastify.register(statics, {
+    root: manifestsDir,
+    prefix: "/manifests/",
+    decorateReply: false,
+    setHeaders: (res, filePath) => {
+      setAssetHeaders(res, filePath);
+    },
+  });
+  console.log(`[HTTP] ✅ Registered /manifests/ → ${manifestsDir}`);
+
   // Log available assets
   await logAvailableAssets(fastify, config);
 

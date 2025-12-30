@@ -9,8 +9,8 @@ import * as THREE from "three";
 const TERRAIN_CONSTANTS = {
   TRIPLANAR_SCALE: 0.02,
   SNOW_HEIGHT: 50.0,
-  FOG_NEAR: 200.0,
-  FOG_FAR: 500.0,
+  FOG_NEAR: 150.0,
+  FOG_FAR: 350.0,
 };
 
 describe("TerrainShader", () => {
@@ -364,6 +364,179 @@ describe("TerrainShader", () => {
         expect(b).toBeGreaterThanOrEqual(0);
         expect(b).toBeLessThanOrEqual(255);
       }
+    });
+  });
+
+  describe("LOD distance thresholds (algorithm documentation)", () => {
+    /**
+     * Algorithm Documentation: These tests verify the LOD calculation formulas
+     * used in TerrainShader.ts TSL code. The actual shader runs on GPU and
+     * cannot be unit tested directly - these tests document expected behavior.
+     *
+     * Constants must match TERRAIN_CONSTANTS in TerrainShader.ts
+     */
+    const LOD_CONSTANTS = {
+      LOD_FULL_DETAIL: 100.0,
+      LOD_MEDIUM_DETAIL: 200.0,
+    };
+
+    // Smoothstep: matches GLSL/TSL smoothstep function
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    function calculateLodFullDetail(distance: number): number {
+      // lodFullDetail: 1.0 at close range, 0.0 at LOD_FULL_DETAIL distance
+      return smoothstep(
+        LOD_CONSTANTS.LOD_FULL_DETAIL,
+        LOD_CONSTANTS.LOD_FULL_DETAIL * 0.7, // 70
+        distance,
+      );
+    }
+
+    function calculateLodMedium(distance: number): number {
+      // lodMedium: 1.0 at medium range, 0.0 at LOD_MEDIUM_DETAIL distance
+      return smoothstep(
+        LOD_CONSTANTS.LOD_MEDIUM_DETAIL, // 200
+        LOD_CONSTANTS.LOD_FULL_DETAIL, // 100
+        distance,
+      );
+    }
+
+    it("full detail at close range (distance < 70)", () => {
+      const lodFull = calculateLodFullDetail(50);
+      expect(lodFull).toBe(1.0);
+    });
+
+    it("full detail fades out between 70-100m", () => {
+      const lod70 = calculateLodFullDetail(70);
+      const lod85 = calculateLodFullDetail(85);
+      const lod100 = calculateLodFullDetail(100);
+
+      expect(lod70).toBe(1.0);
+      expect(lod85).toBeGreaterThan(0);
+      expect(lod85).toBeLessThan(1);
+      expect(lod100).toBe(0);
+    });
+
+    it("zero full detail beyond 100m", () => {
+      expect(calculateLodFullDetail(100)).toBe(0);
+      expect(calculateLodFullDetail(150)).toBe(0);
+      expect(calculateLodFullDetail(300)).toBe(0);
+    });
+
+    it("medium detail at close range (distance < 100)", () => {
+      const lodMed = calculateLodMedium(50);
+      expect(lodMed).toBe(1.0);
+    });
+
+    it("medium detail fades out between 100-200m", () => {
+      const lod100 = calculateLodMedium(100);
+      const lod150 = calculateLodMedium(150);
+      const lod200 = calculateLodMedium(200);
+
+      expect(lod100).toBe(1.0);
+      expect(lod150).toBeGreaterThan(0);
+      expect(lod150).toBeLessThan(1);
+      expect(lod200).toBe(0);
+    });
+
+    it("zero medium detail beyond 200m", () => {
+      expect(calculateLodMedium(200)).toBe(0);
+      expect(calculateLodMedium(250)).toBe(0);
+      expect(calculateLodMedium(500)).toBe(0);
+    });
+
+    it("LOD transition is smooth (no discontinuities)", () => {
+      const distances = [
+        0, 20, 40, 60, 70, 80, 90, 100, 120, 150, 180, 200, 250,
+      ];
+      const lodFullValues = distances.map(calculateLodFullDetail);
+      const lodMedValues = distances.map(calculateLodMedium);
+
+      // Check no sudden jumps in LOD values
+      for (let i = 1; i < lodFullValues.length; i++) {
+        const diff = Math.abs(lodFullValues[i] - lodFullValues[i - 1]);
+        expect(diff).toBeLessThan(0.6); // Reasonable transition step
+      }
+
+      for (let i = 1; i < lodMedValues.length; i++) {
+        const diff = Math.abs(lodMedValues[i] - lodMedValues[i - 1]);
+        expect(diff).toBeLessThan(0.6);
+      }
+    });
+
+    it("normal strength scales with full detail LOD", () => {
+      const baseNormalStrength = 0.15;
+
+      // At close range, full normal strength
+      const closeStrength = baseNormalStrength * calculateLodFullDetail(50);
+      expect(closeStrength).toBeCloseTo(0.15, 3);
+
+      // At medium range, reduced normal strength
+      const medStrength = baseNormalStrength * calculateLodFullDetail(85);
+      expect(medStrength).toBeGreaterThan(0);
+      expect(medStrength).toBeLessThan(0.15);
+
+      // At far range, no normal perturbation
+      const farStrength = baseNormalStrength * calculateLodFullDetail(150);
+      expect(farStrength).toBe(0);
+    });
+
+    it("roughness blends to distant value at medium LOD", () => {
+      const distantRoughness = 0.85;
+      const detailedRoughness = 0.5;
+
+      function calculateFinalRoughness(distance: number): number {
+        const lodMed = calculateLodMedium(distance);
+        return distantRoughness * (1 - lodMed) + detailedRoughness * lodMed;
+      }
+
+      // Close: detailed roughness
+      expect(calculateFinalRoughness(50)).toBeCloseTo(0.5, 3);
+
+      // Medium: blended
+      const medRough = calculateFinalRoughness(150);
+      expect(medRough).toBeGreaterThan(0.5);
+      expect(medRough).toBeLessThan(0.85);
+
+      // Far: distant roughness
+      expect(calculateFinalRoughness(300)).toBeCloseTo(0.85, 3);
+    });
+  });
+
+  describe("LOD boundary conditions (algorithm documentation)", () => {
+    // Smoothstep function matches GLSL/TSL implementation
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    it("handles zero distance", () => {
+      const lod = smoothstep(100, 70, 0);
+      expect(lod).toBe(1.0);
+    });
+
+    it("handles very large distances", () => {
+      const lod = smoothstep(100, 70, 10000);
+      expect(lod).toBe(0);
+    });
+
+    it("handles negative distances (shouldn't occur but safe)", () => {
+      const lod = smoothstep(100, 70, -50);
+      // Negative distance is still beyond the "close" threshold
+      expect(lod).toBe(1.0);
+    });
+
+    it("handles exactly at transition boundaries", () => {
+      // Exact edge0
+      const atEdge0 = smoothstep(100, 70, 100);
+      expect(atEdge0).toBe(0);
+
+      // Exact edge1
+      const atEdge1 = smoothstep(100, 70, 70);
+      expect(atEdge1).toBe(1.0);
     });
   });
 });

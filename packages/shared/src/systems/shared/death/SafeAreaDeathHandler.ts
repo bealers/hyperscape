@@ -153,6 +153,13 @@ export class SafeAreaDeathHandler {
       return "";
     }
 
+    // Get the player entity to retrieve their actual display name
+    const playerEntity = this.world.entities.players.get(playerId) as
+      | { playerName?: string; name?: string }
+      | undefined;
+    const playerName =
+      playerEntity?.playerName || playerEntity?.name || playerId;
+
     const gravestoneId = `gravestone_${playerId}_${Date.now()}`;
     // Calculate despawnTime in ms for entity config (backwards compatible)
     const despawnTime =
@@ -161,7 +168,7 @@ export class SafeAreaDeathHandler {
     // Create gravestone entity
     const gravestoneConfig: HeadstoneEntityConfig = {
       id: gravestoneId,
-      name: `${playerId}'s Gravestone`,
+      name: `${playerName}'s Gravestone`,
       type: EntityType.HEADSTONE,
       position: position,
       rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -170,11 +177,11 @@ export class SafeAreaDeathHandler {
       interactable: true,
       interactionType: InteractionType.LOOT,
       interactionDistance: 2,
-      description: `Gravestone of ${playerId} (killed by ${killedBy})`,
+      description: `Gravestone of ${playerName} (killed by ${killedBy})`,
       model: "models/environment/gravestone.glb",
       headstoneData: {
         playerId: playerId,
-        playerName: playerId, // TODO: Get actual player name
+        playerName: playerName,
         deathTime: Date.now(),
         deathMessage: `Slain by ${killedBy}`,
         position: position,

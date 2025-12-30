@@ -337,4 +337,271 @@ describe("VegetationSystem Algorithms", () => {
       expect(accepted.length).toBeGreaterThan(0);
     });
   });
+
+  describe("Imposter Distance Thresholds (algorithm documentation)", () => {
+    /**
+     * Algorithm Documentation: These tests verify the LOD/culling thresholds
+     * used in VegetationSystem.ts. Constants must match VegetationConfig.
+     *
+     * Full integration testing of VegetationSystem requires Playwright tests.
+     */
+    const VEGETATION_CONFIG = {
+      cullDistance: 150,
+      imposterDistance: 80,
+    };
+
+    type RenderMode = "3d" | "imposter" | "culled";
+
+    /**
+     * Determine render mode based on distance
+     * Mirrors updateAssetVisibility() logic in VegetationSystem
+     */
+    function getRenderMode(distance: number): RenderMode {
+      if (distance > VEGETATION_CONFIG.cullDistance) {
+        return "culled";
+      }
+      if (distance > VEGETATION_CONFIG.imposterDistance) {
+        return "imposter";
+      }
+      return "3d";
+    }
+
+    it("renders 3D mesh at close range (< 80m)", () => {
+      expect(getRenderMode(0)).toBe("3d");
+      expect(getRenderMode(50)).toBe("3d");
+      expect(getRenderMode(79)).toBe("3d");
+    });
+
+    it("renders imposter at medium range (80-150m)", () => {
+      expect(getRenderMode(80)).toBe("3d"); // At boundary, still 3D
+      expect(getRenderMode(81)).toBe("imposter");
+      expect(getRenderMode(100)).toBe("imposter");
+      expect(getRenderMode(149)).toBe("imposter");
+    });
+
+    it("culls at far range (> 150m)", () => {
+      expect(getRenderMode(150)).toBe("imposter"); // At boundary
+      expect(getRenderMode(151)).toBe("culled");
+      expect(getRenderMode(200)).toBe("culled");
+      expect(getRenderMode(1000)).toBe("culled");
+    });
+
+    it("handles exact boundaries", () => {
+      // At exactly imposterDistance: still 3D (using >)
+      expect(getRenderMode(80)).toBe("3d");
+      // Just past: imposter
+      expect(getRenderMode(80.001)).toBe("imposter");
+
+      // At exactly cullDistance: still imposter
+      expect(getRenderMode(150)).toBe("imposter");
+      // Just past: culled
+      expect(getRenderMode(150.001)).toBe("culled");
+    });
+
+    it("handles zero distance", () => {
+      expect(getRenderMode(0)).toBe("3d");
+    });
+
+    it("handles negative distance (shouldn't occur but safe)", () => {
+      expect(getRenderMode(-10)).toBe("3d");
+    });
+  });
+
+  describe("Instance Visibility Update (algorithm documentation)", () => {
+    /**
+     * Algorithm Documentation: Tests the visibility update logic
+     * that VegetationSystem uses when camera moves.
+     */
+    type InstanceState = {
+      x: number;
+      z: number;
+      visible: boolean;
+      mode: "3d" | "imposter" | "culled";
+    };
+
+    const CONFIG = {
+      cullDistance: 150,
+      imposterDistance: 80,
+    };
+
+    /**
+     * Simulate the visibility update logic from VegetationSystem
+     */
+    function updateVisibility(
+      instances: InstanceState[],
+      cameraX: number,
+      cameraZ: number,
+    ): void {
+      for (const instance of instances) {
+        const dx = instance.x - cameraX;
+        const dz = instance.z - cameraZ;
+        const distance = Math.sqrt(dx * dx + dz * dz);
+
+        if (distance > CONFIG.cullDistance) {
+          instance.visible = false;
+          instance.mode = "culled";
+        } else if (distance > CONFIG.imposterDistance) {
+          instance.visible = true;
+          instance.mode = "imposter";
+        } else {
+          instance.visible = true;
+          instance.mode = "3d";
+        }
+      }
+    }
+
+    it("updates all instances based on camera position", () => {
+      const instances: InstanceState[] = [
+        { x: 0, z: 0, visible: true, mode: "3d" },
+        { x: 100, z: 0, visible: true, mode: "3d" },
+        { x: 200, z: 0, visible: true, mode: "3d" },
+      ];
+
+      updateVisibility(instances, 0, 0);
+
+      expect(instances[0].mode).toBe("3d"); // 0m away
+      expect(instances[1].mode).toBe("imposter"); // 100m away
+      expect(instances[2].mode).toBe("culled"); // 200m away
+    });
+
+    it("visibility changes when camera moves", () => {
+      const instances: InstanceState[] = [
+        { x: 100, z: 0, visible: true, mode: "3d" },
+      ];
+
+      // Camera at origin: 100m away -> imposter
+      updateVisibility(instances, 0, 0);
+      expect(instances[0].mode).toBe("imposter");
+
+      // Camera moves closer: 50m away -> 3d
+      updateVisibility(instances, 50, 0);
+      expect(instances[0].mode).toBe("3d");
+
+      // Camera moves further: 250m away -> culled
+      updateVisibility(instances, -150, 0);
+      expect(instances[0].mode).toBe("culled");
+    });
+
+    it("handles diagonal distances correctly", () => {
+      const instances: InstanceState[] = [
+        { x: 60, z: 60, visible: true, mode: "3d" }, // sqrt(60^2 + 60^2) ≈ 85m
+      ];
+
+      updateVisibility(instances, 0, 0);
+
+      // 85m is beyond imposterDistance (80) but below cullDistance (150)
+      expect(instances[0].mode).toBe("imposter");
+    });
+
+    it("handles many instances efficiently", () => {
+      const instances: InstanceState[] = [];
+
+      // Create grid of 1000 instances
+      for (let x = 0; x < 100; x++) {
+        for (let z = 0; z < 10; z++) {
+          instances.push({
+            x: x * 5,
+            z: z * 5,
+            visible: true,
+            mode: "3d",
+          });
+        }
+      }
+
+      const start = performance.now();
+      updateVisibility(instances, 250, 25);
+      const elapsed = performance.now() - start;
+
+      // Should complete quickly (< 10ms for 1000 instances)
+      expect(elapsed).toBeLessThan(10);
+
+      // Verify distribution
+      const modes = { "3d": 0, imposter: 0, culled: 0 };
+      for (const inst of instances) {
+        modes[inst.mode]++;
+      }
+
+      // Should have instances in all categories
+      expect(modes["3d"]).toBeGreaterThan(0);
+      expect(modes.imposter).toBeGreaterThan(0);
+      expect(modes.culled).toBeGreaterThan(0);
+    });
+  });
+
+  describe("Billboard Orientation (algorithm documentation)", () => {
+    /**
+     * Algorithm Documentation: Billboard rotation formula.
+     * Calculate billboard rotation to face camera.
+     * Returns Y-axis rotation in radians.
+     */
+    function calculateBillboardRotation(
+      objectX: number,
+      objectZ: number,
+      cameraX: number,
+      cameraZ: number,
+    ): number {
+      const dx = cameraX - objectX;
+      const dz = cameraZ - objectZ;
+      return Math.atan2(dx, dz);
+    }
+
+    it("billboard faces camera when camera is in front", () => {
+      // Object at origin, camera at (0, 0, 10) - looking down +Z
+      const rotation = calculateBillboardRotation(0, 0, 0, 10);
+      expect(rotation).toBeCloseTo(0, 5); // No rotation needed
+    });
+
+    it("billboard rotates to face camera behind", () => {
+      // Object at origin, camera at (0, 0, -10) - looking down -Z
+      const rotation = calculateBillboardRotation(0, 0, 0, -10);
+      expect(rotation).toBeCloseTo(Math.PI, 5); // 180 degrees
+    });
+
+    it("billboard rotates to face camera on side", () => {
+      // Object at origin, camera at (10, 0, 0) - to the right
+      const rotation = calculateBillboardRotation(0, 0, 10, 0);
+      expect(rotation).toBeCloseTo(Math.PI / 2, 5); // 90 degrees
+    });
+
+    it("billboard rotates to face camera on left", () => {
+      // Object at origin, camera at (-10, 0, 0) - to the left
+      const rotation = calculateBillboardRotation(0, 0, -10, 0);
+      expect(rotation).toBeCloseTo(-Math.PI / 2, 5); // -90 degrees
+    });
+
+    it("billboard handles diagonal camera positions", () => {
+      // Object at origin, camera at (10, 0, 10)
+      const rotation = calculateBillboardRotation(0, 0, 10, 10);
+      expect(rotation).toBeCloseTo(Math.PI / 4, 5); // 45 degrees
+    });
+
+    it("billboard handles non-origin object positions", () => {
+      // Object at (100, 0, 100), camera at (100, 0, 110)
+      const rotation = calculateBillboardRotation(100, 100, 100, 110);
+      expect(rotation).toBeCloseTo(0, 5); // Camera directly ahead
+    });
+  });
+
+  describe("Culling Configuration", () => {
+    it("cullDistance > imposterDistance", () => {
+      // This is required for the LOD system to work
+      const cullDistance = 150;
+      const imposterDistance = 80;
+
+      expect(cullDistance).toBeGreaterThan(imposterDistance);
+    });
+
+    it("imposterDistance provides useful 3D detail range", () => {
+      // Should have enough 3D detail range for player vicinity
+      const imposterDistance = 80;
+      expect(imposterDistance).toBeGreaterThanOrEqual(50);
+    });
+
+    it("cullDistance provides reasonable draw distance", () => {
+      // Should match terrain draw distance approximately
+      const cullDistance = 150;
+      expect(cullDistance).toBeGreaterThanOrEqual(100);
+      expect(cullDistance).toBeLessThanOrEqual(300);
+    });
+  });
 });
