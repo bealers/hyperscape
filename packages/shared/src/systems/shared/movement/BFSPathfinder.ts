@@ -19,7 +19,7 @@ import {
   TileCoord,
   TILE_DIRECTIONS,
   PATHFIND_RADIUS,
-  MAX_PATH_LENGTH,
+  MAX_PATH_LENGTH as _MAX_PATH_LENGTH,
   tileKey,
   tilesEqual,
   isDiagonal,

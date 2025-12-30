@@ -56,6 +56,8 @@ export class DevStats extends System {
   private rendererElement: HTMLDivElement | null = null;
   private sceneElement: HTMLDivElement | null = null;
   private systemsElement: HTMLDivElement | null = null;
+  private playerElement: HTMLDivElement | null = null;
+  private timingElement: HTMLDivElement | null = null;
 
   // State
   private enabled = false;
@@ -85,6 +87,13 @@ export class DevStats extends System {
   private frameDrawCalls = 0;
   private frameTriangles = 0;
 
+  // CPU/Render timing
+  private renderStartTime = 0;
+  private lastRenderTime = 0;
+  private lastCpuTime = 0;
+  private renderTimeSamples: number[] = [];
+  private cpuTimeSamples: number[] = [];
+
   constructor(world: World) {
     super(world);
   }
@@ -109,6 +118,7 @@ export class DevStats extends System {
     if (this.enabled && typeof document !== "undefined") {
       this.createUI();
       this.setupKeyboardToggle();
+      this.setupDevHotkeys();
     }
 
     await super.init(options);
@@ -219,6 +229,28 @@ export class DevStats extends System {
     `;
     this.container.appendChild(this.sceneElement);
 
+    // Player position section
+    this.playerElement = document.createElement("div");
+    this.playerElement.style.cssText = `
+      margin-bottom: 6px;
+      padding-top: 6px;
+      border-top: 1px solid rgba(100, 200, 255, 0.1);
+      color: #94a3b8;
+      font-size: 10px;
+    `;
+    this.container.appendChild(this.playerElement);
+
+    // CPU/GPU timing section
+    this.timingElement = document.createElement("div");
+    this.timingElement.style.cssText = `
+      margin-bottom: 6px;
+      padding-top: 6px;
+      border-top: 1px solid rgba(100, 200, 255, 0.1);
+      color: #94a3b8;
+      font-size: 10px;
+    `;
+    this.container.appendChild(this.timingElement);
+
     // Systems section (initially hidden)
     this.systemsElement = document.createElement("div");
     this.systemsElement.style.cssText = `
@@ -251,6 +283,57 @@ export class DevStats extends System {
         this.toggle();
       }
     });
+  }
+
+  /**
+   * Setup dev hotkeys (only in dev mode)
+   * - Delete: Teleport player to origin (0, 0, 0)
+   */
+  private setupDevHotkeys(): void {
+    console.log("[DevStats] Setting up dev hotkeys");
+    document.addEventListener("keydown", (e) => {
+      // Skip if typing in input
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
+
+      // Delete key: Teleport to origin
+      if (e.key === "Delete") {
+        console.log("[DevStats] Delete key pressed - triggering teleport");
+        e.preventDefault();
+        this.teleportToOrigin();
+      }
+    });
+  }
+
+  /**
+   * Teleport the local player to origin (0, 0, 0)
+   * Sends a server command to perform the teleport authoritatively
+   */
+  private teleportToOrigin(): void {
+    const player = this.world.getPlayer();
+    if (!player) {
+      console.warn("[DevStats] No player found to teleport");
+      return;
+    }
+
+    console.log("[DevStats] Requesting server teleport to origin (0, 0, 0)");
+
+    // Check if network is available
+    const network = this.world.network;
+    console.log("[DevStats] Network state:", {
+      hasNetwork: !!network,
+      isClient: network?.isClient,
+      hasSend: !!(network as { send?: unknown })?.send,
+    });
+
+    // Send teleport command to server - server sends playerTeleport packet
+    // which properly resets tile movement state on the client
+    this.world.chat.command("/teleport 0 0 0");
+    console.log("[DevStats] Command sent");
   }
 
   /**
@@ -307,8 +390,15 @@ export class DevStats extends System {
     }
   }
 
+  private preCommitTime = 0;
+
   override preTick(): void {
     this.tickStartTime = performance.now();
+  }
+
+  override postLateUpdate(_delta: number): void {
+    // Record time right before commit phase (render)
+    this.preCommitTime = performance.now();
   }
 
   override postTick(): void {
@@ -316,6 +406,22 @@ export class DevStats extends System {
 
     const now = performance.now();
     const frameTime = now - this.tickStartTime;
+
+    // Calculate CPU vs render time
+    // CPU time = time from tick start until commit phase
+    // Render time = time spent in commit phase (render submission)
+    const cpuTime = this.preCommitTime - this.tickStartTime;
+    const renderTime = now - this.preCommitTime;
+
+    // Store samples for averaging
+    this.cpuTimeSamples.push(cpuTime);
+    this.renderTimeSamples.push(renderTime);
+    if (this.cpuTimeSamples.length > this.maxSamples) {
+      this.cpuTimeSamples.shift();
+      this.renderTimeSamples.shift();
+    }
+    this.lastCpuTime = cpuTime;
+    this.lastRenderTime = renderTime;
 
     // Update frame counter
     this.frameCount++;
@@ -479,6 +585,44 @@ export class DevStats extends System {
       }
     }
 
+    // Player position
+    if (this.playerElement) {
+      const player = this.world.getPlayer();
+      if (player) {
+        const pos = player.position;
+        this.playerElement.innerHTML = `
+          <div style="display: flex; justify-content: space-between;">
+            <span>Position:</span>
+            <span style="color: #60a5fa; font-family: monospace;">${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}</span>
+          </div>
+        `;
+        this.playerElement.style.display = "block";
+      } else {
+        this.playerElement.style.display = "none";
+      }
+    }
+
+    // CPU/Render timing
+    if (this.timingElement) {
+      const avgCpu = this.getAverageCpuTime();
+      const avgRender = this.getAverageRenderTime();
+      // Color coding: green < 8ms, yellow 8-16ms, red > 16ms
+      const cpuColor =
+        avgCpu < 8 ? "#4ade80" : avgCpu < 16 ? "#fbbf24" : "#ef4444";
+      const renderColor =
+        avgRender < 8 ? "#4ade80" : avgRender < 16 ? "#fbbf24" : "#ef4444";
+      this.timingElement.innerHTML = `
+        <div style="display: flex; justify-content: space-between;">
+          <span>CPU:</span>
+          <span style="color: ${cpuColor};">${avgCpu.toFixed(1)} ms</span>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span>Render:</span>
+          <span style="color: ${renderColor};">${avgRender.toFixed(1)} ms</span>
+        </div>
+      `;
+    }
+
     // System timings (if enabled)
     if (this.measureSystems && this.systemsElement) {
       this.updateSystemTimings();
@@ -492,6 +636,25 @@ export class DevStats extends System {
     if (this.frameSamples.length === 0) return 0;
     const sum = this.frameSamples.reduce((a, b) => a + b.frameTime, 0);
     return sum / this.frameSamples.length;
+  }
+
+  /**
+   * Get average CPU time from samples
+   */
+  private getAverageCpuTime(): number {
+    if (this.cpuTimeSamples.length === 0) return 0;
+    const sum = this.cpuTimeSamples.reduce((a, b) => a + b, 0);
+    return sum / this.cpuTimeSamples.length;
+  }
+
+  /**
+   * Get average render time from samples
+   * Note: This measures render submission time, not actual GPU execution time
+   */
+  private getAverageRenderTime(): number {
+    if (this.renderTimeSamples.length === 0) return 0;
+    const sum = this.renderTimeSamples.reduce((a, b) => a + b, 0);
+    return sum / this.renderTimeSamples.length;
   }
 
   /**

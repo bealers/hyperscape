@@ -108,10 +108,10 @@ export interface ExtendedWindow extends Window {
   _lastSkeletonRotation?: number;
 }
 
-// Import meta extensions
-export interface ExtendedImportMeta extends ImportMeta {
-  env?: EnvironmentVariables;
-}
+// Import meta extensions (use intersection to avoid conflicts with Vite types)
+export type ExtendedImportMeta = ImportMeta & {
+  env?: EnvironmentVariables & ImportMeta["env"];
+};
 
 // Generic event handlers
 export type EventHandler<T = Event> = (event: T) => void;

@@ -162,6 +162,19 @@ export class VRMConverter {
   private coordinateSystemFixed = false;
 
   /**
+   * Helper to find the Armature object in the scene
+   */
+  private findArmature(): THREE.Object3D | null {
+    let armature: THREE.Object3D | null = null;
+    this.scene.traverse((obj) => {
+      if (obj.name === "Armature" && obj !== this.skinnedMesh) {
+        armature = obj;
+      }
+    });
+    return armature;
+  }
+
+  /**
    * Convert Meshy GLB to VRM format
    *
    * @param glbData - Loaded GLB data from Meshy
@@ -276,12 +289,7 @@ export class VRMConverter {
 
     // CRITICAL FIX: Find and bake out the Armature parent scale FIRST
     // Meshy models have an Armature with scale 0.01 that needs to be baked
-    let armature: THREE.Object3D | null = null;
-    this.scene.traverse((obj) => {
-      if (obj.name === "Armature" && obj !== this.skinnedMesh) {
-        armature = obj;
-      }
-    });
+    const armature = this.findArmature();
 
     if (armature && armature.parent) {
       const armatureScale = armature.scale.x; // Assume uniform scale

@@ -20,7 +20,6 @@ import THREE, {
   smoothstep,
   sin,
   abs,
-  Fn,
 } from "../../../extras/three/three";
 
 export const TERRAIN_CONSTANTS = {

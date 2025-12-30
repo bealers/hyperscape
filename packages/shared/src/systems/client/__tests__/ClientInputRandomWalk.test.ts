@@ -294,7 +294,7 @@ describe("ClientInput Random Walk", () => {
         case "idle":
           return "walking";
 
-        case "walking":
+        case "walking": {
           if (!ctx.target) return "pausing";
           const dx = ctx.target.x - ctx.position.x;
           const dz = ctx.target.z - ctx.position.z;
@@ -302,6 +302,7 @@ describe("ClientInput Random Walk", () => {
           return dist <= RANDOM_WALK_CONFIG.STOP_DISTANCE
             ? "pausing"
             : "walking";
+        }
 
         case "pausing":
           if (ctx.pauseEndTime && currentTime >= ctx.pauseEndTime) {

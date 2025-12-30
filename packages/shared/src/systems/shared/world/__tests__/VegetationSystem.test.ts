@@ -155,9 +155,7 @@ describe("VegetationSystem Algorithms", () => {
       // Edge case: when rng returns ~1.0
       const assets = [{ id: "only", weight: 10 }];
       // Create RNG that will generate values very close to 1
-      let callCount = 0;
       const highRng = () => {
-        callCount++;
         return 0.9999;
       };
 

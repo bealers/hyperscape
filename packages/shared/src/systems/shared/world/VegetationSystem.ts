@@ -38,6 +38,10 @@ import type {
 import { EventType } from "../../../types/events";
 import { modelCache } from "../../../utils/rendering/ModelCache";
 import { NoiseGenerator } from "../../../utils/NoiseGenerator";
+import {
+  createGPUVegetationMaterial,
+  type GPUVegetationMaterial,
+} from "./GPUVegetation";
 
 /**
  * Instanced asset data - tracks one InstancedMesh per loaded GLB
@@ -61,6 +65,12 @@ interface InstancedAssetData {
   asset: VegetationAsset;
   /** Y offset to lift model so its base sits on terrain (computed from bounding box) */
   modelBaseOffset: number;
+
+  /** GPU instance attributes (shader handles all transforms) */
+  gpuMaterial?: GPUVegetationMaterial;
+  positionAttr?: THREE.InstancedBufferAttribute;
+  scaleAttr?: THREE.InstancedBufferAttribute;
+  rotationAttr?: THREE.InstancedBufferAttribute;
 }
 
 /**
@@ -94,34 +104,37 @@ interface VegetationConfig {
 }
 
 const DEFAULT_CONFIG: VegetationConfig = {
-  maxInstancesPerAsset: 500, // Reduced - we only see ~50-100 at a time anyway
-  cullDistance: 120, // Reduced render distance
-  imposterDistance: 80,
-  updateInterval: 250, // Less frequent updates (4x per second)
-  movementThreshold: 8, // Only update when player moves significantly
+  maxInstancesPerAsset: 4096, // Power of 2 for GPU efficiency
+  cullDistance: 280, // Used for tile loading - must be > fadeEnd (250m) so vegetation loads before visible
+  imposterDistance: 120, // Not used in GPU mode (shader handles LOD)
+  updateInterval: 100, // Not used in GPU mode
+  movementThreshold: 2, // Not used in GPU mode
 };
 
-// LOD distances per category - AGGRESSIVE culling for performance
+// LOD distances per category
+// fadeStart = fully opaque, fadeEnd = fully invisible
+// Tile spawn radius is 3 tiles = 300m, so fadeStart must be > 300m to prevent pop-in
 const LOD_CONFIG = {
-  tree: { fadeStart: 80, fadeEnd: 100, imposterStart: 60 },
-  bush: { fadeStart: 50, fadeEnd: 70, imposterStart: 40 },
-  flower: { fadeStart: 30, fadeEnd: 40, imposterStart: 25 },
-  fern: { fadeStart: 30, fadeEnd: 40, imposterStart: 25 },
-  rock: { fadeStart: 80, fadeEnd: 100, imposterStart: 60 },
-  fallen_tree: { fadeStart: 60, fadeEnd: 80, imposterStart: 50 },
+  tree: { fadeStart: 180, fadeEnd: 250, imposterStart: 120 },
+  bush: { fadeStart: 140, fadeEnd: 200, imposterStart: 90 },
+  flower: { fadeStart: 100, fadeEnd: 150, imposterStart: 60 },
+  fern: { fadeStart: 100, fadeEnd: 150, imposterStart: 60 },
+  rock: { fadeStart: 180, fadeEnd: 250, imposterStart: 120 },
+  fallen_tree: { fadeStart: 160, fadeEnd: 220, imposterStart: 100 },
 } as const;
 
 /** Max tile distance from player to generate vegetation (in tiles, not world units) */
-const MAX_VEGETATION_TILE_RADIUS = 2; // Only generate for tiles within 2 tiles of player
+// 3 tiles = 300m diagonal (~212m per axis), must be > fadeEnd to load before visible
+const MAX_VEGETATION_TILE_RADIUS = 3;
 
-/** Water level in world units (from WaterSystem) */
-const WATER_LEVEL = 5.0;
+/** Water level in world units - MUST match TerrainSystem.CONFIG.WATER_THRESHOLD */
+const WATER_LEVEL = 5.4;
 
-/** Buffer distance from water edge where vegetation shouldn't spawn */
-const WATER_EDGE_BUFFER = 3.0; // Keep vegetation 3 units away from water
+/** Buffer distance from water edge where vegetation shouldn't spawn - generous buffer */
+const WATER_EDGE_BUFFER = 6.0; // Min spawn height = 11.4 - well above any shoreline
 
 /** Grass only spawns on terrain above this height (relative, for grass texture) */
-const GRASS_MIN_TERRAIN_HEIGHT = 0.2; // Normalized height - grass areas are higher
+const _GRASS_MIN_TERRAIN_HEIGHT = 0.2; // Normalized height - grass areas are higher
 
 // ============================================================================
 // TSL GRASS - WebGPU compatible using MeshStandardNodeMaterial
@@ -144,7 +157,7 @@ const GPU_GRASS_INSTANCES =
 /**
  * Data structure for a grass chunk - holds geometry for one area of grass (legacy, unused)
  */
-interface GrassChunkData {
+interface _GrassChunkData {
   key: string;
   mesh: THREE.Mesh;
   tileX: number;
@@ -178,6 +191,12 @@ export class VegetationSystem extends System {
   // Imposter (billboard) management
   private imposters = new Map<string, ImposterData>();
   private billboardGeometry: THREE.PlaneGeometry | null = null;
+
+  // Pre-rendered imposter textures (cached per asset)
+  private imposterTextures = new Map<string, THREE.Texture>();
+  private imposterRenderTarget: THREE.WebGLRenderTarget | null = null;
+  private imposterCamera: THREE.OrthographicCamera | null = null;
+  private imposterScene: THREE.Scene | null = null;
 
   // Tile vegetation tracking
   private tileVegetation = new Map<string, TileVegetationData>();
@@ -217,6 +236,9 @@ export class VegetationSystem extends System {
   private _origin = new THREE.Vector3(0, 0, 0);
   private _lookAtMatrix = new THREE.Matrix4();
   private _lastGrassLog = 0;
+  // Spatial hash for O(1) nearby instance lookup
+  private _spatialHash = new Map<string, number[]>();
+  private readonly SPATIAL_CELL_SIZE = 50; // 50 unit cells
 
   constructor(world: World) {
     super(world);
@@ -248,40 +270,199 @@ export class VegetationSystem extends System {
   }
 
   /**
+   * Initialize the imposter rendering system
+   * Creates a render target and camera for pre-rendering models to textures
+   */
+  private initImposterRenderer(): void {
+    if (this.imposterRenderTarget) return; // Already initialized
+
+    // Create render target for imposter textures (256x256 with alpha)
+    this.imposterRenderTarget = new THREE.WebGLRenderTarget(256, 256, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+      depthBuffer: true,
+      stencilBuffer: false,
+    });
+
+    // Create orthographic camera for rendering (will be adjusted per model)
+    this.imposterCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+
+    // Create isolated scene for rendering imposters
+    this.imposterScene = new THREE.Scene();
+    this.imposterScene.background = null; // Transparent background
+
+    // Add ambient light for consistent rendering
+    const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+    this.imposterScene.add(ambient);
+
+    // Add directional light matching sun direction
+    const dirLight = new THREE.DirectionalLight(0xfff8f0, 0.6);
+    dirLight.position.set(1, 2, 1);
+    this.imposterScene.add(dirLight);
+  }
+
+  /**
+   * Pre-render a model to a texture for use as an imposter billboard
+   */
+  private preRenderImposterTexture(
+    assetId: string,
+    modelScene: THREE.Object3D,
+  ): THREE.Texture | null {
+    // Check cache first
+    if (this.imposterTextures.has(assetId)) {
+      return this.imposterTextures.get(assetId)!;
+    }
+
+    // Initialize renderer if needed
+    this.initImposterRenderer();
+
+    // Get the renderer from world graphics system
+    const graphics = this.world.graphics as
+      | { renderer?: THREE.WebGLRenderer }
+      | undefined;
+    const renderer = graphics?.renderer;
+    if (
+      !renderer ||
+      !this.imposterRenderTarget ||
+      !this.imposterCamera ||
+      !this.imposterScene
+    ) {
+      return null;
+    }
+
+    // Clone the model to avoid modifying the original
+    const modelClone = modelScene.clone();
+
+    // Compute bounding box to fit camera
+    const bbox = new THREE.Box3().setFromObject(modelClone);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    bbox.getSize(size);
+    bbox.getCenter(center);
+
+    // Position model at origin (centered)
+    modelClone.position.sub(center);
+    modelClone.position.y += size.y / 2; // Lift so base is at y=0
+
+    // Add model to imposter scene
+    this.imposterScene.add(modelClone);
+
+    // Configure orthographic camera to fit the model
+    const maxDim = Math.max(size.x, size.y) * 1.2; // Add 20% margin
+    this.imposterCamera.left = -maxDim / 2;
+    this.imposterCamera.right = maxDim / 2;
+    this.imposterCamera.top = size.y * 0.6;
+    this.imposterCamera.bottom = -size.y * 0.6;
+    this.imposterCamera.near = 0.1;
+    this.imposterCamera.far = maxDim * 4;
+    this.imposterCamera.updateProjectionMatrix();
+
+    // Position camera looking at model from front-side angle
+    const cameraDistance = maxDim * 2;
+    this.imposterCamera.position.set(
+      cameraDistance * 0.7,
+      size.y * 0.4,
+      cameraDistance * 0.7,
+    );
+    this.imposterCamera.lookAt(0, size.y * 0.3, 0);
+
+    // Store current renderer state
+    const currentRenderTarget = renderer.getRenderTarget();
+    const currentClearAlpha = renderer.getClearAlpha();
+    const currentAutoClear = renderer.autoClear;
+
+    // Render to texture
+    renderer.autoClear = true;
+    renderer.setClearAlpha(0); // Transparent background
+    renderer.setRenderTarget(this.imposterRenderTarget);
+    renderer.clear();
+    renderer.render(this.imposterScene, this.imposterCamera);
+
+    // Restore renderer state
+    renderer.setRenderTarget(currentRenderTarget);
+    renderer.setClearAlpha(currentClearAlpha);
+    renderer.autoClear = currentAutoClear;
+
+    // Remove model from imposter scene
+    this.imposterScene.remove(modelClone);
+
+    // Clone the texture from render target (so it persists after target is reused)
+    const texture = this.imposterRenderTarget.texture.clone();
+    texture.needsUpdate = true;
+
+    // Cache the texture
+    this.imposterTextures.set(assetId, texture);
+
+    console.log(
+      `[VegetationSystem] 📸 Pre-rendered imposter texture for: ${assetId}`,
+    );
+
+    return texture;
+  }
+
+  /**
    * Create imposter (billboard) mesh for an asset type
-   * Billboards are simple quads that always face the camera
+   * Uses pre-rendered textures for realistic appearance
    */
   private createImposter(
     assetId: string,
     asset: VegetationAsset,
     _material: THREE.Material | THREE.Material[],
   ): ImposterData {
-    const maxBillboards = Math.floor(this.config.maxInstancesPerAsset * 0.5);
+    const maxBillboards = Math.floor(this.config.maxInstancesPerAsset * 0.3);
 
-    // Create a simple colored material for billboards with vertex colors for fading
-    // In a full implementation, you'd pre-render the vegetation to a texture
-    const billboardMaterial = new THREE.MeshBasicMaterial({
-      color: 0x3a5f0b, // Dark green for trees
-      transparent: true,
-      opacity: 0.9,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      vertexColors: true, // Enable per-instance color for fading
-    });
+    // Try to get pre-rendered texture
+    const imposterTexture = this.imposterTextures.get(assetId);
 
-    // Adjust color based on asset category
-    if (
-      asset.category === "bush" ||
-      asset.category === "grass" ||
-      asset.category === "fern"
-    ) {
-      billboardMaterial.color.setHex(0x228b22); // Forest green
-    } else if (asset.category === "rock") {
-      billboardMaterial.color.setHex(0x696969); // Dim gray
-      billboardMaterial.opacity = 1.0;
-      billboardMaterial.depthWrite = true;
-    } else if (asset.category === "flower") {
-      billboardMaterial.color.setHex(0xff69b4); // Pink for flowers
+    // Create billboard material with texture or fallback to silhouette
+    let billboardMaterial: THREE.Material;
+
+    if (imposterTexture) {
+      // Use pre-rendered texture - looks like the actual model
+      billboardMaterial = new THREE.MeshBasicMaterial({
+        map: imposterTexture,
+        transparent: true,
+        alphaTest: 0.1,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        vertexColors: true, // For per-instance fading
+      });
+    } else {
+      // Fallback: subtle silhouette (shouldn't happen if prerender succeeds)
+      billboardMaterial = new THREE.MeshBasicMaterial({
+        color: 0x2a4a1a,
+        transparent: true,
+        opacity: 0.4,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        vertexColors: true,
+      });
+
+      // Adjust color based on asset category
+      const mat = billboardMaterial as THREE.MeshBasicMaterial;
+      if (
+        asset.category === "bush" ||
+        asset.category === "grass" ||
+        asset.category === "fern"
+      ) {
+        mat.color.setHex(0x1a3a1a);
+        mat.opacity = 0.25;
+      } else if (asset.category === "rock") {
+        mat.color.setHex(0x4a4a4a);
+        mat.opacity = 0.35;
+      } else if (asset.category === "flower") {
+        mat.color.setHex(0x2a4a2a);
+        mat.opacity = 0.2;
+      } else if (asset.category === "fallen_tree") {
+        mat.color.setHex(0x3a2a1a);
+        mat.opacity = 0.3;
+      } else {
+        mat.opacity = 0.3;
+      }
     }
 
     const billboardMesh = new THREE.InstancedMesh(
@@ -726,10 +907,12 @@ export class VegetationSystem extends System {
       if (layer.minHeight !== undefined && height < layer.minHeight) continue;
       if (layer.maxHeight !== undefined && height > layer.maxHeight) continue;
 
-      // Check water avoidance - use actual water level + buffer
-      if (layer.avoidWater) {
-        const waterThreshold = WATER_LEVEL + WATER_EDGE_BUFFER;
-        if (height < waterThreshold) continue;
+      // Check water avoidance - ALWAYS avoid water unless explicitly disabled
+      // layer.avoidWater defaults to true if not specified
+      const shouldAvoidWater = layer.avoidWater !== false;
+      const waterThreshold = WATER_LEVEL + WATER_EDGE_BUFFER;
+      if (shouldAvoidWater && height < waterThreshold) {
+        continue;
       }
 
       // Calculate slope once for all checks
@@ -1217,29 +1400,48 @@ export class VegetationSystem extends System {
       return;
     }
 
-    // Compute transformation matrix
-    // Apply modelBaseOffset to lift model so its base sits on terrain
-    this._tempPosition.set(
-      instance.position.x,
-      instance.position.y + assetData.modelBaseOffset * instance.scale,
-      instance.position.z,
-    );
-    this._tempEuler.set(
-      instance.rotation.x,
-      instance.rotation.y,
-      instance.rotation.z,
-    );
-    this._tempQuaternion.setFromEuler(this._tempEuler);
-    this._tempScale.set(instance.scale, instance.scale, instance.scale);
+    const matrixIndex = assetData.activeCount;
+    const worldY =
+      instance.position.y + assetData.modelBaseOffset * instance.scale;
 
+    // WATER CHECK: Reject any instance below water level
+    const waterCutoff = WATER_LEVEL + WATER_EDGE_BUFFER;
+    if (worldY < waterCutoff) {
+      console.warn(
+        `[VegetationSystem] ⛔ REJECTED tree at Y=${worldY.toFixed(2)} (water cutoff=${waterCutoff.toFixed(2)}), pos=(${instance.position.x.toFixed(1)}, ${instance.position.z.toFixed(1)})`,
+      );
+      return; // Do not add this instance
+    }
+
+    // Write instance attributes for GPU shader (used for distance fade calculations)
+    if (
+      assetData.positionAttr &&
+      assetData.scaleAttr &&
+      assetData.rotationAttr
+    ) {
+      const i3 = matrixIndex * 3;
+      assetData.positionAttr.array[i3] = instance.position.x;
+      assetData.positionAttr.array[i3 + 1] = worldY;
+      assetData.positionAttr.array[i3 + 2] = instance.position.z;
+      assetData.positionAttr.needsUpdate = true;
+
+      assetData.scaleAttr.array[matrixIndex] = instance.scale;
+      assetData.scaleAttr.needsUpdate = true;
+
+      assetData.rotationAttr.array[matrixIndex] = instance.rotation.y;
+      assetData.rotationAttr.needsUpdate = true;
+    }
+
+    // Compose proper transform matrix for Three.js InstancedMesh
+    this._tempPosition.set(instance.position.x, worldY, instance.position.z);
+    this._tempEuler.set(0, instance.rotation.y, 0);
+    this._tempQuaternion.setFromEuler(this._tempEuler);
+    this._tempScale.setScalar(instance.scale);
     this._tempMatrix.compose(
       this._tempPosition,
       this._tempQuaternion,
       this._tempScale,
     );
-
-    // Add to instanced mesh
-    const matrixIndex = assetData.activeCount;
     assetData.instancedMesh.setMatrixAt(matrixIndex, this._tempMatrix);
     assetData.instancedMesh.instanceMatrix.needsUpdate = true;
 
@@ -1251,6 +1453,13 @@ export class VegetationSystem extends System {
 
     // Update instance count
     assetData.instancedMesh.count = assetData.activeCount;
+
+    // Debug: Log tree placements near water
+    if (instance.category === "tree" && worldY < 15) {
+      console.log(
+        `[VegetationSystem] 🌲 Tree placed at Y=${worldY.toFixed(2)}, pos=(${instance.position.x.toFixed(1)}, ${instance.position.z.toFixed(1)})`,
+      );
+    }
   }
 
   /**
@@ -1446,14 +1655,11 @@ export class VegetationSystem extends System {
       instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       instancedMesh.count = 0;
 
-      // Enable frustum culling - GPU will skip off-screen instances
-      instancedMesh.frustumCulled = true;
-
-      // Set a large bounding sphere centered on origin - will be updated in LOD
-      instancedMesh.geometry.boundingSphere = new THREE.Sphere(
-        new THREE.Vector3(0, 0, 0),
-        Infinity,
-      );
+      // DISABLE Three.js frustum culling on the whole mesh!
+      // We do per-instance frustum culling manually in updateLOD.
+      // If we leave this true, Three.js might cull the entire instanced mesh
+      // based on an outdated bounding sphere, causing all vegetation to vanish.
+      instancedMesh.frustumCulled = false;
 
       // Configure shadows based on category
       if (asset.category === "tree") {
@@ -1470,6 +1676,59 @@ export class VegetationSystem extends System {
         this.vegetationGroup.add(instancedMesh);
       }
 
+      // Set up GPU instance buffer attributes for shader-based transforms
+      const maxInst = this.config.maxInstancesPerAsset;
+      const positionAttr = new THREE.InstancedBufferAttribute(
+        new Float32Array(maxInst * 3),
+        3,
+      );
+      const scaleAttr = new THREE.InstancedBufferAttribute(
+        new Float32Array(maxInst),
+        1,
+      );
+      const rotationAttr = new THREE.InstancedBufferAttribute(
+        new Float32Array(maxInst),
+        1,
+      );
+
+      // Dynamic usage for initial population, switches to static after upload
+      positionAttr.setUsage(THREE.DynamicDrawUsage);
+      scaleAttr.setUsage(THREE.DynamicDrawUsage);
+      rotationAttr.setUsage(THREE.DynamicDrawUsage);
+
+      // Attach to geometry for shader access
+      instancedMesh.geometry.setAttribute("instancePosition", positionAttr);
+      instancedMesh.geometry.setAttribute("instanceScale", scaleAttr);
+      instancedMesh.geometry.setAttribute("instanceRotationY", rotationAttr);
+
+      // Check if geometry has vertex colors
+      const hasVertexColors = geometry.attributes.color !== undefined;
+
+      // Create GPU material with shader-based LOD, wind, and distance fade
+      const baseMat = Array.isArray(finalMaterial)
+        ? finalMaterial[0]
+        : finalMaterial;
+      const stdMat = baseMat as THREE.MeshStandardMaterial;
+      const gpuMaterial = createGPUVegetationMaterial({
+        color: stdMat.color,
+        map: stdMat.map,
+        alphaTest: hasVertexColors ? 0.1 : 0.5, // Lower alpha test for vertex color models
+        fadeStart:
+          LOD_CONFIG[asset.category as keyof typeof LOD_CONFIG]?.fadeStart ??
+          60,
+        fadeEnd:
+          LOD_CONFIG[asset.category as keyof typeof LOD_CONFIG]?.fadeEnd ?? 100,
+        vertexColors: hasVertexColors,
+      }) as GPUVegetationMaterial;
+
+      if (hasVertexColors) {
+        console.log(
+          `[VegetationSystem] 🎨 Vertex colors enabled for ${asset.id}`,
+        );
+      }
+
+      instancedMesh.material = gpuMaterial;
+
       const assetData: InstancedAssetData = {
         geometry,
         material,
@@ -1479,12 +1738,26 @@ export class VegetationSystem extends System {
         maxInstances: this.config.maxInstancesPerAsset,
         activeCount: 0,
         asset,
-        modelBaseOffset, // Y offset to place model at terrain level
+        modelBaseOffset,
+        gpuMaterial,
+        positionAttr,
+        scaleAttr,
+        rotationAttr,
       };
 
       this.loadedAssets.set(asset.id, assetData);
 
-      // NOTE: Imposters disabled for performance - using simple distance culling instead
+      // Pre-render imposter texture from the loaded model
+      // This captures the actual appearance for use as a billboard at distance
+      try {
+        this.preRenderImposterTexture(asset.id, scene);
+      } catch (err) {
+        console.warn(
+          `[VegetationSystem] Failed to pre-render imposter for ${asset.id}:`,
+          err,
+        );
+      }
+
       console.log(`[VegetationSystem] Loaded asset: ${asset.id}`);
 
       return assetData;
@@ -1526,10 +1799,7 @@ export class VegetationSystem extends System {
   private lastPendingCheck = 0;
   private lastPlayerTileKey = "";
 
-  // LOD system
-  private lastLODUpdate = 0;
-  private lastPlayerPos = new THREE.Vector3();
-  private lodNeedsUpdate = true;
+  // Camera layer setup
   private cameraLayerSet = false;
 
   override update(delta: number): void {
@@ -1548,125 +1818,54 @@ export class VegetationSystem extends System {
     this.grassTime += delta;
     this.updateGrass();
 
-    // Check if player moved enough to warrant LOD update
+    // Update GPU uniforms - this is ALL the CPU work per frame!
+    // The shader handles LOD, culling, transforms, and wind animation.
     if (playerPos) {
-      const moveDistance = this.lastPlayerPos.distanceTo(playerPos);
-      if (moveDistance > this.config.movementThreshold) {
-        this.lodNeedsUpdate = true;
-        this.lastPlayerPos.copy(playerPos);
-      }
+      this.updateGPUUniforms(
+        playerPos.x,
+        playerPos.y,
+        playerPos.z,
+        this.grassTime,
+      );
     }
 
-    // Update LOD periodically
-    if (
-      this.lodNeedsUpdate &&
-      now - this.lastLODUpdate > this.config.updateInterval
-    ) {
-      this.lastLODUpdate = now;
-      this.lodNeedsUpdate = false;
-      this.updateLOD();
-    }
-
-    // Check for pending tiles that are now in range (lazy loading)
+    // Lazy load pending tiles as player moves
     if (now - this.lastPendingCheck > 1000) {
-      // Check once per second
       this.lastPendingCheck = now;
       this.processPendingTiles();
     }
 
-    // Log stats periodically for debugging (less frequently)
+    // Periodic stats logging (debug only)
     if (now - this.lastStatsLog > 30000) {
       this.lastStatsLog = now;
       const stats = this.getStats();
       if (stats.loadedAssets > 0 || stats.tilesWithVegetation > 0) {
         const grassCount = this.grassMesh?.count ?? 0;
         console.log(
-          `[VegetationSystem] 📊 Stats: ${stats.totalInstances} vegetation, ${grassCount} grass blades`,
+          `[VegetationSystem] 📊 ${stats.totalInstances} vegetation, ${grassCount} grass`,
         );
       }
     }
   }
 
   /**
-   * Update LOD - simple distance-based culling
-   * Only processes instances near the player for efficiency
+   * Update GPU material uniforms. This is the ONLY CPU work per frame (~16 bytes).
+   * All LOD, culling, transforms, and wind happen in the shader.
    */
-  private updateLOD(): void {
-    const playerPos = this.getPlayerPosition();
-    if (!playerPos) return;
-
-    const playerX = playerPos.x;
-    const playerY = playerPos.y;
-    const playerZ = playerPos.z;
-
-    // Process each loaded asset
-    for (const [_assetId, assetData] of this.loadedAssets) {
-      const category = assetData.asset.category;
-      const lodConfig = LOD_CONFIG[category as keyof typeof LOD_CONFIG];
-      if (!lodConfig) continue;
-
-      const fadeEndSq = lodConfig.fadeEnd * lodConfig.fadeEnd;
-      const maxVisible = Math.min(
-        assetData.maxInstances,
-        this.config.maxInstancesPerAsset,
-      );
-      let visibleCount = 0;
-
-      // Simple distance culling
-      const instances = assetData.instances;
-      const len = instances.length;
-
-      for (let i = 0; i < len && visibleCount < maxVisible; i++) {
-        const instance = instances[i];
-        if (!instance) continue;
-
-        const dx = instance.position.x - playerX;
-        const dz = instance.position.z - playerZ;
-        const distSq = dx * dx + dz * dz;
-
-        // Beyond fade end - skip
-        if (distSq > fadeEndSq) continue;
-
-        // Set matrix directly (reuse cached values when possible)
-        // Apply modelBaseOffset to lift model so its base sits on terrain
-        this._tempPosition.set(
-          instance.position.x,
-          instance.position.y + assetData.modelBaseOffset * instance.scale,
-          instance.position.z,
+  private updateGPUUniforms(
+    playerX: number,
+    playerY: number,
+    playerZ: number,
+    time: number,
+  ): void {
+    for (const [, assetData] of this.loadedAssets) {
+      if (assetData.gpuMaterial) {
+        assetData.gpuMaterial.gpuUniforms.playerPos.value.set(
+          playerX,
+          playerY,
+          playerZ,
         );
-        this._tempEuler.set(
-          instance.rotation.x,
-          instance.rotation.y,
-          instance.rotation.z,
-        );
-        this._tempQuaternion.setFromEuler(this._tempEuler);
-        this._tempScale.setScalar(instance.scale);
-        this._tempMatrix.compose(
-          this._tempPosition,
-          this._tempQuaternion,
-          this._tempScale,
-        );
-
-        assetData.instancedMesh.setMatrixAt(visibleCount, this._tempMatrix);
-        visibleCount++;
-      }
-
-      // Update GPU only if needed
-      const prevCount = assetData.instancedMesh.count;
-      if (prevCount !== visibleCount) {
-        assetData.instancedMesh.count = visibleCount;
-        assetData.instancedMesh.instanceMatrix.needsUpdate = true;
-
-        // Update bounding sphere to be centered on player for proper frustum culling
-        if (assetData.instancedMesh.geometry.boundingSphere) {
-          assetData.instancedMesh.geometry.boundingSphere.center.set(
-            playerX,
-            playerY,
-            playerZ,
-          );
-          assetData.instancedMesh.geometry.boundingSphere.radius =
-            lodConfig.fadeEnd + 20;
-        }
+        assetData.gpuMaterial.gpuUniforms.time.value = time;
       }
     }
   }

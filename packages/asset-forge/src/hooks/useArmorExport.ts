@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter";
+import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 
 export function useArmorExport(params: {
   sceneRef: React.RefObject<THREE.Scene | null>;

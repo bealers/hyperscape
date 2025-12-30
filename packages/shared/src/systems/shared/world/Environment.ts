@@ -150,10 +150,17 @@ export class Environment extends System {
 
     this.updateSky();
 
-    // Load initial model
-    await this.updateModel();
+    // Load initial model (non-blocking - don't let model errors break sky)
+    try {
+      await this.updateModel();
+    } catch (err) {
+      console.warn(
+        "[Environment] Failed to load model (continuing without):",
+        err,
+      );
+    }
 
-    // Enhanced dynamic sky (client-only)
+    // Enhanced dynamic sky (client-only) - must run even if model fails
     this.skySystem = new SkySystem(this.world);
     await this.skySystem.init({} as unknown as WorldOptions);
     this.skySystem.start();

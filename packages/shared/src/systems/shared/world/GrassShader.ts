@@ -15,7 +15,6 @@ import THREE, {
   float,
   vec2,
   vec3,
-  vec4,
   add,
   sub,
   mul,
@@ -203,7 +202,7 @@ export function createGrassMaterial(
   const rand3 = hash(mul(bladeSeed, float(1.2)));
   const rand4 = hash(mul(bladeSeed, float(1.3)));
   const rand5 = hash(mul(bladeSeed, float(1.4)));
-  const rand6 = hash(mul(bladeSeed, float(1.5)));
+  const _rand6 = hash(mul(bladeSeed, float(1.5)));
 
   // Position: completely random within a 2x2 cell area (allows overlap between cells)
   // This breaks the grid by letting blades spread beyond their "home" cell

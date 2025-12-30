@@ -7,7 +7,6 @@
 import * as tf from "@tensorflow/tfjs";
 import * as handPoseDetection from "@tensorflow-models/hand-pose-detection";
 
-// @ts-expect-error - tfjs-backend-webgpu has no type declarations but is needed for side effects
 import "@tensorflow/tfjs-backend-webgpu";
 import "@mediapipe/hands";
 

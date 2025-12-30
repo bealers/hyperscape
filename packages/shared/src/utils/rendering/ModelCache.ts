@@ -9,6 +9,7 @@
 
 import THREE from "../../extras/three/three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import type { World } from "../../core/World";
 
 interface CachedModel {
@@ -29,6 +30,8 @@ export class ModelCache {
   private constructor() {
     // Use our own GLTFLoader to ensure we get pure THREE.Object3D (not Hyperscape Nodes)
     this.gltfLoader = new GLTFLoader();
+    // Enable meshopt decoder for compressed GLB files (EXT_meshopt_compression)
+    this.gltfLoader.setMeshoptDecoder(MeshoptDecoder);
   }
 
   static getInstance(): ModelCache {
@@ -44,6 +47,7 @@ export class ModelCache {
    */
   private convertToStandardMaterial(
     mat: THREE.Material,
+    hasVertexColors = false,
   ): THREE.MeshStandardMaterial {
     // Extract textures and colors from original material
     const originalMat = mat as THREE.Material & {
@@ -57,6 +61,7 @@ export class ModelCache {
       transparent?: boolean;
       alphaTest?: number;
       side?: THREE.Side;
+      vertexColors?: boolean;
     };
 
     const newMat = new THREE.MeshStandardMaterial({
@@ -73,6 +78,8 @@ export class ModelCache {
       roughness: 0.7,
       metalness: 0.0,
       envMapIntensity: 1.0, // Respond to environment map
+      // Enable vertex colors if the geometry has them
+      vertexColors: hasVertexColors || originalMat.vertexColors || false,
     });
 
     // Copy name for debugging
@@ -94,18 +101,26 @@ export class ModelCache {
       if (node instanceof THREE.Mesh || node instanceof THREE.SkinnedMesh) {
         const mesh = node;
 
+        // Check if geometry has vertex colors
+        const hasVertexColors = mesh.geometry?.attributes?.color !== undefined;
+
         // Convert materials to MeshStandardMaterial for proper sun/moon/environment lighting
         const convertMaterial = (mat: THREE.Material): THREE.Material => {
-          // If already a PBR material, just set it up
+          // If already a PBR material, just set it up (and enable vertex colors if needed)
           if (
             mat instanceof THREE.MeshStandardMaterial ||
             mat instanceof THREE.MeshPhysicalMaterial
           ) {
+            // Enable vertex colors if geometry has them
+            if (hasVertexColors && !mat.vertexColors) {
+              mat.vertexColors = true;
+              mat.needsUpdate = true;
+            }
             this.setupSingleMaterial(mat, world);
             return mat;
           }
           // Convert non-PBR materials (MeshBasicMaterial, MeshPhongMaterial, etc.)
-          const newMat = this.convertToStandardMaterial(mat);
+          const newMat = this.convertToStandardMaterial(mat, hasVertexColors);
           this.setupSingleMaterial(newMat, world);
           return newMat;
         };

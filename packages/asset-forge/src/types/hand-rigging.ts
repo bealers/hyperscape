@@ -69,7 +69,7 @@ export interface HandRiggingOptions {
           };
       debugCaptures?: Record<string, string>;
     }>;
-  }>;
+  } | null>;
 }
 
 // Extended type for required options

@@ -1994,6 +1994,20 @@ export class ClientNetwork extends SystemBase {
         data.position[1],
         data.position[2],
       );
+
+      // CRITICAL: Reset tile interpolator state BEFORE teleporting
+      // Otherwise the tile movement system will immediately pull player back
+      this.tileInterpolator.syncPosition(data.playerId, {
+        x: pos.x,
+        y: pos.y,
+        z: pos.z,
+      });
+
+      // Clear the tile movement flags on player data
+      player.data.tileInterpolatorControlled = false;
+      player.data.tileMovementActive = false;
+
+      // Now teleport the player
       player.teleport(pos);
     }
   };
