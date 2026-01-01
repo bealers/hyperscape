@@ -16,25 +16,7 @@ import type { ServerSocket } from "../../../shared/types";
 import type { World } from "@hyperscape/shared";
 import type { FollowManager } from "../FollowManager";
 import { validateRequestTimestamp } from "../services/InputValidation";
-import {
-  createRateLimiter,
-  type RateLimiter,
-} from "../services/SlidingWindowRateLimiter";
-
-/**
- * Rate limiter for follow requests (5 per second - more lenient than combat)
- */
-let followRateLimiter: RateLimiter | null = null;
-
-function getFollowRateLimiter(): RateLimiter {
-  if (!followRateLimiter) {
-    followRateLimiter = createRateLimiter({
-      maxPerSecond: 5,
-      name: "follow",
-    });
-  }
-  return followRateLimiter;
-}
+import { getFollowRateLimiter } from "../services/SlidingWindowRateLimiter";
 
 /**
  * Send feedback to client

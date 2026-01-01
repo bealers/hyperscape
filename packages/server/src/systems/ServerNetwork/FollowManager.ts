@@ -27,12 +27,12 @@ interface FollowState {
   startTick: number;
 }
 
-/** Current tick number, updated by processTick */
-let currentTickNumber = 0;
-
 export class FollowManager {
   /** Map of followerId -> follow state */
   private following = new Map<string, FollowState>();
+
+  /** Current tick number, updated by processTick - instance member for proper encapsulation */
+  private currentTickNumber = 0;
 
   constructor(
     private world: World,
@@ -77,7 +77,7 @@ export class FollowManager {
       followerId,
       targetId,
       lastTargetTile: null, // null triggers path calculation in processTick
-      startTick: currentTickNumber,
+      startTick: this.currentTickNumber,
     });
 
     // NO immediate movePlayerToward() call here!
@@ -125,7 +125,7 @@ export class FollowManager {
   processTick(tickNumber?: number): void {
     // Track current tick for startFollowing delay
     if (tickNumber !== undefined) {
-      currentTickNumber = tickNumber;
+      this.currentTickNumber = tickNumber;
     }
 
     for (const [followerId, state] of this.following) {
@@ -133,7 +133,7 @@ export class FollowManager {
       // If follow was registered THIS tick, skip processing until NEXT tick
       // This matches OSRS: "Each action registered within one tick will start
       // to take place by the beginning of the next tick"
-      if (state.startTick === currentTickNumber) {
+      if (state.startTick === this.currentTickNumber) {
         continue;
       }
 
@@ -189,72 +189,6 @@ export class FollowManager {
         );
         state.lastTargetTile = { x: previousTile.x, z: previousTile.z };
       }
-    }
-  }
-
-  /**
-   * Process following for a specific player
-   * Called by GameTickProcessor during player phase
-   *
-   * OSRS-ACCURATE: Uses PREVIOUS tile (last stepped-off tile) for 1-tile trailing
-   * This is consistent with processTick() - both use previousTile which:
-   * - Is always 1 tile behind current position during movement
-   * - Stays unchanged when target stops (doesn't update every tick)
-   */
-  processPlayerTick(playerId: string): void {
-    const state = this.following.get(playerId);
-    if (!state) return;
-
-    // Check if target still exists
-    const targetEntity = this.world.entities.get(state.targetId);
-    if (!targetEntity) {
-      this.following.delete(playerId);
-      return;
-    }
-
-    // Check if follower still exists
-    const followerEntity = this.world.entities.get(playerId);
-    if (!followerEntity) {
-      this.following.delete(playerId);
-      return;
-    }
-
-    const targetPos = targetEntity.position;
-    if (!targetPos) {
-      this.following.delete(playerId);
-      return;
-    }
-
-    const followerPos = followerEntity.position;
-    const followerTile = worldToTile(followerPos.x, followerPos.z);
-
-    // OSRS-ACCURATE: Get target's PREVIOUS tile (last tile they stepped off)
-    // This is always 1 tile behind their current position
-    // When target stops, previousTile stays at the last stepped-off position
-    const previousTile = this.tileMovementManager.getPreviousTile(
-      state.targetId,
-    );
-
-    // Already at target's previous tile - we're correctly trailing
-    if (tilesEqual(followerTile, previousTile)) {
-      return;
-    }
-
-    // Check if target's previous tile changed (they moved)
-    if (
-      !state.lastTargetTile ||
-      state.lastTargetTile.x !== previousTile.x ||
-      state.lastTargetTile.z !== previousTile.z
-    ) {
-      // Re-path to target's PREVIOUS tile (1 tile behind)
-      const previousWorld = tileToWorld(previousTile);
-      this.tileMovementManager.movePlayerToward(
-        playerId,
-        { x: previousWorld.x, y: targetPos.y, z: previousWorld.z },
-        true,
-        0,
-      );
-      state.lastTargetTile = { x: previousTile.x, z: previousTile.z };
     }
   }
 
