@@ -20,6 +20,7 @@
 import { BaseInteractionHandler } from "./BaseInteractionHandler";
 import type { RaycastTarget, ContextMenuAction } from "../types";
 import { INTERACTION_RANGE, MESSAGE_TYPES } from "../constants";
+import { getCombatLevelColor } from "../utils/combatLevelColor";
 import type { ZoneDetectionSystem } from "../../../shared/death/ZoneDetectionSystem";
 
 export class PlayerInteractionHandler extends BaseInteractionHandler {
@@ -34,10 +35,17 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
 
   /**
    * Right-click: Show player interaction options (OSRS order)
+   *
+   * Combat levels are colored based on relative level difference:
+   * - Green: Target is lower level
+   * - Yellow: Target is same level
+   * - Red: Target is higher level
    */
   getContextMenuActions(target: RaycastTarget): ContextMenuAction[] {
     const actions: ContextMenuAction[] = [];
     const targetLevel = this.getPlayerCombatLevel(target.entityId);
+    const localPlayerLevel = this.getLocalPlayerCombatLevel();
+    const levelColor = getCombatLevelColor(targetLevel, localPlayerLevel);
     const inPvPZone = this.isInPvPZone();
 
     // 1. Attack (OSRS-accurate: only APPEARS in PvP zones, not just greyed out)
@@ -45,6 +53,13 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "attack",
         label: `Attack ${target.name} (level-${targetLevel})`,
+        styledLabel: [
+          { text: "Attack " },
+          { text: target.name, color: "#ffffff" },
+          { text: " (level-" },
+          { text: `${targetLevel}`, color: levelColor },
+          { text: ")" },
+        ],
         icon: "⚔️",
         enabled: true,
         priority: 0,
@@ -52,20 +67,34 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
       });
     }
 
-    // 2. Trade with - Priority 1
+    // 2. Trade with - Priority 1 (includes level for consistency)
     actions.push({
       id: "trade",
-      label: `Trade with ${target.name}`,
+      label: `Trade with ${target.name} (level-${targetLevel})`,
+      styledLabel: [
+        { text: "Trade with " },
+        { text: target.name, color: "#ffffff" },
+        { text: " (level-" },
+        { text: `${targetLevel}`, color: levelColor },
+        { text: ")" },
+      ],
       icon: "🤝",
       enabled: false, // Disabled until trading implemented
       priority: 1,
       handler: () => this.showExamineMessage("Trading is not yet available."),
     });
 
-    // 3. Follow - Priority 2
+    // 3. Follow - Priority 2 (includes level for consistency)
     actions.push({
       id: "follow",
-      label: `Follow ${target.name}`,
+      label: `Follow ${target.name} (level-${targetLevel})`,
+      styledLabel: [
+        { text: "Follow " },
+        { text: target.name, color: "#ffffff" },
+        { text: " (level-" },
+        { text: `${targetLevel}`, color: levelColor },
+        { text: ")" },
+      ],
       icon: "👣",
       enabled: true,
       priority: 2,
@@ -147,6 +176,23 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
       if (typeof entity.combatLevel === "number") {
         return entity.combatLevel;
       }
+    }
+    // Fallback: OSRS minimum combat level
+    return 3;
+  }
+
+  /**
+   * Get local player's combat level.
+   * Used for relative color calculation (green/yellow/red).
+   * Falls back to 3 (OSRS minimum) if unknown.
+   */
+  private getLocalPlayerCombatLevel(): number {
+    const player = this.getPlayer();
+    if (!player) return 3;
+
+    const entity = player as unknown as { combatLevel?: number };
+    if (typeof entity.combatLevel === "number") {
+      return entity.combatLevel;
     }
     // Fallback: OSRS minimum combat level
     return 3;
