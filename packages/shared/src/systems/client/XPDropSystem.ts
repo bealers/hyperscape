@@ -39,6 +39,9 @@ export class XPDropSystem extends System {
   private readonly RISE_DISTANCE = 2.5; // Units to float upward
   private readonly DROP_SIZE = 0.5; // Size of the XP drop sprite
 
+  // Pre-allocated array for removal indices to avoid per-frame allocation
+  private readonly _toRemove: number[] = [];
+
   constructor(world: World) {
     super(world);
   }
@@ -174,7 +177,9 @@ export class XPDropSystem extends System {
     if (!this.world.isClient) return;
 
     const now = performance.now();
-    const toRemove: number[] = [];
+    // Reuse pre-allocated array to avoid per-frame allocation
+    this._toRemove.length = 0;
+    const toRemove = this._toRemove;
 
     // Animate all active drops
     for (let i = 0; i < this.activeDrops.length; i++) {
@@ -197,10 +202,8 @@ export class XPDropSystem extends System {
       // Mark for removal when done
       if (progress >= 1) {
         this.world.stage.scene.remove(drop.sprite);
-        drop.sprite.material.dispose();
-        if (drop.sprite.material.map) {
-          drop.sprite.material.map.dispose();
-        }
+        // NOTE: Don't dispose material/texture - let GC handle it
+        // to avoid WebGPU texture cache corruption with dual-renderer setup
         toRemove.push(i);
       }
     }
@@ -215,10 +218,8 @@ export class XPDropSystem extends System {
     // Clean up all active drops
     for (const drop of this.activeDrops) {
       this.world.stage.scene.remove(drop.sprite);
-      drop.sprite.material.dispose();
-      if (drop.sprite.material.map) {
-        drop.sprite.material.map.dispose();
-      }
+      // NOTE: Don't dispose material/texture - let GC handle it
+      // to avoid WebGPU texture cache corruption with dual-renderer setup
     }
     this.activeDrops = [];
   }

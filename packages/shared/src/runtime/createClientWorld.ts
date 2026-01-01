@@ -9,22 +9,21 @@
  * - Client receives authoritative state from server
  * - No client-side prediction or interpolation (server is authoritative)
  * - Client handles rendering, input, audio, and UI
- * - Uses WebGL/WebGPU for graphics via three.js
+ * - Uses WebGPU for graphics via three.js
  * - PhysX physics runs locally for immediate feedback (validated by server)
  *
  * Systems Registered:
  * 1. Core Systems: ClientRuntime, Stage, ClientNetwork
  * 2. Media: ClientLiveKit (voice), ClientAudio, MusicSystem
  * 3. Rendering: ClientGraphics, Environment, ClientCameraSystem
- * 4. Input: ClientInput (keyboard, mouse, touch, XR)
+ * 4. Input: ClientInput (keyboard, mouse, touch)
  * 5. UI: ClientInterface (preferences, UI state)
  * 6. Loading: ClientLoader (asset management)
  * 7. Physics: Physics (PhysX via WASM)
  * 8. Terrain: TerrainSystem (heightmap rendering)
  * 9. Visual Effects: LODs, Nametags, Particles, Wind
- * 10. VR/AR: XR system
- * 11. Actions: ClientActions (executable actions from UI/keybinds)
- * 12. RPG Systems: All game logic systems (shared with server)
+ * 10. Actions: ClientActions (executable actions from UI/keybinds)
+ * 11. RPG Systems: All game logic systems (shared with server)
  *
  * Browser Integration:
  * - Exposes `window.world` for debugging and testing
@@ -51,6 +50,7 @@ import { World } from "../core/World";
 import { ClientActions } from "../systems/client/ClientActions";
 import { ClientAudio } from "../systems/client/ClientAudio";
 import { ClientCameraSystem } from "../systems/client/ClientCameraSystem";
+import { DevStats } from "../systems/client/DevStats";
 import { Environment } from "../systems/shared";
 import { ClientGraphics } from "../systems/client/ClientGraphics";
 import { ClientInput } from "../systems/client/ClientInput";
@@ -64,8 +64,9 @@ import { Stage } from "../systems/shared";
 
 import THREE from "../extras/three/three";
 
-// Terrain and physics
+// Terrain, vegetation, and physics
 import { TerrainSystem } from "../systems/shared";
+import { VegetationSystem } from "../systems/shared";
 import { Physics } from "../systems/shared";
 
 // RPG systems are registered via SystemLoader to keep them modular
@@ -80,9 +81,10 @@ import { LODs } from "../systems/shared";
 import { Nametags } from "../systems/client/Nametags";
 import { HealthBars } from "../systems/client/HealthBars";
 import { EquipmentVisualSystem } from "../systems/client/EquipmentVisualSystem";
+import { ZoneVisualsSystem } from "../systems/client/ZoneVisualsSystem";
+import { ZoneDetectionSystem } from "../systems/shared/death/ZoneDetectionSystem";
 import { Particles } from "../systems/shared";
 import { Wind } from "../systems/shared";
-import { XR } from "../systems/client/XR";
 
 /**
  * Window extension for browser testing and debugging.
@@ -142,15 +144,18 @@ export function createClientWorld() {
   world.register("loader", ClientLoader); // Asset loading and caching
 
   // Rendering systems
-  world.register("graphics", ClientGraphics); // WebGL/WebGPU renderer
+  world.register("graphics", ClientGraphics); // WebGPU renderer
   world.register("environment", Environment); // Lighting, shadows, CSM
+
+  // Dev tools (only active in dev mode)
+  world.register("devStats", DevStats); // FPS counter and performance telemetry
 
   // Audio systems
   world.register("audio", ClientAudio); // 3D spatial audio
   world.register("music", MusicSystem); // Background music player
 
   // Input and interaction
-  world.register("controls", ClientInput); // Keyboard, mouse, touch, XR input
+  world.register("controls", ClientInput); // Keyboard, mouse, touch input
   world.register("actions", ClientActions); // Executable player actions
 
   // UI and preferences
@@ -170,6 +175,14 @@ export function createClientWorld() {
   world.register("terrain", TerrainSystem);
 
   // ============================================================================
+  // VEGETATION SYSTEM
+  // ============================================================================
+  // GPU-instanced vegetation (trees, bushes, grass, rocks, flowers)
+  // Must be registered after terrain as it listens to terrain tile events
+
+  world.register("vegetation", VegetationSystem);
+
+  // ============================================================================
   // VISUAL EFFECTS SYSTEMS
   // ============================================================================
   // These systems enhance visual fidelity and user experience
@@ -178,9 +191,10 @@ export function createClientWorld() {
   world.register("nametags", Nametags); // Player/NPC name labels
   world.register("healthbars", HealthBars); // Entity health bars (separate from nametags)
   world.register("equipment-visual", EquipmentVisualSystem); // Visual weapon/equipment attachment
+  world.register("zone-detection", ZoneDetectionSystem); // Zone type detection (safe/pvp/wilderness)
+  world.register("zone-visuals", ZoneVisualsSystem); // PvP zone ground overlays and warnings
   world.register("particles", Particles); // Particle effects system
   world.register("wind", Wind); // Environmental wind effects
-  world.register("xr", XR); // VR/AR support
 
   // ============================================================================
   // THREE.JS SETUP

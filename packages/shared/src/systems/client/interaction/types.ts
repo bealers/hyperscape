@@ -70,6 +70,25 @@ export interface QueuedAction {
 }
 
 /**
+ * A segment of styled text within a label.
+ *
+ * Used for rich text rendering in context menus, such as
+ * combat level colors (green/yellow/red based on relative level).
+ *
+ * @see getCombatLevelColor for OSRS-accurate level coloring
+ */
+export interface LabelSegment {
+  /** Text content of this segment */
+  text: string;
+  /** Hex color (e.g., "#ff0000" for red) */
+  color?: string;
+  /** Whether text should be bold */
+  bold?: boolean;
+  /** Whether text should be italic */
+  italic?: boolean;
+}
+
+/**
  * Context menu action definition
  *
  * Returned by handlers to build context menus.
@@ -78,8 +97,10 @@ export interface QueuedAction {
 export interface ContextMenuAction {
   /** Unique action ID */
   id: string;
-  /** Display label (e.g., "Attack Goblin (Lv3)") */
+  /** Display label - plain text fallback (e.g., "Attack Goblin (Lv3)") */
   label: string;
+  /** Rich text label with colors/styles - takes precedence over label if present */
+  styledLabel?: LabelSegment[];
   /** Optional emoji icon */
   icon?: string;
   /** Whether action can be executed (greyed out if false) */

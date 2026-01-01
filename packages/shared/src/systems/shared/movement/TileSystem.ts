@@ -48,6 +48,16 @@ export interface TileMovementState {
   pathIndex: number; // Current position in path
   isRunning: boolean; // Walk (1 tile/tick) vs Run (2 tiles/tick)
   moveSeq: number; // Movement sequence number (incremented on each new path)
+  /**
+   * Tile player was on at START of current tick (captured before movement)
+   *
+   * OSRS-ACCURATE: Used by FollowManager for follow mechanic.
+   * Following a player means walking to their PREVIOUS tile,
+   * creating the characteristic 1-tick trailing effect.
+   *
+   * @see https://rune-server.org/threads/help-with-player-dancing-spinning-when-following-each-other.706121/
+   */
+  previousTile: TileCoord | null;
 }
 
 /**
@@ -106,6 +116,22 @@ export function tileToWorld(tile: TileCoord): {
     y: 0, // Y will be set from terrain height
     z: (tile.z + 0.5) * TILE_SIZE,
   };
+}
+
+/**
+ * Convert tile coordinates to world coordinates (zero-allocation)
+ * Writes to an existing object to avoid GC pressure in hot paths.
+ *
+ * @param tile - Tile coordinates to convert
+ * @param out - Pre-allocated object to write to (must have x, y, z properties)
+ */
+export function tileToWorldInto(
+  tile: TileCoord,
+  out: { x: number; y: number; z: number },
+): void {
+  out.x = (tile.x + 0.5) * TILE_SIZE;
+  out.y = 0; // Y will be set from terrain height
+  out.z = (tile.z + 0.5) * TILE_SIZE;
 }
 
 /**
@@ -656,6 +682,7 @@ export function createTileMovementState(
     pathIndex: 0,
     isRunning: false,
     moveSeq: 0,
+    previousTile: null, // Set on first tick
   };
 }
 

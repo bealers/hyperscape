@@ -40,7 +40,6 @@ import type { PlayerEntity } from "../../../entities/player/PlayerEntity";
 import { Position3D } from "../../../types";
 import {
   AttackStyle,
-  AttackType,
   Player,
   PlayerAttackStyleState,
   PlayerMigration,
@@ -64,7 +63,7 @@ import { EventType } from "../../../types/events";
 import type { World } from "../../../types/index";
 import { Logger } from "../../../utils/Logger";
 import { EntityManager } from "..";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import type { TerrainSystem } from "..";
 import { PlayerIdMapper } from "../../../utils/PlayerIdMapper";
 import type { DatabaseSystem } from "../../../types/systems/system-interfaces";
@@ -266,6 +265,16 @@ export class PlayerSystem extends SystemBase {
         },
       ),
     );
+    // CLIENT-SIDE: Sync internal state when receiving authoritative style from server
+    // This fixes the bug where client initializes with "accurate" but server has saved style
+    this.subscribe(EventType.UI_ATTACK_STYLE_CHANGED, (data) =>
+      this.handleStyleSyncFromServer(
+        data as {
+          playerId: string;
+          currentStyle: { id: string };
+        },
+      ),
+    );
 
     // Auto-retaliate events
     this.subscribe(EventType.UI_AUTO_RETALIATE_GET, (data) =>
@@ -452,8 +461,8 @@ export class PlayerSystem extends SystemBase {
     oldLevel: number;
     newLevel: number;
   }): void {
-    // Only save on server
-    if (!this.world.isServer || !this.databaseSystem) return;
+    // Only process on server
+    if (!this.world.isServer) return;
 
     const player = this.players.get(data.entityId);
     if (!player) return;
@@ -461,11 +470,16 @@ export class PlayerSystem extends SystemBase {
     // Update combat level in player data (SkillsSystem already updated StatsComponent)
     player.combat.combatLevel = data.newLevel;
 
-    // Save to database immediately
-    const databaseId = PlayerIdMapper.getDatabaseId(data.entityId);
-    this.databaseSystem.savePlayer(databaseId, {
-      combatLevel: data.newLevel,
-    });
+    // Sync to entity and broadcast to all clients
+    this.syncCombatLevelToEntity(data.entityId, data.newLevel);
+
+    // Save to database immediately (only if database system available)
+    if (this.databaseSystem) {
+      const databaseId = PlayerIdMapper.getDatabaseId(data.entityId);
+      this.databaseSystem.savePlayer(databaseId, {
+        combatLevel: data.newLevel,
+      });
+    }
   }
 
   async onPlayerEnter(data: PlayerEnterEvent): Promise<void> {
@@ -599,6 +613,12 @@ export class PlayerSystem extends SystemBase {
 
     // Update UI
     this.emitPlayerUpdate(data.playerId);
+
+    // CRITICAL: Sync combat level to entity data for remote clients
+    // The entity was created with combatLevel=3 (default), but we now have the correct level
+    // from database. Sync it to entity.data so serialize() sends correct level to new clients,
+    // and broadcast via entityModified so existing clients see the correct combat level.
+    this.syncCombatLevelToEntity(data.playerId, playerData.combat.combatLevel);
 
     // If entity doesn't exist yet, wait for spawn request to create spawn data
     // This happens during initial join before character select
@@ -979,6 +999,9 @@ export class PlayerSystem extends SystemBase {
 
     // Recalculate combat level
     player.combat.combatLevel = this.calculateCombatLevel(player.skills);
+
+    // Sync to entity and broadcast to all clients
+    this.syncCombatLevelToEntity(playerId, player.combat.combatLevel);
 
     // Save to database
     if (this.databaseSystem) {
@@ -1406,6 +1429,28 @@ export class PlayerSystem extends SystemBase {
     return Math.floor(combatLevel);
   }
 
+  /**
+   * Sync combat level to entity data and broadcast to all clients
+   * Call this after recalculating combat level to ensure remote players see updates
+   */
+  private syncCombatLevelToEntity(playerId: string, combatLevel: number): void {
+    if (!this.world.isServer) return;
+
+    const entity = this.world.entities.get(playerId);
+    if (entity) {
+      // Update entity data so serialize() includes correct combat level
+      (entity.data as { combatLevel?: number }).combatLevel = combatLevel;
+
+      // Broadcast to all clients via entityModified
+      if (this.world.network?.send) {
+        this.world.network.send("entityModified", {
+          id: playerId,
+          combatLevel: combatLevel,
+        });
+      }
+    }
+  }
+
   // === ATTACK STYLE METHODS (merged from AttackStyleSystem) ===
 
   /**
@@ -1563,6 +1608,42 @@ export class PlayerSystem extends SystemBase {
       this.databaseSystem.savePlayer(databaseId, {
         attackStyle: newStyle,
       });
+    }
+  }
+
+  /**
+   * CLIENT-SIDE: Sync internal state when receiving authoritative style from server.
+   *
+   * This fixes a bug where the client initializes playerAttackStyles with "accurate"
+   * (because there's no database on client), but the server has the correct saved style.
+   * When the server sends the correct style via attackStyleChanged packet, we need to
+   * update the client's internal Map so that getAttackStyleInfo() returns the correct value.
+   */
+  private handleStyleSyncFromServer(data: {
+    playerId: string;
+    currentStyle: { id: string };
+  }): void {
+    // Only sync on client - server is authoritative and doesn't need this
+    if (this.world.isServer) return;
+
+    const { playerId, currentStyle } = data;
+    if (!currentStyle?.id) return;
+
+    const playerState = this.playerAttackStyles.get(playerId);
+    if (!playerState) {
+      // Player not yet initialized, create state with server's value
+      this.playerAttackStyles.set(playerId, {
+        playerId,
+        selectedStyle: currentStyle.id,
+        lastStyleChange: 0,
+        combatStyleHistory: [],
+      });
+      return;
+    }
+
+    // Update existing state with server's authoritative value
+    if (playerState.selectedStyle !== currentStyle.id) {
+      playerState.selectedStyle = currentStyle.id;
     }
   }
 
@@ -1847,6 +1928,9 @@ export class PlayerSystem extends SystemBase {
 
     // Recalculate combat level
     player.combat.combatLevel = this.calculateCombatLevel(data.skills);
+
+    // Sync to entity and broadcast to all clients
+    this.syncCombatLevelToEntity(data.playerId, player.combat.combatLevel);
 
     // Update stats component with new skill data for SkillsSystem and combat calculations
     const playerEntity = this.world.entities.get(data.playerId);

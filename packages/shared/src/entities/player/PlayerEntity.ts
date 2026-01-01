@@ -602,10 +602,13 @@ export class PlayerEntity extends CombatantEntity {
   protected async createMesh(): Promise<void> {
     // Create player capsule geometry (represents the player body)
     const geometry = new THREE.CapsuleGeometry(0.4, 1.2, 4, 8);
-    const material = new THREE.MeshPhongMaterial({
+    // Use MeshStandardMaterial for proper lighting (responds to sun, moon, and environment maps)
+    const material = new THREE.MeshStandardMaterial({
       color: 0x4169e1, // Royal blue for player
       emissive: 0x1a3470,
-      emissiveIntensity: 0.2,
+      emissiveIntensity: 0.15,
+      roughness: 0.7,
+      metalness: 0.1,
     });
 
     const mesh = new THREE.Mesh(geometry, material);
@@ -881,12 +884,9 @@ export class PlayerEntity extends CombatantEntity {
     // Clean up player-specific stamina bar
     if (this.staminaBarUI && this.world.stage.scene) {
       this.world.stage.scene.remove(this.staminaBarUI);
-      // Strong type assumption - stamina bar material is SpriteMaterial
-      const spriteMaterial = this.staminaBarUI.material as THREE.SpriteMaterial;
-      if (spriteMaterial.map) {
-        spriteMaterial.map.dispose();
-      }
-      spriteMaterial.dispose();
+      // NOTE: Don't dispose sprite material or texture - they will be GC'd
+      // when the sprite is no longer referenced. Disposing synchronously
+      // causes WebGPU texture cache corruption with dual-renderer setup.
       this.staminaBarUI = null;
     }
 

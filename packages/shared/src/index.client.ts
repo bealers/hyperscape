@@ -126,9 +126,9 @@ export { ClientGraphics } from "./systems/client/ClientGraphics";
 export { ClientRuntime } from "./systems/client/ClientRuntime"; // Client lifecycle and diagnostics
 export { ClientAudio } from "./systems/client/ClientAudio";
 export { ClientLiveKit } from "./systems/client/ClientLiveKit";
-export { ClientInput } from "./systems/client/ClientInput"; // Keyboard, mouse, touch, XR input handling
+export { ClientInput } from "./systems/client/ClientInput";
 export { ClientActions } from "./systems/client/ClientActions";
-export { XR } from "./systems/client/XR";
+export { DevStats } from "./systems/client/DevStats"; // FPS counter and dev performance telemetry
 export { EventBus } from "./systems/shared";
 export { System as SystemClass } from "./systems/shared";
 export { SystemBase } from "./systems/shared";
@@ -160,9 +160,7 @@ export {
   createRenderer,
   configureRenderer,
   configureShadowMaps,
-  configureXR,
   isWebGPURenderer,
-  isWebGLRenderer,
   getRendererBackend,
   detectRenderingCapabilities,
   type UniversalRenderer,
@@ -171,8 +169,6 @@ export {
 
 export {
   createPostProcessing,
-  setBloomEnabled,
-  disposePostProcessing,
   type PostProcessingComposer,
 } from "./utils/rendering/PostProcessingFactory";
 

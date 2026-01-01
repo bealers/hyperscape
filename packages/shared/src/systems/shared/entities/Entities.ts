@@ -69,7 +69,7 @@ import type {
   World,
 } from "../../../types/index";
 import { EventType } from "../../../types/events";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import { MobEntity } from "../../../entities/npc/MobEntity";
 import { NPCEntity } from "../../../entities/npc/NPCEntity";
 import { ItemEntity } from "../../../entities/world/ItemEntity";
@@ -109,18 +109,22 @@ class GenericEntity extends Entity {
 /**
  * Entity type registry - maps type strings to entity constructors.
  * New entity types can be registered at runtime via registerEntityType().
+ *
+ * Note: Specialized entity classes have more specific constructor signatures,
+ * so we use type assertions to EntityConstructor. At runtime, the caller is
+ * responsible for passing the correct config type for each entity type.
  */
 const EntityTypes: Record<string, EntityConstructor> = {
-  entity: GenericEntity,
-  player: PlayerEntity, // Server-side player entity
-  playerLocal: PlayerLocal, // Client-side local player
-  playerRemote: PlayerRemote, // Client-side remote players
-  item: ItemEntity as unknown as EntityConstructor, // Ground items
-  mob: MobEntity as unknown as EntityConstructor, // Enemy entities
-  npc: NPCEntity as unknown as EntityConstructor, // NPC entities
-  resource: ResourceEntity as unknown as EntityConstructor, // Resource entities (trees, rocks, etc)
-  headstone: HeadstoneEntity as unknown as EntityConstructor, // Death markers
-  bank: BankEntity as unknown as EntityConstructor, // Bank booths
+  entity: GenericEntity as EntityConstructor,
+  player: PlayerEntity as EntityConstructor,
+  playerLocal: PlayerLocal as EntityConstructor,
+  playerRemote: PlayerRemote as EntityConstructor,
+  item: ItemEntity as unknown as EntityConstructor,
+  mob: MobEntity as unknown as EntityConstructor,
+  npc: NPCEntity as unknown as EntityConstructor,
+  resource: ResourceEntity as unknown as EntityConstructor,
+  headstone: HeadstoneEntity as unknown as EntityConstructor,
+  bank: BankEntity as unknown as EntityConstructor,
 };
 
 /**
@@ -153,7 +157,8 @@ export class Entities extends SystemBase implements IEntities {
   }
 
   get(id: string): Entity | null {
-    return this.items.get(id) || null;
+    // Check items first, then players (for remote player entity lookup)
+    return this.items.get(id) || this.players.get(id) || null;
   }
 
   values(): IterableIterator<Entity> {
@@ -270,6 +275,20 @@ export class Entities extends SystemBase implements IEntities {
         }
       }
 
+      // Extract mob data sent from server (see MobEntity.serialize())
+      const networkData = data as {
+        level?: number;
+        currentHealth?: number;
+        maxHealth?: number;
+        mobType?: string;
+        aiState?: MobAIState;
+        targetPlayerId?: string | null;
+      };
+      const mobLevel = networkData.level || 1;
+      const mobCurrentHealth = networkData.currentHealth || 100;
+      const mobMaxHealth = networkData.maxHealth || 100;
+      const mobType = networkData.mobType || derivedMobType;
+
       const mobConfig: MobEntityConfig = {
         id: data.id,
         name: name,
@@ -292,11 +311,11 @@ export class Entities extends SystemBase implements IEntities {
         interactionDistance: 5,
         description: name,
         model: finalModelPath,
-        // Minimal required MobEntity fields with sensible defaults
-        mobType: derivedMobType, // Mob ID from mobs.json
-        level: 1,
-        currentHealth: 100,
-        maxHealth: 100,
+        // Use server-provided mob data, with sensible defaults
+        mobType: mobType,
+        level: mobLevel,
+        currentHealth: mobCurrentHealth,
+        maxHealth: mobMaxHealth,
         attack: 1, // Default attack level for accuracy
         attackPower: 10,
         defense: 2,
@@ -318,17 +337,17 @@ export class Entities extends SystemBase implements IEntities {
           y: positionArray[1],
           z: positionArray[2],
         },
-        aiState: MobAIState.IDLE,
+        aiState: networkData.aiState || MobAIState.IDLE,
         lastAttackTime: 0,
         properties: {
           movementComponent: null,
           combatComponent: null,
           healthComponent: null,
           visualComponent: null,
-          health: { current: 100, max: 100 },
-          level: 1,
+          health: { current: mobCurrentHealth, max: mobMaxHealth },
+          level: mobLevel,
         },
-        targetPlayerId: null,
+        targetPlayerId: networkData.targetPlayerId || null,
         deathTime: null,
       };
 
@@ -845,8 +864,8 @@ export class Entities extends SystemBase implements IEntities {
             err,
           );
           console.error(`[Entities] Entity ${entity.id} init() failed:`, err);
+          // Error logged above
         });
-    } else {
     }
 
     return entity;
@@ -899,22 +918,22 @@ export class Entities extends SystemBase implements IEntities {
   }
 
   override fixedUpdate(delta: number): void {
-    const hotEntities = Array.from(this.hot);
-    for (const entity of hotEntities) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const entity of this.hot) {
       entity.fixedUpdate?.(delta);
     }
   }
 
   override update(delta: number): void {
-    const hotEntities = Array.from(this.hot);
-    for (const entity of hotEntities) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const entity of this.hot) {
       entity.update(delta);
     }
   }
 
   override lateUpdate(delta: number): void {
-    const hotEntities = Array.from(this.hot);
-    for (const entity of hotEntities) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const entity of this.hot) {
       entity.lateUpdate?.(delta);
     }
   }
@@ -973,8 +992,8 @@ export class Entities extends SystemBase implements IEntities {
   // Missing lifecycle methods
   postFixedUpdate(): void {
     // Add postLateUpdate calls for entities
-    const hotEntities = Array.from(this.hot);
-    for (const entity of hotEntities) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const entity of this.hot) {
       entity.postLateUpdate?.(0);
     }
   }

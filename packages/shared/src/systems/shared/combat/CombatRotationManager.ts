@@ -19,12 +19,26 @@ interface QuaternionLike {
 }
 
 /**
+ * Simple quaternion-like object for server-side rotation storage
+ * (used by Entity.rotation on server, different from THREE.Quaternion)
+ */
+interface QuaternionObject {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+}
+
+/**
  * Entity interface for rotation operations
  */
 interface RotatableEntity {
   id: string;
   position?: Position3D;
   getPosition?: () => Position3D | undefined;
+  // Server-side rotation (plain object with x,y,z,w)
+  rotation?: QuaternionObject;
+  // Client-side base transform (THREE.Object3D with quaternion)
   base?: {
     quaternion?: QuaternionLike;
   };
@@ -103,6 +117,11 @@ export class CombatRotationManager {
 
   /**
    * Apply Y-axis rotation to entity using pooled quaternion
+   *
+   * Sets rotation on:
+   * - entity.rotation (server-side storage, used for network sync)
+   * - entity.base.quaternion (client-side THREE.js transform)
+   * - entity.node.quaternion (client-side visual node)
    */
   private applyRotation(
     entity: RotatableEntity,
@@ -113,6 +132,17 @@ export class CombatRotationManager {
     quaternionPool.setYRotation(tempQuat, angle);
 
     try {
+      // CRITICAL: Always set entity.rotation for server-side sync
+      // This is what EntityManager.syncNetworkDirtyEntities() reads to broadcast
+      // Without this, rotation changes on server are never sent to clients
+      if (entity.rotation) {
+        entity.rotation.x = tempQuat.x;
+        entity.rotation.y = tempQuat.y;
+        entity.rotation.z = tempQuat.z;
+        entity.rotation.w = tempQuat.w;
+      }
+
+      // For client-side rendering, also set THREE.js objects
       if (entityType === "player" && entity.base?.quaternion) {
         // For players, set on base and node
         entity.base.quaternion.set(
@@ -138,7 +168,7 @@ export class CombatRotationManager {
       quaternionPool.release(tempQuat);
     }
 
-    // Mark network dirty
+    // Mark network dirty so EntityManager broadcasts the rotation change
     entity.markNetworkDirty?.();
   }
 

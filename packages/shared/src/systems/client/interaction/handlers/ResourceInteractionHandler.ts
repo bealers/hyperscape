@@ -51,7 +51,6 @@ export class ResourceInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "chop",
         label: "Chop",
-        icon: "🪓",
         enabled: true,
         priority: 1,
         handler: () => this.gatherResource(target, "chop"),
@@ -60,7 +59,6 @@ export class ResourceInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "mine",
         label: "Mine",
-        icon: "⛏️",
         enabled: true,
         priority: 1,
         handler: () => this.gatherResource(target, "mine"),
@@ -69,7 +67,6 @@ export class ResourceInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "fish",
         label: "Fish",
-        icon: "🎣",
         enabled: true,
         priority: 1,
         handler: () => this.gatherResource(target, "fish"),

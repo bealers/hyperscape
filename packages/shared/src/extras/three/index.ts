@@ -12,3 +12,4 @@ export * from "./getTrianglesFromGeometry";
 export * from "./getTextureBytesFromMaterial";
 export * from "./three";
 export * from "./textureLoaderPatch";
+export * from "./ktx2TextureLoader";

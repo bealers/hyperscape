@@ -529,6 +529,7 @@ export class ReturnState implements AIState {
 export class AIStateMachine {
   private currentState: AIState;
   private states: Map<MobAIState, AIState>;
+  private hasInitialized: boolean = false;
 
   constructor() {
     // Create all state instances
@@ -547,6 +548,15 @@ export class AIStateMachine {
    * Update current state and handle transitions
    */
   update(context: AIStateContext, deltaTime: number): void {
+    // CRITICAL FIX: Call enter() on initial state on first update
+    // The constructor can't call enter() because it doesn't have the context yet.
+    // Without this, IdleState's idleStartTime stays at 0, causing instant transition
+    // to WANDER because (Date.now() - 0) > 0 is always true.
+    if (!this.hasInitialized) {
+      this.currentState.enter(context);
+      this.hasInitialized = true;
+    }
+
     const nextState = this.currentState.update(context, deltaTime);
 
     if (nextState !== null && nextState !== this.currentState.name) {
@@ -589,6 +599,8 @@ export class AIStateMachine {
    * Force state change (for external events like death)
    */
   forceState(newState: MobAIState, context: AIStateContext): void {
+    // Mark as initialized since transitionTo calls enter() on the new state
+    this.hasInitialized = true;
     this.transitionTo(newState, context);
   }
 }

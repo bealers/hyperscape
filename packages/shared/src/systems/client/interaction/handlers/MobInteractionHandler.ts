@@ -17,8 +17,10 @@
 import { BaseInteractionHandler } from "./BaseInteractionHandler";
 import type { RaycastTarget, ContextMenuAction } from "../types";
 import { INTERACTION_RANGE, TIMING, MESSAGE_TYPES } from "../constants";
+import { getCombatLevelColor } from "../utils/combatLevelColor";
 import { getNPCById } from "../../../../data/npcs";
 import { getPlayerWeaponRange } from "../../../../utils/game/CombatUtils";
+import { calculateCombatLevel } from "../../../../utils/game/CombatLevelCalculator";
 import type { Player } from "../../../../types/core/core";
 
 /**
@@ -46,24 +48,45 @@ export class MobInteractionHandler extends BaseInteractionHandler {
 
   /**
    * Right-click: Show attack and other options
+   *
+   * Mob levels are colored based on relative level difference:
+   * - Green: Mob is lower level than you
+   * - Yellow: Mob is same level as you
+   * - Red: Mob is higher level than you
+   *
+   * Returns empty array for dead mobs - this allows items dropped
+   * at the mob's position to be clickable instead.
    */
   getContextMenuActions(target: RaycastTarget): ContextMenuAction[] {
-    const actions: ContextMenuAction[] = [];
     const mobData = this.getMobData(target);
     const isAlive = (mobData?.health || 0) > 0;
 
-    // Attack action
+    // Dead mobs should not show context menu - let items underneath be clicked
+    // This fixes the bug where clicking on loot shows dead mob menu instead
+    if (!isAlive) {
+      return [];
+    }
+
+    const actions: ContextMenuAction[] = [];
+    const mobLevel = mobData?.level || 1;
+    const playerLevel = this.getLocalPlayerCombatLevel();
+    const levelColor = getCombatLevelColor(mobLevel, playerLevel);
+
+    // Attack action with colored level (format: "Level: X")
+    // Note: We already returned early if !isAlive, so enabled is always true
     actions.push({
       id: "attack",
-      label: `Attack ${target.name} (Lv${mobData?.level || 1})`,
-      icon: "⚔️",
-      enabled: isAlive,
+      label: `Attack ${target.name} (Level: ${mobLevel})`,
+      styledLabel: [
+        { text: "Attack " },
+        { text: target.name, color: "#ffff00" }, // Yellow for mob names (OSRS style)
+        { text: " (Level: " },
+        { text: `${mobLevel}`, color: levelColor },
+        { text: ")" },
+      ],
+      enabled: true,
       priority: 1,
-      handler: () => {
-        if (isAlive) {
-          this.attackMob(target);
-        }
-      },
+      handler: () => this.attackMob(target),
     });
 
     // Walk here
@@ -115,6 +138,59 @@ export class MobInteractionHandler extends BaseInteractionHandler {
   private getPlayerCombatRange(player: { id: string }): number {
     const playerData = player as unknown as Player;
     return getPlayerWeaponRange(playerData);
+  }
+
+  /**
+   * Get local player's combat level.
+   * Used for relative color calculation (green/yellow/red).
+   * Falls back to 3 (OSRS minimum) if unknown.
+   *
+   * Checks multiple property paths to handle different player entity types:
+   * - PlayerRemote: has `combatLevel` getter
+   * - PlayerLocal: stores in `combat.combatLevel` or can be calculated from skills
+   */
+  private getLocalPlayerCombatLevel(): number {
+    const player = this.getPlayer();
+    if (!player) return 3;
+
+    const entity = player as unknown as Record<string, unknown>;
+
+    // 1. Check direct getter (PlayerRemote)
+    if (typeof entity.combatLevel === "number") {
+      return entity.combatLevel;
+    }
+
+    // 2. Check data object (raw entity data from server sync)
+    const data = entity.data as { combatLevel?: number } | undefined;
+    if (typeof data?.combatLevel === "number" && data.combatLevel > 1) {
+      return data.combatLevel;
+    }
+
+    // 3. Calculate from skills (PlayerLocal has synced skills via SKILLS_UPDATED)
+    // This is the most reliable method for the local player
+    const skills = entity.skills as
+      | Record<string, { level: number }>
+      | undefined;
+    if (skills) {
+      return calculateCombatLevel({
+        attack: skills.attack?.level || 1,
+        strength: skills.strength?.level || 1,
+        defense: skills.defense?.level || 1,
+        hitpoints: skills.constitution?.level || 10,
+        ranged: skills.ranged?.level || 1,
+        magic: skills.magic?.level || 1,
+        prayer: skills.prayer?.level || 1,
+      });
+    }
+
+    // 4. Check nested combat object (PlayerLocal - fallback)
+    const combat = entity.combat as { combatLevel?: number } | undefined;
+    if (typeof combat?.combatLevel === "number" && combat.combatLevel > 1) {
+      return combat.combatLevel;
+    }
+
+    // Fallback: OSRS minimum combat level
+    return 3;
   }
 
   private getExamineText(

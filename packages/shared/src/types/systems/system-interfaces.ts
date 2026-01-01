@@ -108,6 +108,8 @@ export interface LoaderSystem extends System {
   load(type: string, url: string): Promise<unknown>;
   preload(type: string, url: string): void;
   execPreload(): Promise<void>;
+  /** Promise that resolves when preload is complete. Can be awaited to ensure all assets are loaded. */
+  preloader?: Promise<void> | null;
   insert?(type: string, url: string, data: File): void;
   get?(type: string, url: string): unknown;
 
@@ -125,12 +127,6 @@ export interface ActionsSystem extends System {
   getAvailable(): string[];
   register(action: unknown): void;
   unregister(name: string): void;
-}
-
-export interface XRSystem extends System {
-  session?: unknown;
-  supportsVR: boolean;
-  enter(): void;
 }
 
 // ============================================================================

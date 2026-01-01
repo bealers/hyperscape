@@ -44,10 +44,8 @@ import type {
   NPCDataInput,
   NPCCategory,
   TreasureLocation,
-  BankEntityData,
   StoreData,
   BiomeData,
-  ZoneData,
 } from "../types/core/core";
 import type { DataValidationResult } from "../types/core/validation-types";
 import type { MobSpawnPoint, NPCLocation, WorldArea } from "./world-areas";
@@ -105,11 +103,22 @@ export class DataManager {
   }
 
   /**
-   * Load manifests from CDN (both client and server)
+   * Load manifests from CDN (client) or filesystem (server)
    */
   private async loadManifestsFromCDN(): Promise<void> {
-    // Load directly from CDN (localhost:8080 in dev, R2/S3 in prod)
-    // Server uses process.env, client will use hardcoded default
+    // On server (Node.js), load from filesystem since HTTP server isn't up yet
+    // Check for Node.js-specific globals that don't exist in browsers
+    const isServer =
+      typeof process !== "undefined" &&
+      process.versions !== undefined &&
+      process.versions.node !== undefined;
+
+    if (isServer) {
+      await this.loadManifestsFromFilesystem();
+      return;
+    }
+
+    // Client: Load from CDN (localhost:8080 in dev, R2/S3 in prod)
     let cdnUrl = "http://localhost:8080";
     if (
       typeof process !== "undefined" &&
@@ -236,6 +245,161 @@ export class DataManager {
         );
         throw error;
       }
+    }
+  }
+
+  /**
+   * Load manifests from filesystem (server-side only)
+   * Uses packages/server/world/assets/manifests/ directory
+   */
+  private async loadManifestsFromFilesystem(): Promise<void> {
+    // Dynamic import for Node.js modules (not available in browser)
+    const fs = await import("fs/promises");
+    const path = await import("path");
+
+    // Find manifests directory - assets are in packages/server/world/assets/
+    let manifestsDir: string;
+    if (process.env.ASSETS_DIR) {
+      manifestsDir = path.join(process.env.ASSETS_DIR, "manifests");
+    } else {
+      // cwd is typically packages/server when running the server
+      const cwd = process.cwd();
+      if (
+        cwd.endsWith("/packages/server") ||
+        cwd.includes("/packages/server/")
+      ) {
+        // Running from packages/server - assets are in world/assets/
+        manifestsDir = path.join(
+          cwd.replace(/\/packages\/server.*$/, "/packages/server"),
+          "world",
+          "assets",
+          "manifests",
+        );
+      } else if (cwd.includes("/packages/")) {
+        // Running from another package - navigate to server assets
+        const workspaceRoot = path.resolve(cwd, "../..");
+        manifestsDir = path.join(
+          workspaceRoot,
+          "packages",
+          "server",
+          "world",
+          "assets",
+          "manifests",
+        );
+      } else {
+        // Already at workspace root
+        manifestsDir = path.join(
+          cwd,
+          "packages",
+          "server",
+          "world",
+          "assets",
+          "manifests",
+        );
+      }
+    }
+
+    console.log(
+      `[DataManager] Loading manifests from filesystem: ${manifestsDir}`,
+    );
+
+    try {
+      // Load items
+      const itemsPath = path.join(manifestsDir, "items.json");
+      const itemsData = await fs.readFile(itemsPath, "utf-8");
+      const list = JSON.parse(itemsData) as Array<Item>;
+      for (const it of list) {
+        const normalized = this.normalizeItem(it);
+        (ITEMS as Map<string, Item>).set(normalized.id, normalized);
+      }
+
+      // Generate noted variants
+      const itemsWithNotes = generateAllNotedItems(ITEMS);
+      (ITEMS as Map<string, Item>).clear();
+      for (const [id, item] of itemsWithNotes) {
+        (ITEMS as Map<string, Item>).set(id, item);
+      }
+
+      // Load NPCs
+      const npcsPath = path.join(manifestsDir, "npcs.json");
+      const npcsData = await fs.readFile(npcsPath, "utf-8");
+      const npcList = JSON.parse(npcsData) as Array<NPCDataInput>;
+      for (const npc of npcList) {
+        const normalized = this.normalizeNPC(npc);
+        (ALL_NPCS as Map<string, NPCData>).set(normalized.id, normalized);
+      }
+
+      // Load resources
+      const resourcesPath = path.join(manifestsDir, "resources.json");
+      const resourcesData = await fs.readFile(resourcesPath, "utf-8");
+      const resourceList = JSON.parse(
+        resourcesData,
+      ) as Array<ExternalResourceData>;
+
+      if (
+        !(
+          globalThis as {
+            EXTERNAL_RESOURCES?: Map<string, ExternalResourceData>;
+          }
+        ).EXTERNAL_RESOURCES
+      ) {
+        (
+          globalThis as {
+            EXTERNAL_RESOURCES?: Map<string, ExternalResourceData>;
+          }
+        ).EXTERNAL_RESOURCES = new Map();
+      }
+      for (const resource of resourceList) {
+        (
+          globalThis as unknown as {
+            EXTERNAL_RESOURCES: Map<string, ExternalResourceData>;
+          }
+        ).EXTERNAL_RESOURCES.set(resource.id, resource);
+      }
+
+      // Load world areas
+      const worldAreasPath = path.join(manifestsDir, "world-areas.json");
+      const worldAreasData = await fs.readFile(worldAreasPath, "utf-8");
+      const worldAreas = JSON.parse(worldAreasData) as {
+        starterTowns: Record<string, WorldArea>;
+        level1Areas: Record<string, WorldArea>;
+        level2Areas: Record<string, WorldArea>;
+        level3Areas: Record<string, WorldArea>;
+      };
+      Object.assign(
+        ALL_WORLD_AREAS,
+        worldAreas.starterTowns,
+        worldAreas.level1Areas,
+        worldAreas.level2Areas,
+        worldAreas.level3Areas,
+      );
+      Object.assign(STARTER_TOWNS, worldAreas.starterTowns);
+
+      // Load biomes
+      const biomesPath = path.join(manifestsDir, "biomes.json");
+      const biomesData = await fs.readFile(biomesPath, "utf-8");
+      const biomeList = JSON.parse(biomesData) as Array<BiomeData>;
+      for (const biome of biomeList) {
+        BIOMES[biome.id] = biome;
+      }
+
+      // Load stores
+      const storesPath = path.join(manifestsDir, "stores.json");
+      const storesData = await fs.readFile(storesPath, "utf-8");
+      const storeList = JSON.parse(storesData) as Array<StoreData>;
+      for (const store of storeList) {
+        (GENERAL_STORES as Record<string, StoreData>)[store.id] = store;
+      }
+
+      console.log(
+        `[DataManager] ✅ Loaded manifests from filesystem (${(ITEMS as Map<string, Item>).size} items, ${(ALL_NPCS as Map<string, NPCData>).size} NPCs, ${Object.keys(BIOMES).length} biomes)`,
+      );
+    } catch (error) {
+      console.error(
+        "[DataManager] ❌ Failed to load manifests from filesystem:",
+        error,
+      );
+      throw error;
     }
   }
 
@@ -383,8 +547,7 @@ export class DataManager {
     this.validationResult = await this.validateAllData();
     this.isInitialized = true;
 
-    if (this.validationResult.isValid) {
-    } else {
+    if (!this.validationResult.isValid) {
       throw new Error(
         `[DataManager] ❌ Data validation failed: ${this.validationResult.errors.join(", ")}`,
       );

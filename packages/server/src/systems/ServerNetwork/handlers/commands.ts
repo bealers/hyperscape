@@ -138,6 +138,55 @@ export async function handleCommand(
     });
   }
 
+  // Teleport command: /teleport x y z - sends proper playerTeleport packet
+  // Used by dev tools to teleport player with proper tile movement reset
+  console.log("[Commands] Received command:", cmd, "args:", args);
+  if (cmd === "teleport" && args.length >= 4) {
+    console.log("[Commands] Processing teleport command");
+    const x = parseFloat(args[1]);
+    const y = parseFloat(args[2]);
+    const z = parseFloat(args[3]);
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+      // Get terrain height at target position
+      const terrain = world.getSystem("terrain") as InstanceType<
+        typeof TerrainSystem
+      > | null;
+      if (!terrain) {
+        console.warn("[Commands] Terrain system not available for teleport");
+        return;
+      }
+      const th = terrain.getHeightAt(x, z);
+      if (!Number.isFinite(th)) {
+        console.warn(
+          `[Commands] Invalid terrain height for teleport at x=${x}, z=${z}`,
+        );
+        return;
+      }
+      const groundedY = th + 0.1;
+
+      // Update server-side entity position
+      player.position.set(x, groundedY, z);
+      if (Array.isArray(player.data.position)) {
+        player.data.position[0] = x;
+        player.data.position[1] = groundedY;
+        player.data.position[2] = z;
+      }
+
+      // Send playerTeleport packet to the client (resets tile movement properly)
+      socket.send("playerTeleport", {
+        playerId: player.id,
+        position: [x, groundedY, z],
+      });
+
+      // Broadcast position update to other clients
+      sendFn(
+        "entityModified",
+        { id: player.id, changes: { p: [x, groundedY, z] } },
+        socket.id,
+      );
+    }
+  }
+
   if (cmd === "chat") {
     const op = arg1;
     if (op === "clear" && socket.player && isBuilder(socket.player)) {

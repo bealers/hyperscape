@@ -26,6 +26,7 @@ export type {
   RaycastTarget,
   QueuedAction,
   ContextMenuAction,
+  LabelSegment,
   ClickType,
   InteractionInputEvent,
   QueueActionParams,
@@ -58,6 +59,9 @@ export { PlayerInteractionHandler } from "./handlers/PlayerInteractionHandler";
 
 // Controllers
 export { ContextMenuController } from "./ContextMenuController";
+
+// Utilities
+export { getCombatLevelColor, getCombatLevelDescription } from "./utils";
 
 // Main system
 export { InteractionRouter } from "./InteractionRouter";

@@ -1,20 +1,28 @@
 /**
  * PlayerInteractionHandler
  *
- * Handles interactions with other players.
+ * Handles interactions with other players (OSRS-accurate).
  *
- * Actions:
- * - Follow (context menu)
- * - Trade (context menu) - future feature
- * - Examine
+ * Menu order (matches OSRS):
+ * 1. Attack PlayerName (Level: XX) - ONLY APPEARS in PvP zones (not shown elsewhere)
+ * 2. Trade with PlayerName - disabled until trading implemented
+ * 3. Follow PlayerName
+ * 4. Report PlayerName
+ * 5. Walk here
+ * 6. Examine
  *
  * Note: Left-click on players does nothing by default (OSRS behavior).
  * All player interactions require right-click context menu.
+ *
+ * @see https://oldschool.runescape.wiki/w/Player_killing - Attack only in PvP areas
  */
 
 import { BaseInteractionHandler } from "./BaseInteractionHandler";
 import type { RaycastTarget, ContextMenuAction } from "../types";
 import { INTERACTION_RANGE, MESSAGE_TYPES } from "../constants";
+import { getCombatLevelColor } from "../utils/combatLevelColor";
+import { calculateCombatLevel } from "../../../../utils/game/CombatLevelCalculator";
+import type { ZoneDetectionSystem } from "../../../shared/death/ZoneDetectionSystem";
 
 export class PlayerInteractionHandler extends BaseInteractionHandler {
   /**
@@ -27,39 +35,86 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
   }
 
   /**
-   * Right-click: Show player interaction options
+   * Right-click: Show player interaction options (OSRS order)
+   *
+   * Combat levels are colored based on relative level difference:
+   * - Green: Target is lower level
+   * - Yellow: Target is same level
+   * - Red: Target is higher level
    */
   getContextMenuActions(target: RaycastTarget): ContextMenuAction[] {
     const actions: ContextMenuAction[] = [];
+    const targetLevel = this.getPlayerCombatLevel(target.entityId);
+    const localPlayerLevel = this.getLocalPlayerCombatLevel();
+    const levelColor = getCombatLevelColor(targetLevel, localPlayerLevel);
+    const inPvPZone = this.isInPvPZone();
 
-    // Follow player
+    // 1. Attack (OSRS-accurate: only APPEARS in PvP zones, not just greyed out)
+    if (inPvPZone) {
+      actions.push({
+        id: "attack",
+        label: `Attack ${target.name} (Level: ${targetLevel})`,
+        styledLabel: [
+          { text: "Attack " },
+          { text: target.name, color: "#ffffff" },
+          { text: " (Level: " },
+          { text: `${targetLevel}`, color: levelColor },
+          { text: ")" },
+        ],
+        enabled: true,
+        priority: 0,
+        handler: () => this.attackPlayer(target),
+      });
+    }
+
+    // 2. Trade with - Priority 1 (includes level for consistency)
+    actions.push({
+      id: "trade",
+      label: `Trade with ${target.name} (Level: ${targetLevel})`,
+      styledLabel: [
+        { text: "Trade with " },
+        { text: target.name, color: "#ffffff" },
+        { text: " (Level: " },
+        { text: `${targetLevel}`, color: levelColor },
+        { text: ")" },
+      ],
+      enabled: false, // Disabled until trading implemented
+      priority: 1,
+      handler: () => this.showExamineMessage("Trading is not yet available."),
+    });
+
+    // 3. Follow - Priority 2 (includes level for consistency)
     actions.push({
       id: "follow",
-      label: `Follow ${target.name}`,
-      icon: "👣",
+      label: `Follow ${target.name} (Level: ${targetLevel})`,
+      styledLabel: [
+        { text: "Follow " },
+        { text: target.name, color: "#ffffff" },
+        { text: " (Level: " },
+        { text: `${targetLevel}`, color: levelColor },
+        { text: ")" },
+      ],
       enabled: true,
-      priority: 1,
+      priority: 2,
       handler: () => this.followPlayer(target),
     });
 
-    // Trade (placeholder for future feature)
+    // 4. Report - Priority 3
     actions.push({
-      id: "trade",
-      label: `Trade with ${target.name}`,
-      icon: "🤝",
-      enabled: false, // Disabled until trading is implemented
-      priority: 2,
-      handler: () => {
-        this.showExamineMessage("Trading is not yet available.");
-      },
+      id: "report",
+      label: `Report ${target.name}`,
+      enabled: true,
+      priority: 3,
+      handler: () => this.showExamineMessage("Report system coming soon."),
     });
 
-    // Walk here
+    // 5. Walk here - Priority 99
     actions.push(this.createWalkHereAction(target));
 
-    // Examine
-    const examineText = `${target.name}, a fellow adventurer.`;
-    actions.push(this.createExamineAction(target, examineText));
+    // 6. Examine - Priority 100
+    actions.push(
+      this.createExamineAction(target, `${target.name}, a fellow adventurer.`),
+    );
 
     return actions.sort((a, b) => a.priority - b.priority);
   }
@@ -70,8 +125,148 @@ export class PlayerInteractionHandler extends BaseInteractionHandler {
 
   // === Private Methods ===
 
+  /**
+   * Check if the LOCAL player is currently in a PvP-enabled zone.
+   */
+  private isInPvPZone(): boolean {
+    const player = this.getPlayer();
+    if (!player) return false;
+
+    const position = player.position;
+    if (!position) return false;
+
+    // Use ZoneDetectionSystem
+    const zoneSystem =
+      this.world.getSystem<ZoneDetectionSystem>("zone-detection");
+    if (!zoneSystem) {
+      // Fallback: no zone system = safe (conservative)
+      return false;
+    }
+
+    return zoneSystem.isPvPEnabled({ x: position.x, z: position.z });
+  }
+
+  /**
+   * Send attack request to server.
+   */
+  private attackPlayer(target: RaycastTarget): void {
+    if (!this.isInPvPZone()) {
+      this.showExamineMessage("You can't attack players here.");
+      return;
+    }
+
+    this.send(MESSAGE_TYPES.ATTACK_PLAYER, {
+      targetPlayerId: target.entityId,
+    });
+
+    this.addChatMessage(`Attacking ${target.name}...`);
+  }
+
+  /**
+   * Get target player's combat level.
+   * Falls back to 3 (OSRS minimum) if unknown.
+   *
+   * Checks multiple property paths to handle different player entity types:
+   * - PlayerRemote: has `combatLevel` getter
+   * - PlayerLocal: stores in `combat.combatLevel` or can be calculated from skills
+   */
+  private getPlayerCombatLevel(playerId: string): number {
+    const playerEntity = this.world.entities?.players?.get(playerId);
+    if (!playerEntity) return 3;
+
+    const entity = playerEntity as unknown as Record<string, unknown>;
+
+    // 1. Check direct getter (PlayerRemote - most common for other players)
+    if (typeof entity.combatLevel === "number") {
+      return entity.combatLevel;
+    }
+
+    // 2. Check data object (raw entity data from server sync)
+    const data = entity.data as { combatLevel?: number } | undefined;
+    if (typeof data?.combatLevel === "number" && data.combatLevel > 1) {
+      return data.combatLevel;
+    }
+
+    // 3. Calculate from skills (if available)
+    const skills = entity.skills as
+      | Record<string, { level: number }>
+      | undefined;
+    if (skills) {
+      return calculateCombatLevel({
+        attack: skills.attack?.level || 1,
+        strength: skills.strength?.level || 1,
+        defense: skills.defense?.level || 1,
+        hitpoints: skills.constitution?.level || 10,
+        ranged: skills.ranged?.level || 1,
+        magic: skills.magic?.level || 1,
+        prayer: skills.prayer?.level || 1,
+      });
+    }
+
+    // 4. Check nested combat object (fallback)
+    const combat = entity.combat as { combatLevel?: number } | undefined;
+    if (typeof combat?.combatLevel === "number" && combat.combatLevel > 1) {
+      return combat.combatLevel;
+    }
+
+    // Fallback: OSRS minimum combat level
+    return 3;
+  }
+
+  /**
+   * Get local player's combat level.
+   * Used for relative color calculation (green/yellow/red).
+   * Falls back to 3 (OSRS minimum) if unknown.
+   *
+   * Checks multiple property paths to handle different player entity types:
+   * - PlayerRemote: has `combatLevel` getter
+   * - PlayerLocal: stores in `combat.combatLevel` or can be calculated from skills
+   */
+  private getLocalPlayerCombatLevel(): number {
+    const player = this.getPlayer();
+    if (!player) return 3;
+
+    const entity = player as unknown as Record<string, unknown>;
+
+    // 1. Check direct getter (PlayerRemote)
+    if (typeof entity.combatLevel === "number") {
+      return entity.combatLevel;
+    }
+
+    // 2. Check data object (raw entity data from server sync)
+    const data = entity.data as { combatLevel?: number } | undefined;
+    if (typeof data?.combatLevel === "number" && data.combatLevel > 1) {
+      return data.combatLevel;
+    }
+
+    // 3. Calculate from skills (PlayerLocal has synced skills via SKILLS_UPDATED)
+    // This is the most reliable method for the local player
+    const skills = entity.skills as
+      | Record<string, { level: number }>
+      | undefined;
+    if (skills) {
+      return calculateCombatLevel({
+        attack: skills.attack?.level || 1,
+        strength: skills.strength?.level || 1,
+        defense: skills.defense?.level || 1,
+        hitpoints: skills.constitution?.level || 10,
+        ranged: skills.ranged?.level || 1,
+        magic: skills.magic?.level || 1,
+        prayer: skills.prayer?.level || 1,
+      });
+    }
+
+    // 4. Check nested combat object (PlayerLocal - fallback)
+    const combat = entity.combat as { combatLevel?: number } | undefined;
+    if (typeof combat?.combatLevel === "number" && combat.combatLevel > 1) {
+      return combat.combatLevel;
+    }
+
+    // Fallback: OSRS minimum combat level
+    return 3;
+  }
+
   private followPlayer(target: RaycastTarget): void {
-    // Send follow request to server
     this.send(MESSAGE_TYPES.FOLLOW_PLAYER, {
       targetPlayerId: target.entityId,
     });

@@ -159,12 +159,15 @@ export class ItemEntity extends InteractableEntity {
       const geometry = new THREE.PlaneGeometry(0.3, 0.4);
 
       // Paper/parchment material - cream colored with slight transparency
-      const material = new THREE.MeshLambertMaterial({
+      // Use MeshStandardMaterial for proper lighting (responds to sun, moon, and environment maps)
+      const material = new THREE.MeshStandardMaterial({
         color: 0xf5ebd2, // Cream/parchment color
         transparent: true,
         opacity: 0.95,
         emissive: 0xf5ebd2,
         emissiveIntensity: 0.1,
+        roughness: 0.9,
+        metalness: 0.0,
         side: THREE.DoubleSide, // Visible from both sides
       });
 
@@ -193,12 +196,15 @@ export class ItemEntity extends InteractableEntity {
         color = 0x8b4513;
       else if (nameLower.includes("fish")) color = 0xb0e0e6;
 
-      const material = new THREE.MeshLambertMaterial({
+      // Use MeshStandardMaterial for proper lighting (responds to sun, moon, and environment maps)
+      const material = new THREE.MeshStandardMaterial({
         color: color,
         transparent: true,
         opacity: 0.6,
         emissive: color,
         emissiveIntensity: 0.05,
+        roughness: 0.7,
+        metalness: 0.2,
       });
 
       this.mesh = new THREE.Mesh(geometry, material);

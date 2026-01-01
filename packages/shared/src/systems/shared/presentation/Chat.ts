@@ -1,6 +1,6 @@
 import type { ChatMessage, World } from "../../../types/index";
 import { uuid } from "../../../utils";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import { EventType } from "../../../types/events";
 import type { AnyEvent } from "../../../types/events";
 import type { EventMap } from "../../../types/events";
@@ -74,8 +74,12 @@ export class Chat extends SystemBase {
   }
 
   command(text: string): void {
+    console.log("[Chat] command() called with:", text);
     const network = this.world.network;
-    if (!network || network.isServer) return;
+    if (!network || network.isServer) {
+      console.log("[Chat] command() early return - no network or is server");
+      return;
+    }
 
     const playerId = network.id;
     const args = text
@@ -83,6 +87,8 @@ export class Chat extends SystemBase {
       .split(" ")
       .map((str) => str.trim())
       .filter((str) => !!str);
+
+    console.log("[Chat] parsed args:", args);
 
     const isAdminCommand = args[0] === "admin";
 
@@ -98,7 +104,10 @@ export class Chat extends SystemBase {
     }
 
     if (network.send) {
+      console.log("[Chat] Sending command to server:", args);
       network.send("command", args);
+    } else {
+      console.log("[Chat] network.send not available!");
     }
   }
 

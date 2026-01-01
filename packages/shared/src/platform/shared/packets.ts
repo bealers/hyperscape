@@ -117,6 +117,8 @@ const names = [
   'gatheringComplete',
   // Combat packets
   'attackMob',
+  'attackPlayer',  // PvP attack
+  'followPlayer',  // Follow another player (OSRS-style)
   'changeAttackStyle',
   'setAutoRetaliate',
   'autoRetaliateChanged',

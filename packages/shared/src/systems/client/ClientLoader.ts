@@ -2,7 +2,8 @@ import { VRMLoaderPlugin } from "@pixiv/three-vrm";
 import Hls from "hls.js/dist/hls.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { GLTFParser } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
+import { HDRLoader } from "three/examples/jsm/loaders/HDRLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { createEmoteFactory } from "../../extras/three/createEmoteFactory";
 import { createNode } from "../../extras/three/createNode";
 import { createVRMFactory } from "../../extras/three/createVRMFactory";
@@ -23,9 +24,134 @@ import type {
 } from "../../types";
 import type { AvatarFactory } from "../../types/rendering/nodes";
 import { EventType } from "../../types/events";
-import { SystemBase } from "../shared";
+import { SystemBase } from "../shared/infrastructure/SystemBase";
 
-// THREE.Cache.enabled = true
+// Enable three.js built-in cache for textures and files
+// This prevents duplicate network requests for the same asset
+THREE.Cache.enabled = true;
+
+/**
+ * Asset Caching Architecture:
+ *
+ * Level 1: Browser HTTP Cache (persistent across sessions)
+ *   - Controlled by Cache-Control headers from CDN
+ *   - max-age=31536000, immutable for assets
+ *   - Automatically used by fetch() with cache: 'default'
+ *
+ * Level 2: THREE.Cache (in-memory, session only)
+ *   - Caches ArrayBuffers for GLTFLoader, TextureLoader, etc.
+ *   - Prevents duplicate network requests within session
+ *
+ * Level 3: ClientLoader.files Map (in-memory, session only)
+ *   - Caches File objects created from fetched blobs
+ *   - Deduplicates with filePromises for parallel requests
+ *
+ * Level 4: ModelCache (in-memory, session only)
+ *   - Caches parsed THREE.Object3D scenes
+ *   - Shares materials across clones
+ *
+ * Level 5: IndexedDB (persistent across sessions)
+ *   - Stores File blobs for instant access on reload
+ *   - Only used for large assets (>10KB)
+ */
+
+/** IndexedDB database name for asset cache */
+const ASSET_DB_NAME = "hyperscape-assets";
+const ASSET_STORE_NAME = "files";
+const ASSET_DB_VERSION = 1;
+
+/** Promise for IndexedDB initialization */
+let dbPromise: Promise<IDBDatabase | null> | null = null;
+
+/**
+ * Initialize IndexedDB for persistent asset caching
+ */
+function initAssetDB(): Promise<IDBDatabase | null> {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve) => {
+    // IndexedDB not available in some environments
+    if (typeof indexedDB === "undefined") {
+      resolve(null);
+      return;
+    }
+
+    try {
+      const request = indexedDB.open(ASSET_DB_NAME, ASSET_DB_VERSION);
+
+      request.onerror = () => {
+        console.warn(
+          "[ClientLoader] IndexedDB not available, using memory cache only",
+        );
+        resolve(null);
+      };
+
+      request.onsuccess = () => {
+        resolve(request.result);
+      };
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(ASSET_STORE_NAME)) {
+          db.createObjectStore(ASSET_STORE_NAME);
+        }
+      };
+    } catch {
+      resolve(null);
+    }
+  });
+
+  return dbPromise;
+}
+
+/**
+ * Get a cached file from IndexedDB
+ */
+async function getFromIndexedDB(url: string): Promise<File | null> {
+  const db = await initAssetDB();
+  if (!db) return null;
+
+  return new Promise((resolve) => {
+    try {
+      const transaction = db.transaction(ASSET_STORE_NAME, "readonly");
+      const store = transaction.objectStore(ASSET_STORE_NAME);
+      const request = store.get(url);
+
+      request.onerror = () => resolve(null);
+      request.onsuccess = () => {
+        const result = request.result as
+          | { blob: Blob; name: string; type: string }
+          | undefined;
+        if (result) {
+          resolve(new File([result.blob], result.name, { type: result.type }));
+        } else {
+          resolve(null);
+        }
+      };
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Save a file to IndexedDB for persistent caching
+ */
+async function saveToIndexedDB(url: string, file: File): Promise<void> {
+  // Only cache files > 10KB (skip tiny files)
+  if (file.size < 10 * 1024) return;
+
+  const db = await initAssetDB();
+  if (!db) return;
+
+  try {
+    const transaction = db.transaction(ASSET_STORE_NAME, "readwrite");
+    const store = transaction.objectStore(ASSET_STORE_NAME);
+    store.put({ blob: file, name: file.name, type: file.type }, url);
+  } catch {
+    // Ignore IndexedDB errors - not critical
+  }
+}
 
 function nodeToINode(node: Node): INode {
   // Ensure transforms are current, then return the actual Node instance
@@ -44,7 +170,7 @@ function nodeToINode(node: Node): INode {
  * - Blob/File APIs for binary data
  * - URL.createObjectURL() for temporary blob URLs
  * - HTMLVideoElement + MediaSource for HLS streaming
- * - Three.js loaders (GLTF, RGBE, Texture) with browser context
+ * - Three.js loaders (GLTF, HDR, Texture) with browser context
  *
  * Why browser-specific:
  * This loader uses browser-only APIs that don't exist in Node.js:
@@ -61,16 +187,34 @@ function nodeToINode(node: Node): INode {
  * - **Avatars**: .vrm (VRM humanoid avatars with VRMLoaderPlugin)
  * - **Emotes**: .glb animations (retargetable to VRM skeletons)
  * - **Textures**: .jpg, .png, .webp (via TextureLoader)
- * - **HDR**: .hdr (RGBE environment maps via RGBELoader)
+ * - **HDR**: .hdr (RGBE environment maps via HDRLoader)
  * - **Images**: Raw image elements
  * - **Video**: .mp4, .webm, .m3u8 (HLS with hls.js polyfill)
  * - **Audio**: .mp3, .ogg, .wav (decoded via Web Audio API)
  */
+/** Loading statistics for performance monitoring */
+export interface LoadingStats {
+  /** Number of files downloaded from network */
+  filesLoaded: number;
+  /** Number of duplicate requests avoided via deduplication */
+  requestsDeduped: number;
+  /** Number of in-memory cache hits */
+  cacheHits: number;
+  /** Number of IndexedDB persistent cache hits */
+  indexedDBHits: number;
+  /** Total network requests made */
+  networkRequests: number;
+  /** Time spent loading (ms) */
+  totalLoadTime: number;
+}
+
 export class ClientLoader extends SystemBase {
   files: Map<string, File>;
+  /** In-flight file fetch promises - prevents duplicate network requests */
+  filePromises: Map<string, Promise<File | undefined>>;
   promises: Map<string, Promise<LoaderResult>>;
   results: Map<string, LoaderResult>;
-  hdrLoader: RGBELoader;
+  hdrLoader: HDRLoader;
   texLoader: THREE.TextureLoader;
   gltfLoader: GLTFLoader;
   preloadItems: Array<{ type: string; url: string }> = [];
@@ -82,6 +226,26 @@ export class ClientLoader extends SystemBase {
     loader?: ClientLoader;
   };
   preloader?: Promise<void> | null;
+
+  /** Performance statistics for debugging */
+  private stats: LoadingStats = {
+    filesLoaded: 0,
+    requestsDeduped: 0,
+    cacheHits: 0,
+    indexedDBHits: 0,
+    networkRequests: 0,
+    totalLoadTime: 0,
+  };
+  private loadStartTime = 0;
+
+  /**
+   * Concurrent fetch semaphore to prevent network saturation.
+   * Browsers limit to ~6 connections per domain; too many parallel fetches
+   * cause HTTP/2 head-of-line blocking and slow overall throughput.
+   */
+  private readonly maxConcurrentFetches = 8;
+  private activeFetches = 0;
+  private fetchQueue: Array<() => void> = [];
   constructor(world: World) {
     super(world, {
       name: "client-loader",
@@ -89,15 +253,18 @@ export class ClientLoader extends SystemBase {
       autoCleanup: true,
     });
     this.files = new Map();
+    this.filePromises = new Map();
     this.promises = new Map();
     this.results = new Map();
-    this.hdrLoader = new RGBELoader();
+    this.hdrLoader = new HDRLoader();
     this.texLoader = new THREE.TextureLoader();
     this.gltfLoader = new GLTFLoader();
     // Register VRM loader plugin with proper parser typing
     this.gltfLoader.register(
       (parser: GLTFParser) => new VRMLoaderPlugin(parser),
     );
+    // Enable meshopt decoder for compressed GLB files (EXT_meshopt_compression)
+    this.gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 
     // Apply texture loader patch to handle blob URL errors
     patchTextureLoader();
@@ -140,10 +307,19 @@ export class ClientLoader extends SystemBase {
       return;
     }
 
+    // Track preload timing
+    this.loadStartTime = performance.now();
+
     let loadedItems = 0;
     const totalItems = this.preloadItems.length;
     let progress = 0;
 
+    // Log what we're preloading
+    this.logger.info(
+      `[ClientLoader] Starting preload of ${totalItems} assets (parallel loading enabled)`,
+    );
+
+    // All items are loaded in parallel via Promise.allSettled
     const promises = this.preloadItems.map((item) => {
       return this.load(item.type, item.url)
         .then(() => {
@@ -171,10 +347,19 @@ export class ClientLoader extends SystemBase {
     });
 
     this.preloader = Promise.allSettled(promises).then((results) => {
+      const loadDuration = performance.now() - this.loadStartTime;
       const failed = results.filter((r) => r.status === "rejected");
+
       if (failed.length > 0) {
         this.logger.error(`Some assets failed to load: ${failed.length}`);
       }
+
+      // Log performance summary
+      this.logger.info(
+        `[ClientLoader] Preload complete in ${loadDuration.toFixed(0)}ms`,
+      );
+      this.logStats();
+
       this.preloader = null;
       // Ensure a final 100% progress event is emitted (defensive in case of rounding)
       this.emitTypedEvent(EventType.ASSETS_LOADING_PROGRESS, {
@@ -217,26 +402,160 @@ export class ClientLoader extends SystemBase {
 
   loadFile = async (url: string): Promise<File | undefined> => {
     url = this.world.resolveURL(url);
+
+    // Level 3: Check in-memory cache first (fastest)
     if (this.files.has(url)) {
+      this.stats.cacheHits++;
       return this.files.get(url);
     }
 
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      throw new Error(`HTTP error! status: ${resp.status}`);
+    // Check if already loading (deduplication for parallel requests)
+    // This prevents multiple fetches for the same URL when called concurrently
+    const existingPromise = this.filePromises.get(url);
+    if (existingPromise) {
+      this.stats.requestsDeduped++;
+      return existingPromise;
     }
-    const blob = await resp.blob();
-    const file = new File([blob], url.split("/").pop() as string, {
-      type: blob.type,
-    });
-    this.files.set(url, file);
-    return file;
+
+    // Create and track the fetch promise
+    const fetchPromise = (async (): Promise<File | undefined> => {
+      try {
+        // Level 5: Check IndexedDB persistent cache (survives page reloads)
+        const cachedFile = await getFromIndexedDB(url);
+        if (cachedFile) {
+          this.files.set(url, cachedFile);
+          this.stats.indexedDBHits++;
+          return cachedFile;
+        }
+
+        // Level 1: Fetch from network (with concurrency limiting)
+        // Wait for a slot in the semaphore to prevent network saturation
+        await this.acquireFetchSlot();
+
+        try {
+          this.stats.networkRequests++;
+          const fetchStart = performance.now();
+
+          // Use 'default' cache mode to leverage browser HTTP cache
+          // This will use cached response if available and not stale
+          const resp = await fetch(url, {
+            cache: "default",
+            mode: "cors",
+          });
+
+          if (!resp.ok) {
+            throw new Error(`HTTP error! status: ${resp.status}`);
+          }
+
+          const blob = await resp.blob();
+          const file = new File([blob], url.split("/").pop() as string, {
+            type: blob.type,
+          });
+
+          // Store in memory cache
+          this.files.set(url, file);
+          this.stats.filesLoaded++;
+
+          // Save to IndexedDB for persistence (async, non-blocking)
+          saveToIndexedDB(url, file);
+
+          // Track load time
+          const loadTime = performance.now() - fetchStart;
+          this.stats.totalLoadTime += loadTime;
+
+          return file;
+        } finally {
+          this.releaseFetchSlot();
+        }
+      } finally {
+        // Clean up the in-flight tracker after completion
+        this.filePromises.delete(url);
+      }
+    })();
+
+    this.filePromises.set(url, fetchPromise);
+    return fetchPromise;
   };
 
-  async load(type: string, url: string): Promise<LoaderResult> {
-    if (this.preloader) {
-      await this.preloader;
+  /**
+   * Get loading statistics for performance monitoring
+   */
+  getStats(): LoadingStats & {
+    modelCacheStats: ReturnType<
+      typeof import("../../utils/rendering/ModelCache").modelCache.getStats
+    >;
+  } {
+    // Import dynamically to avoid circular dependency
+    const { modelCache } = require("../../utils/rendering/ModelCache") as {
+      modelCache: {
+        getStats: () => {
+          total: number;
+          paths: string[];
+          totalClones: number;
+          materialsSaved: number;
+        };
+      };
+    };
+    return {
+      ...this.stats,
+      modelCacheStats: modelCache.getStats(),
+    };
+  }
+
+  /**
+   * Log loading statistics to console
+   */
+  logStats(): void {
+    const stats = this.getStats();
+    console.log("[ClientLoader] Loading Statistics:");
+    console.log(`  Network downloads: ${stats.filesLoaded}`);
+    console.log(`  Memory cache hits: ${stats.cacheHits}`);
+    console.log(`  IndexedDB cache hits: ${stats.indexedDBHits}`);
+    console.log(`  Requests deduped: ${stats.requestsDeduped}`);
+    console.log(`  Total load time: ${stats.totalLoadTime.toFixed(0)}ms`);
+    console.log(
+      `  Model cache: ${stats.modelCacheStats.total} models, ${stats.modelCacheStats.totalClones} clones`,
+    );
+    console.log(
+      `  Materials saved by sharing: ${stats.modelCacheStats.materialsSaved}`,
+    );
+  }
+
+  /**
+   * Acquire a slot in the fetch semaphore.
+   * Limits concurrent network requests to prevent saturation.
+   */
+  private acquireFetchSlot(): Promise<void> {
+    if (this.activeFetches < this.maxConcurrentFetches) {
+      this.activeFetches++;
+      return Promise.resolve();
     }
+
+    // Queue the request and wait for a slot
+    return new Promise<void>((resolve) => {
+      this.fetchQueue.push(resolve);
+    });
+  }
+
+  /**
+   * Release a slot in the fetch semaphore.
+   * Allows queued requests to proceed.
+   */
+  private releaseFetchSlot(): void {
+    if (this.fetchQueue.length > 0) {
+      // Give the slot to the next queued request
+      const next = this.fetchQueue.shift()!;
+      next();
+    } else {
+      this.activeFetches--;
+    }
+  }
+
+  async load(type: string, url: string): Promise<LoaderResult> {
+    // NOTE: Removed blocking `await this.preloader` that used to wait for ALL preloads
+    // to complete before any new load could start. This was a significant bottleneck.
+    // Individual load calls now proceed independently, relying on promise deduplication.
+
     const key = `${type}/${url}`;
     if (this.promises.has(key)) {
       return this.promises.get(key)!;
@@ -663,9 +982,52 @@ export class ClientLoader extends SystemBase {
 
   destroy() {
     this.files.clear();
+    this.filePromises.clear();
     this.promises.clear();
     this.results.clear();
     this.preloadItems = [];
+    // Reset fetch semaphore
+    this.activeFetches = 0;
+    this.fetchQueue = [];
+    // Reset stats
+    this.stats = {
+      filesLoaded: 0,
+      requestsDeduped: 0,
+      cacheHits: 0,
+      indexedDBHits: 0,
+      networkRequests: 0,
+      totalLoadTime: 0,
+    };
+  }
+
+  /**
+   * Clear all caches including IndexedDB persistent cache
+   * Useful for forcing fresh downloads
+   */
+  async clearAllCaches(): Promise<void> {
+    // Clear in-memory caches
+    this.files.clear();
+    this.filePromises.clear();
+    this.promises.clear();
+    this.results.clear();
+
+    // Clear IndexedDB cache
+    const db = await initAssetDB();
+    if (db) {
+      try {
+        const transaction = db.transaction(ASSET_STORE_NAME, "readwrite");
+        const store = transaction.objectStore(ASSET_STORE_NAME);
+        store.clear();
+        console.log("[ClientLoader] IndexedDB cache cleared");
+      } catch {
+        // Ignore errors
+      }
+    }
+
+    // Clear THREE.Cache
+    THREE.Cache.clear();
+
+    console.log("[ClientLoader] All caches cleared");
   }
 }
 

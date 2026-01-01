@@ -51,7 +51,21 @@ export class CombatStateService {
   private world: World;
   private combatStates = new Map<EntityID, CombatData>();
 
-  // Reusable buffer to avoid allocation during iteration
+  /**
+   * Pre-allocated buffer for getAllCombatStates()
+   *
+   * ALLOCATION-FREE DESIGN:
+   * - Buffer array grows to accommodate peak concurrent combatants
+   * - Tuple objects [EntityID, CombatData] are pre-allocated and reused
+   * - forEach() avoids Map.entries() tuple allocation overhead
+   * - In steady state: ZERO allocations per tick
+   *
+   * Memory behavior:
+   * - Initial: Empty array
+   * - Growth: Allocates new tuples only when more combatants than ever before
+   * - Shrink: Array length shrinks but V8 preserves internal capacity
+   * - Steady state: All allocations amortized, zero per-tick GC pressure
+   */
   private combatStateBuffer: Array<[EntityID, CombatData]> = [];
 
   constructor(world: World) {
@@ -79,14 +93,41 @@ export class CombatStateService {
   }
 
   /**
-   * Get all combat states (for iteration)
-   * Returns reusable buffer to avoid allocations
+   * Get all combat states for iteration (ALLOCATION-FREE in steady state)
+   *
+   * Returns a reusable buffer of pre-allocated tuples. The buffer and its
+   * tuple objects are reused across calls to eliminate per-tick GC pressure.
+   *
+   * IMPORTANT: The returned array is mutated on each call. Do not store
+   * references to it or its contents across tick boundaries.
+   *
+   * @returns Reusable buffer - valid only until next call
    */
   getAllCombatStates(): Array<[EntityID, CombatData]> {
-    this.combatStateBuffer.length = 0;
-    for (const entry of this.combatStates.entries()) {
-      this.combatStateBuffer.push(entry);
+    const size = this.combatStates.size;
+
+    // Grow buffer capacity if needed (allocations amortized over time)
+    // Pre-allocate tuple objects so we can reuse them
+    while (this.combatStateBuffer.length < size) {
+      // These tuples are allocated once and reused forever
+      this.combatStateBuffer.push([
+        "" as EntityID,
+        null as unknown as CombatData,
+      ]);
     }
+
+    // Populate existing tuples in-place using forEach (avoids entries() tuple allocation)
+    let i = 0;
+    this.combatStates.forEach((value, key) => {
+      const tuple = this.combatStateBuffer[i];
+      tuple[0] = key;
+      tuple[1] = value;
+      i++;
+    });
+
+    // Truncate to active count (V8 preserves internal capacity)
+    this.combatStateBuffer.length = i;
+
     return this.combatStateBuffer;
   }
 
@@ -291,7 +332,14 @@ export class CombatStateService {
       entityIdStr,
     ) as CombatPlayerEntity | null;
 
-    if (!playerEntity) return;
+    if (!playerEntity) {
+      // Log warning - client won't receive c:false and health bar may persist
+      // Client-side fallback timer will handle this case
+      console.warn(
+        `[CombatStateService] clearCombatStateFromEntity: player ${entityIdStr} not found, c:false will not be sent`,
+      );
+      return;
+    }
 
     // Clear combat property if it exists (legacy support)
     if (playerEntity.combat) {

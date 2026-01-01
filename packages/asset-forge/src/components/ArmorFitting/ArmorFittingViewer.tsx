@@ -10,7 +10,7 @@ import React, {
 } from "react";
 import * as THREE from "three";
 // import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter'
-import { GLTF, GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
+import { GLTF, GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 // @ts-ignore - Three.js examples modules don't have proper type declarations
 import {
@@ -23,7 +23,6 @@ import { MeshFittingService } from "../../services/fitting/MeshFittingService";
 import { notify } from "../../utils/notify";
 
 import { useArmorExport } from "@/hooks";
-import { apiFetch } from "@/utils/api";
 
 // Type declarations
 interface AnimatedGLTF extends GLTF {
@@ -159,7 +158,7 @@ const ModelDemo: React.FC<ModelDemoProps> = ({
       (_progress: ProgressEvent) => {
         // Progress callback
       },
-      (error: unknown) => {
+      () => {
         // File doesn't exist or failed to load - this is expected for many assets
         console.log(
           `Animation file not available: ${animationPath} - will use built-in animations if available`,

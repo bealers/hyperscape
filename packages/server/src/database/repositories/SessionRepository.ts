@@ -141,4 +141,47 @@ export class SessionRepository extends BaseRepository {
       })
       .where(eq(schema.playerSessions.id, sessionId));
   }
+
+  /**
+   * Clean up old sessions
+   *
+   * Deletes sessions older than the specified number of days.
+   * Used for maintenance to keep the database clean.
+   *
+   * @param daysOld - Delete sessions older than this many days
+   * @returns Number of sessions deleted
+   */
+  async cleanupOldSessionsAsync(daysOld: number): Promise<number> {
+    this.ensureDatabase();
+
+    const cutoffTime = Date.now() - daysOld * 24 * 60 * 60 * 1000;
+
+    // Delete sessions where sessionEnd is set and older than cutoff
+    const result = await this.db
+      .delete(schema.playerSessions)
+      .where(
+        sql`${schema.playerSessions.sessionEnd} IS NOT NULL AND ${schema.playerSessions.sessionEnd} < ${cutoffTime}`,
+      );
+
+    // PostgreSQL returns rowCount for delete operations
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Get count of active sessions
+   *
+   * Returns the number of sessions that are currently active (no end time).
+   *
+   * @returns Number of active sessions
+   */
+  async getActiveSessionCountAsync(): Promise<number> {
+    this.ensureDatabase();
+
+    const result = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.playerSessions)
+      .where(sql`${schema.playerSessions.sessionEnd} IS NULL`);
+
+    return result[0]?.count ?? 0;
+  }
 }

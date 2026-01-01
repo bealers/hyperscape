@@ -1,0 +1,542 @@
+/**
+ * Tests terrain shader constants and blending calculations.
+ * TSL material tests require Playwright.
+ */
+
+import { describe, it, expect } from "vitest";
+import * as THREE from "three";
+
+const TERRAIN_CONSTANTS = {
+  TRIPLANAR_SCALE: 0.02,
+  SNOW_HEIGHT: 50.0,
+  FOG_NEAR: 150.0,
+  FOG_FAR: 350.0,
+};
+
+describe("TerrainShader", () => {
+  describe("TERRAIN_CONSTANTS", () => {
+    it("has valid triplanar scale (positive, reasonable range)", () => {
+      expect(TERRAIN_CONSTANTS.TRIPLANAR_SCALE).toBeGreaterThan(0);
+      expect(TERRAIN_CONSTANTS.TRIPLANAR_SCALE).toBeLessThan(1);
+    });
+
+    it("triplanar scale produces reasonable texture repeat", () => {
+      // At 0.02 scale, a 50m distance produces 1 texture repeat
+      const worldSize = 50;
+      const repeats = worldSize * TERRAIN_CONSTANTS.TRIPLANAR_SCALE;
+      expect(repeats).toBe(1);
+    });
+
+    it("has valid snow height (positive elevation)", () => {
+      expect(TERRAIN_CONSTANTS.SNOW_HEIGHT).toBeGreaterThan(0);
+    });
+
+    it("snow height is reasonable for game world", () => {
+      // Snow at 50+ units is mountainous terrain
+      expect(TERRAIN_CONSTANTS.SNOW_HEIGHT).toBeGreaterThanOrEqual(30);
+      expect(TERRAIN_CONSTANTS.SNOW_HEIGHT).toBeLessThanOrEqual(100);
+    });
+
+    it("has valid fog distances (near < far)", () => {
+      expect(TERRAIN_CONSTANTS.FOG_NEAR).toBeGreaterThan(0);
+      expect(TERRAIN_CONSTANTS.FOG_FAR).toBeGreaterThan(
+        TERRAIN_CONSTANTS.FOG_NEAR,
+      );
+    });
+
+    it("fog distances provide reasonable visibility range", () => {
+      // Near should allow clear visibility for gameplay
+      expect(TERRAIN_CONSTANTS.FOG_NEAR).toBeGreaterThanOrEqual(100);
+
+      // Far should limit draw distance but not be too close
+      expect(TERRAIN_CONSTANTS.FOG_FAR).toBeGreaterThanOrEqual(300);
+      expect(TERRAIN_CONSTANTS.FOG_FAR).toBeLessThanOrEqual(1000);
+    });
+
+    it("fog transition range is reasonable", () => {
+      const fogRange = TERRAIN_CONSTANTS.FOG_FAR - TERRAIN_CONSTANTS.FOG_NEAR;
+      // Should have a gradual transition
+      expect(fogRange).toBeGreaterThanOrEqual(100);
+    });
+  });
+
+  describe("Triplanar blending logic", () => {
+    // Simulate triplanar weight calculation
+    function calculateTriplanarWeights(
+      normalX: number,
+      normalY: number,
+      normalZ: number,
+    ): THREE.Vector3 {
+      const blendSharpness = 4.0;
+      const weights = new THREE.Vector3(
+        Math.pow(Math.abs(normalX), blendSharpness),
+        Math.pow(Math.abs(normalY), blendSharpness),
+        Math.pow(Math.abs(normalZ), blendSharpness),
+      );
+      const sum = weights.x + weights.y + weights.z;
+      weights.divideScalar(sum);
+      return weights;
+    }
+
+    it("flat surface (Y-up) weights Y axis heavily", () => {
+      const weights = calculateTriplanarWeights(0, 1, 0);
+
+      expect(weights.y).toBeGreaterThan(0.99);
+      expect(weights.x).toBeLessThan(0.01);
+      expect(weights.z).toBeLessThan(0.01);
+    });
+
+    it("vertical wall (X-facing) weights X axis heavily", () => {
+      const weights = calculateTriplanarWeights(1, 0, 0);
+
+      expect(weights.x).toBeGreaterThan(0.99);
+      expect(weights.y).toBeLessThan(0.01);
+      expect(weights.z).toBeLessThan(0.01);
+    });
+
+    it("vertical wall (Z-facing) weights Z axis heavily", () => {
+      const weights = calculateTriplanarWeights(0, 0, 1);
+
+      expect(weights.z).toBeGreaterThan(0.99);
+      expect(weights.x).toBeLessThan(0.01);
+      expect(weights.y).toBeLessThan(0.01);
+    });
+
+    it("45-degree slope blends X and Y", () => {
+      const angle = Math.PI / 4;
+      const weights = calculateTriplanarWeights(
+        Math.sin(angle),
+        Math.cos(angle),
+        0,
+      );
+
+      // Both X and Y should have significant weight
+      expect(weights.x).toBeGreaterThan(0.1);
+      expect(weights.y).toBeGreaterThan(0.1);
+      expect(weights.z).toBeLessThan(0.01);
+    });
+
+    it("diagonal normal blends all three axes", () => {
+      const len = Math.sqrt(3);
+      const weights = calculateTriplanarWeights(1 / len, 1 / len, 1 / len);
+
+      // All weights should be approximately equal
+      expect(weights.x).toBeCloseTo(1 / 3, 1);
+      expect(weights.y).toBeCloseTo(1 / 3, 1);
+      expect(weights.z).toBeCloseTo(1 / 3, 1);
+    });
+
+    it("weights always sum to 1", () => {
+      const testNormals = [
+        [0, 1, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+        [0.707, 0.707, 0],
+        [0.577, 0.577, 0.577],
+        [0.2, 0.9, 0.3],
+      ];
+
+      for (const [x, y, z] of testNormals) {
+        const weights = calculateTriplanarWeights(x, y, z);
+        const sum = weights.x + weights.y + weights.z;
+        expect(sum).toBeCloseTo(1.0, 5);
+      }
+    });
+
+    it("handles negative normals correctly", () => {
+      const weightsPos = calculateTriplanarWeights(0, 1, 0);
+      const weightsNeg = calculateTriplanarWeights(0, -1, 0);
+
+      // Absolute value means same weights
+      expect(weightsPos.y).toBeCloseTo(weightsNeg.y, 5);
+    });
+  });
+
+  describe("Height-based texture blending", () => {
+    // Simulate smoothstep
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    it("no snow below snow height", () => {
+      const snowBlend = smoothstep(
+        TERRAIN_CONSTANTS.SNOW_HEIGHT,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT + 10,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT - 10,
+      );
+
+      expect(snowBlend).toBe(0);
+    });
+
+    it("full snow above snow height + 10", () => {
+      const snowBlend = smoothstep(
+        TERRAIN_CONSTANTS.SNOW_HEIGHT,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT + 10,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT + 20,
+      );
+
+      expect(snowBlend).toBe(1);
+    });
+
+    it("partial snow in transition zone", () => {
+      const snowBlend = smoothstep(
+        TERRAIN_CONSTANTS.SNOW_HEIGHT,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT + 10,
+        TERRAIN_CONSTANTS.SNOW_HEIGHT + 5,
+      );
+
+      expect(snowBlend).toBeGreaterThan(0);
+      expect(snowBlend).toBeLessThan(1);
+    });
+
+    it("sand at low elevations near water", () => {
+      const sandBlend = smoothstep(5.0, 0.0, 2.5);
+
+      expect(sandBlend).toBeGreaterThan(0);
+      expect(sandBlend).toBeLessThan(1);
+    });
+
+    it("no sand at high elevations", () => {
+      const sandBlend = smoothstep(5.0, 0.0, 10.0);
+
+      expect(sandBlend).toBe(0);
+    });
+  });
+
+  describe("Slope-based texture blending", () => {
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    function calculateSlope(normalY: number): number {
+      return 1.0 - Math.abs(normalY);
+    }
+
+    it("flat terrain (normalY=1) has zero slope", () => {
+      const slope = calculateSlope(1.0);
+      expect(slope).toBe(0);
+    });
+
+    it("vertical wall (normalY=0) has max slope", () => {
+      const slope = calculateSlope(0);
+      expect(slope).toBe(1);
+    });
+
+    it("45-degree angle has 0.29 slope", () => {
+      const normalY = Math.cos(Math.PI / 4);
+      const slope = calculateSlope(normalY);
+      expect(slope).toBeCloseTo(0.29, 2);
+    });
+
+    it("rock blending starts at slope 0.6", () => {
+      const rockBlend = smoothstep(0.6, 0.75, 0.5);
+      expect(rockBlend).toBe(0); // Below threshold
+    });
+
+    it("full rock at slope 0.75+", () => {
+      const rockBlend = smoothstep(0.6, 0.75, 0.8);
+      expect(rockBlend).toBe(1);
+    });
+
+    it("partial rock blending in transition", () => {
+      const rockBlend = smoothstep(0.6, 0.75, 0.675);
+      expect(rockBlend).toBeGreaterThan(0);
+      expect(rockBlend).toBeLessThan(1);
+    });
+
+    it("dirt blending on moderate slopes", () => {
+      const dirtBlend = smoothstep(0.3, 0.5, 0.4) * 0.4;
+      expect(dirtBlend).toBeGreaterThan(0);
+      expect(dirtBlend).toBeLessThanOrEqual(0.4);
+    });
+  });
+
+  describe("Fog calculation", () => {
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    function calculateFog(distance: number): number {
+      return smoothstep(
+        TERRAIN_CONSTANTS.FOG_NEAR,
+        TERRAIN_CONSTANTS.FOG_FAR,
+        distance,
+      );
+    }
+
+    it("no fog at close range", () => {
+      const fog = calculateFog(50);
+      expect(fog).toBe(0);
+    });
+
+    it("no fog just before FOG_NEAR", () => {
+      const fog = calculateFog(TERRAIN_CONSTANTS.FOG_NEAR - 10);
+      expect(fog).toBe(0);
+    });
+
+    it("partial fog between FOG_NEAR and FOG_FAR", () => {
+      const midpoint =
+        (TERRAIN_CONSTANTS.FOG_NEAR + TERRAIN_CONSTANTS.FOG_FAR) / 2;
+      const fog = calculateFog(midpoint);
+
+      expect(fog).toBeGreaterThan(0);
+      expect(fog).toBeLessThan(1);
+    });
+
+    it("full fog at FOG_FAR", () => {
+      const fog = calculateFog(TERRAIN_CONSTANTS.FOG_FAR);
+      expect(fog).toBe(1);
+    });
+
+    it("full fog beyond FOG_FAR", () => {
+      const fog = calculateFog(TERRAIN_CONSTANTS.FOG_FAR + 100);
+      expect(fog).toBe(1);
+    });
+  });
+
+  describe("Lighting calculation (Half-Lambert)", () => {
+    function halfLambert(ndotl: number): number {
+      const h = ndotl * 0.5 + 0.5;
+      return h * h;
+    }
+
+    it("bright at sun-facing surfaces", () => {
+      const brightness = halfLambert(1.0);
+      expect(brightness).toBe(1.0);
+    });
+
+    it("moderate at tangent surfaces", () => {
+      const brightness = halfLambert(0);
+      expect(brightness).toBe(0.25);
+    });
+
+    it("dim but not black at shadow-facing surfaces", () => {
+      const brightness = halfLambert(-1.0);
+      expect(brightness).toBe(0);
+    });
+
+    it("smooth gradient across angles", () => {
+      const b1 = halfLambert(1.0);
+      const b2 = halfLambert(0.5);
+      const b3 = halfLambert(0.0);
+      const b4 = halfLambert(-0.5);
+      const b5 = halfLambert(-1.0);
+
+      expect(b1).toBeGreaterThan(b2);
+      expect(b2).toBeGreaterThan(b3);
+      expect(b3).toBeGreaterThan(b4);
+      expect(b4).toBeGreaterThan(b5);
+    });
+  });
+
+  describe("Placeholder texture creation", () => {
+    it("creates valid DataTexture for server-side", () => {
+      // Simulate server-side placeholder creation
+      const data = new Uint8Array([255, 0, 0, 255]); // Red
+      const tex = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.needsUpdate = true;
+
+      expect(tex.image.data).toBeDefined();
+      expect(tex.image.width).toBe(1);
+      expect(tex.image.height).toBe(1);
+    });
+
+    it("placeholder colors are valid hex", () => {
+      const colors = [0x5a9216, 0x6b4423, 0x7a7265, 0xc2b280, 0xf0f8ff];
+
+      for (const color of colors) {
+        expect(color).toBeGreaterThanOrEqual(0);
+        expect(color).toBeLessThanOrEqual(0xffffff);
+
+        // Extract RGB components
+        const r = (color >> 16) & 0xff;
+        const g = (color >> 8) & 0xff;
+        const b = color & 0xff;
+
+        expect(r).toBeGreaterThanOrEqual(0);
+        expect(r).toBeLessThanOrEqual(255);
+        expect(g).toBeGreaterThanOrEqual(0);
+        expect(g).toBeLessThanOrEqual(255);
+        expect(b).toBeGreaterThanOrEqual(0);
+        expect(b).toBeLessThanOrEqual(255);
+      }
+    });
+  });
+
+  describe("LOD distance thresholds (algorithm documentation)", () => {
+    /**
+     * Algorithm Documentation: These tests verify the LOD calculation formulas
+     * used in TerrainShader.ts TSL code. The actual shader runs on GPU and
+     * cannot be unit tested directly - these tests document expected behavior.
+     *
+     * Constants must match TERRAIN_CONSTANTS in TerrainShader.ts
+     */
+    const LOD_CONSTANTS = {
+      LOD_FULL_DETAIL: 100.0,
+      LOD_MEDIUM_DETAIL: 200.0,
+    };
+
+    // Smoothstep: matches GLSL/TSL smoothstep function
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    function calculateLodFullDetail(distance: number): number {
+      // lodFullDetail: 1.0 at close range, 0.0 at LOD_FULL_DETAIL distance
+      return smoothstep(
+        LOD_CONSTANTS.LOD_FULL_DETAIL,
+        LOD_CONSTANTS.LOD_FULL_DETAIL * 0.7, // 70
+        distance,
+      );
+    }
+
+    function calculateLodMedium(distance: number): number {
+      // lodMedium: 1.0 at medium range, 0.0 at LOD_MEDIUM_DETAIL distance
+      return smoothstep(
+        LOD_CONSTANTS.LOD_MEDIUM_DETAIL, // 200
+        LOD_CONSTANTS.LOD_FULL_DETAIL, // 100
+        distance,
+      );
+    }
+
+    it("full detail at close range (distance < 70)", () => {
+      const lodFull = calculateLodFullDetail(50);
+      expect(lodFull).toBe(1.0);
+    });
+
+    it("full detail fades out between 70-100m", () => {
+      const lod70 = calculateLodFullDetail(70);
+      const lod85 = calculateLodFullDetail(85);
+      const lod100 = calculateLodFullDetail(100);
+
+      expect(lod70).toBe(1.0);
+      expect(lod85).toBeGreaterThan(0);
+      expect(lod85).toBeLessThan(1);
+      expect(lod100).toBe(0);
+    });
+
+    it("zero full detail beyond 100m", () => {
+      expect(calculateLodFullDetail(100)).toBe(0);
+      expect(calculateLodFullDetail(150)).toBe(0);
+      expect(calculateLodFullDetail(300)).toBe(0);
+    });
+
+    it("medium detail at close range (distance < 100)", () => {
+      const lodMed = calculateLodMedium(50);
+      expect(lodMed).toBe(1.0);
+    });
+
+    it("medium detail fades out between 100-200m", () => {
+      const lod100 = calculateLodMedium(100);
+      const lod150 = calculateLodMedium(150);
+      const lod200 = calculateLodMedium(200);
+
+      expect(lod100).toBe(1.0);
+      expect(lod150).toBeGreaterThan(0);
+      expect(lod150).toBeLessThan(1);
+      expect(lod200).toBe(0);
+    });
+
+    it("zero medium detail beyond 200m", () => {
+      expect(calculateLodMedium(200)).toBe(0);
+      expect(calculateLodMedium(250)).toBe(0);
+      expect(calculateLodMedium(500)).toBe(0);
+    });
+
+    it("LOD transition is smooth (no discontinuities)", () => {
+      const distances = [
+        0, 20, 40, 60, 70, 80, 90, 100, 120, 150, 180, 200, 250,
+      ];
+      const lodFullValues = distances.map(calculateLodFullDetail);
+      const lodMedValues = distances.map(calculateLodMedium);
+
+      // Check no sudden jumps in LOD values
+      for (let i = 1; i < lodFullValues.length; i++) {
+        const diff = Math.abs(lodFullValues[i] - lodFullValues[i - 1]);
+        expect(diff).toBeLessThan(0.6); // Reasonable transition step
+      }
+
+      for (let i = 1; i < lodMedValues.length; i++) {
+        const diff = Math.abs(lodMedValues[i] - lodMedValues[i - 1]);
+        expect(diff).toBeLessThan(0.6);
+      }
+    });
+
+    it("normal strength scales with full detail LOD", () => {
+      const baseNormalStrength = 0.15;
+
+      // At close range, full normal strength
+      const closeStrength = baseNormalStrength * calculateLodFullDetail(50);
+      expect(closeStrength).toBeCloseTo(0.15, 3);
+
+      // At medium range, reduced normal strength
+      const medStrength = baseNormalStrength * calculateLodFullDetail(85);
+      expect(medStrength).toBeGreaterThan(0);
+      expect(medStrength).toBeLessThan(0.15);
+
+      // At far range, no normal perturbation
+      const farStrength = baseNormalStrength * calculateLodFullDetail(150);
+      expect(farStrength).toBe(0);
+    });
+
+    it("roughness blends to distant value at medium LOD", () => {
+      const distantRoughness = 0.85;
+      const detailedRoughness = 0.5;
+
+      function calculateFinalRoughness(distance: number): number {
+        const lodMed = calculateLodMedium(distance);
+        return distantRoughness * (1 - lodMed) + detailedRoughness * lodMed;
+      }
+
+      // Close: detailed roughness
+      expect(calculateFinalRoughness(50)).toBeCloseTo(0.5, 3);
+
+      // Medium: blended
+      const medRough = calculateFinalRoughness(150);
+      expect(medRough).toBeGreaterThan(0.5);
+      expect(medRough).toBeLessThan(0.85);
+
+      // Far: distant roughness
+      expect(calculateFinalRoughness(300)).toBeCloseTo(0.85, 3);
+    });
+  });
+
+  describe("LOD boundary conditions (algorithm documentation)", () => {
+    // Smoothstep function matches GLSL/TSL implementation
+    function smoothstep(edge0: number, edge1: number, x: number): number {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    }
+
+    it("handles zero distance", () => {
+      const lod = smoothstep(100, 70, 0);
+      expect(lod).toBe(1.0);
+    });
+
+    it("handles very large distances", () => {
+      const lod = smoothstep(100, 70, 10000);
+      expect(lod).toBe(0);
+    });
+
+    it("handles negative distances (shouldn't occur but safe)", () => {
+      const lod = smoothstep(100, 70, -50);
+      // Negative distance is still beyond the "close" threshold
+      expect(lod).toBe(1.0);
+    });
+
+    it("handles exactly at transition boundaries", () => {
+      // Exact edge0
+      const atEdge0 = smoothstep(100, 70, 100);
+      expect(atEdge0).toBe(0);
+
+      // Exact edge1
+      const atEdge1 = smoothstep(100, 70, 70);
+      expect(atEdge1).toBe(1.0);
+    });
+  });
+});

@@ -1,20 +1,21 @@
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import type { World } from "../../../core/World";
 import { EventType } from "../../../types/events";
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
 import { ticksToMs } from "../../../utils/game/CombatCalculations";
-import type { HeadstoneData } from "../../../types/entities";
 import type {
-  ZoneData,
   InventoryItem,
-  HeadstoneApp,
   DeathLocationData,
 } from "../../../types/core/core";
 import {
   calculateDistance,
   groundToTerrain,
 } from "../../../utils/game/EntityUtils";
-import { EntityType, InteractionType } from "../../../types/entities";
+import {
+  EntityType,
+  InteractionType,
+  DeathState,
+} from "../../../types/entities";
 import type { HeadstoneEntityConfig } from "../../../types/entities";
 import type { EntityManager } from "..";
 import { ZoneDetectionSystem } from "../death/ZoneDetectionSystem";
@@ -22,7 +23,7 @@ import type { GroundItemSystem } from "../economy/GroundItemSystem";
 import { DeathStateManager } from "../death/DeathStateManager";
 import { SafeAreaDeathHandler } from "../death/SafeAreaDeathHandler";
 import { WildernessDeathHandler } from "../death/WildernessDeathHandler";
-import { ZoneType } from "../../../types/death";
+import { ZoneType, type TransactionContext } from "../../../types/death";
 import type { InventorySystem } from "../character/InventorySystem";
 import { getEntityPosition } from "../../../utils/game/EntityPositionUtils";
 
@@ -31,7 +32,9 @@ interface PlayerSystemLike {
 }
 
 interface DatabaseSystemLike {
-  executeInTransaction: (fn: (tx: unknown) => Promise<void>) => Promise<void>;
+  executeInTransaction: (
+    fn: (tx: TransactionContext) => Promise<void>,
+  ) => Promise<void>;
 }
 
 interface EquipmentSystemLike {
@@ -62,6 +65,14 @@ interface NetworkLike {
   ) => void;
 }
 
+interface TickSystemLike {
+  getCurrentTick: () => number;
+  onTick: (
+    callback: (tickNumber: number, deltaMs: number) => void,
+    priority?: number,
+  ) => () => void;
+}
+
 interface PlayerEntityLike {
   emote?: string;
   data?: {
@@ -69,6 +80,10 @@ interface PlayerEntityLike {
     visible?: boolean;
     name?: string;
     position?: number[];
+    // Death state fields (single source of truth)
+    deathState?: DeathState;
+    deathPosition?: [number, number, number];
+    respawnTick?: number;
   };
   node?: {
     position: { set: (x: number, y: number, z: number) => void };
@@ -115,6 +130,10 @@ export class PlayerDeathSystem extends SystemBase {
     COMBAT_CONSTANTS.DEATH.COOLDOWN_TICKS,
   );
 
+  // Tick-based respawn system (AAA quality - deterministic timing)
+  private tickSystem: TickSystemLike | null = null;
+  private tickUnsubscribe: (() => void) | null = null;
+
   private zoneDetection!: ZoneDetectionSystem;
   private groundItemSystem!: GroundItemSystem;
   private deathStateManager!: DeathStateManager;
@@ -144,6 +163,24 @@ export class PlayerDeathSystem extends SystemBase {
 
     this.deathStateManager = new DeathStateManager(this.world);
     await this.deathStateManager.init();
+
+    // Register for tick-based respawn processing (AAA quality - deterministic timing)
+    // TickSystem is only available on server
+    if (this.world.isServer) {
+      const tickSystemRaw = this.world.getSystem("tick");
+      if (
+        tickSystemRaw &&
+        "getCurrentTick" in tickSystemRaw &&
+        "onTick" in tickSystemRaw
+      ) {
+        this.tickSystem = tickSystemRaw as unknown as TickSystemLike;
+        // Priority 3 = AI priority, runs after combat
+        this.tickUnsubscribe = this.tickSystem.onTick(
+          (tickNumber) => this.processPendingRespawns(tickNumber),
+          3,
+        );
+      }
+    }
 
     this.safeAreaHandler = new SafeAreaDeathHandler(
       this.world,
@@ -230,6 +267,12 @@ export class PlayerDeathSystem extends SystemBase {
   }
 
   destroy(): void {
+    // Unsubscribe from tick system
+    if (this.tickUnsubscribe) {
+      this.tickUnsubscribe();
+      this.tickUnsubscribe = null;
+    }
+
     // Clean up modular death system components
     if (this.safeAreaHandler) {
       this.safeAreaHandler.destroy();
@@ -384,74 +427,76 @@ export class PlayerDeathSystem extends SystemBase {
     let itemsToDrop: InventoryItem[] = [];
 
     try {
-      await databaseSystem.executeInTransaction(async (tx: unknown) => {
-        const inventory = inventorySystem.getInventory(playerId);
-        if (!inventory) {
-          console.warn(`[PlayerDeathSystem] No inventory for ${playerId}`);
-        }
+      await databaseSystem.executeInTransaction(
+        async (tx: TransactionContext) => {
+          const inventory = inventorySystem.getInventory(playerId);
+          if (!inventory) {
+            console.warn(`[PlayerDeathSystem] No inventory for ${playerId}`);
+          }
 
-        const inventoryItems =
-          inventory?.items.map((item, index) => ({
-            id: `death_${playerId}_${Date.now()}_${index}`,
-            itemId: item.itemId,
-            quantity: item.quantity,
-            slot: item.slot,
-            metadata: null,
-          })) || [];
+          const inventoryItems =
+            inventory?.items.map((item, index) => ({
+              id: `death_${playerId}_${Date.now()}_${index}`,
+              itemId: item.itemId,
+              quantity: item.quantity,
+              slot: item.slot,
+              metadata: null,
+            })) || [];
 
-        let equipmentItems: InventoryItem[] = [];
-        if (equipmentSystem) {
-          const equipment = equipmentSystem.getPlayerEquipment(playerId);
-          if (equipment) {
-            equipmentItems = this.convertEquipmentToInventoryItems(
-              equipment,
-              playerId,
+          let equipmentItems: InventoryItem[] = [];
+          if (equipmentSystem) {
+            const equipment = equipmentSystem.getPlayerEquipment(playerId);
+            if (equipment) {
+              equipmentItems = this.convertEquipmentToInventoryItems(
+                equipment,
+                playerId,
+              );
+            }
+          } else {
+            console.warn(
+              "[PlayerDeathSystem] EquipmentSystem not available, only inventory items will drop",
             );
           }
-        } else {
-          console.warn(
-            "[PlayerDeathSystem] EquipmentSystem not available, only inventory items will drop",
-          );
-        }
 
-        itemsToDrop = [...inventoryItems, ...equipmentItems];
-        const zoneType = this.zoneDetection.getZoneType(deathPosition);
+          itemsToDrop = [...inventoryItems, ...equipmentItems];
+          const zoneType = this.zoneDetection.getZoneType(deathPosition);
 
-        if (zoneType === ZoneType.SAFE_AREA) {
-          this.pendingGravestones.set(playerId, {
-            position: deathPosition,
-            items: itemsToDrop,
-            killedBy,
-            zoneType,
-          });
-
-          await this.deathStateManager.createDeathLock(
-            playerId,
-            {
-              gravestoneId: "",
+          if (zoneType === ZoneType.SAFE_AREA) {
+            this.pendingGravestones.set(playerId, {
               position: deathPosition,
-              zoneType: ZoneType.SAFE_AREA,
-              itemCount: itemsToDrop.length,
-            },
-            tx,
-          );
-        } else {
-          await this.wildernessHandler.handleDeath(
-            playerId,
-            deathPosition,
-            itemsToDrop,
-            killedBy,
-            zoneType,
-            tx,
-          );
-        }
+              items: itemsToDrop,
+              killedBy,
+              zoneType,
+            });
 
-        await inventorySystem.clearInventoryImmediate(playerId);
+            await this.deathStateManager.createDeathLock(
+              playerId,
+              {
+                gravestoneId: "",
+                position: deathPosition,
+                zoneType: ZoneType.SAFE_AREA,
+                itemCount: itemsToDrop.length,
+              },
+              tx,
+            );
+          } else {
+            await this.wildernessHandler.handleDeath(
+              playerId,
+              deathPosition,
+              itemsToDrop,
+              killedBy,
+              zoneType,
+              tx,
+            );
+          }
 
-        if (equipmentSystem && equipmentSystem.clearEquipmentImmediate) {
-          await equipmentSystem.clearEquipmentImmediate(playerId);
-        }
-      });
+          await inventorySystem.clearInventoryImmediate(playerId);
+
+          if (equipmentSystem && equipmentSystem.clearEquipmentImmediate) {
+            await equipmentSystem.clearEquipmentImmediate(playerId);
+          }
+        },
+      );
 
       this.postDeathCleanup(playerId, deathPosition, itemsToDrop, killedBy);
     } catch (error) {
@@ -467,7 +512,7 @@ export class PlayerDeathSystem extends SystemBase {
     playerId: string,
     deathPosition: { x: number; y: number; z: number },
     itemsToDrop: InventoryItem[],
-    killedBy: string,
+    _killedBy: string,
   ): void {
     const deathData: DeathLocationData = {
       playerId,
@@ -476,6 +521,10 @@ export class PlayerDeathSystem extends SystemBase {
       items: itemsToDrop,
     };
     this.deathLocations.set(playerId, deathData);
+
+    // PVP XP: Emit COMBAT_KILL event if killed by another player
+    // This allows SkillsSystem to award XP for PvP kills
+    this.emitCombatKillForPvP(playerId);
 
     // Set player as dead and disable movement
     this.emitTypedEvent(EventType.PLAYER_SET_DEAD, {
@@ -495,6 +544,19 @@ export class PlayerDeathSystem extends SystemBase {
       }
       if (typedPlayerEntity.data) {
         typedPlayerEntity.data.e = "death";
+
+        // AAA QUALITY: Set entity death state (single source of truth)
+        typedPlayerEntity.data.deathState = DeathState.DYING;
+        typedPlayerEntity.data.deathPosition = [
+          deathPosition.x,
+          deathPosition.y,
+          deathPosition.z,
+        ];
+
+        // Calculate respawn tick using tick system
+        const currentTick = this.tickSystem?.getCurrentTick() ?? 0;
+        typedPlayerEntity.data.respawnTick =
+          currentTick + COMBAT_CONSTANTS.DEATH.ANIMATION_TICKS;
       }
 
       if ("markNetworkDirty" in playerEntity) {
@@ -502,25 +564,99 @@ export class PlayerDeathSystem extends SystemBase {
       }
     }
 
-    const DEATH_ANIMATION_DURATION = ticksToMs(
-      COMBAT_CONSTANTS.DEATH.ANIMATION_TICKS,
-    );
-    const respawnTimer = setTimeout(() => {
-      if (playerEntity && "data" in playerEntity) {
-        const entityData = playerEntity.data as {
-          e?: string;
-          visible?: boolean;
-        };
-        entityData.visible = false;
-        if ("markNetworkDirty" in playerEntity) {
-          (playerEntity as { markNetworkDirty: () => void }).markNetworkDirty();
+    // Fallback: Use setTimeout if tick system is not available (e.g., client-side)
+    // This maintains backward compatibility while preferring tick-based timing
+    if (!this.tickSystem) {
+      const DEATH_ANIMATION_DURATION = ticksToMs(
+        COMBAT_CONSTANTS.DEATH.ANIMATION_TICKS,
+      );
+      const respawnTimer = setTimeout(() => {
+        if (playerEntity && "data" in playerEntity) {
+          const entityData = playerEntity.data as {
+            e?: string;
+            visible?: boolean;
+          };
+          entityData.visible = false;
+          if ("markNetworkDirty" in playerEntity) {
+            (
+              playerEntity as { markNetworkDirty: () => void }
+            ).markNetworkDirty();
+          }
         }
+
+        this.initiateRespawn(playerId);
+      }, DEATH_ANIMATION_DURATION);
+
+      this.respawnTimers.set(playerId, respawnTimer);
+    }
+    // Note: If tickSystem is available, respawn is handled by processPendingRespawns()
+  }
+
+  /**
+   * Emit COMBAT_KILL event for PvP kills so SkillsSystem can award XP.
+   * Uses CombatStateService to find the attacker who killed the player.
+   */
+  private emitCombatKillForPvP(deadPlayerId: string): void {
+    // Get CombatSystem to access stateService
+    const combatSystem = this.world.getSystem("combat") as {
+      stateService?: {
+        getAttackersTargeting: (
+          entityId: string,
+        ) => Array<{ toString: () => string }>;
+        getCombatData: (entityId: string) => {
+          attackerType: "player" | "mob";
+        } | null;
+      };
+    } | null;
+
+    if (!combatSystem?.stateService) {
+      return;
+    }
+
+    // Get all attackers who were targeting the dead player
+    const attackers =
+      combatSystem.stateService.getAttackersTargeting(deadPlayerId);
+    if (attackers.length === 0) {
+      return;
+    }
+
+    // Get dead player's max health for damage calculation (same approach as MobEntity)
+    const deadPlayerEntity = this.world.entities?.get?.(deadPlayerId);
+    let maxHealth = 10; // Default fallback
+    if (deadPlayerEntity && "getMaxHealth" in deadPlayerEntity) {
+      maxHealth =
+        (deadPlayerEntity as { getMaxHealth: () => number }).getMaxHealth() ||
+        10;
+    }
+
+    // Get PlayerSystem for attack style lookup
+    const playerSystem = this.world.getSystem("player") as {
+      getPlayerAttackStyle?: (playerId: string) => { id: string } | null;
+    } | null;
+
+    // Emit COMBAT_KILL for each player attacker (award XP to all who contributed)
+    for (const attackerId of attackers) {
+      const attackerIdStr = attackerId.toString();
+
+      // Check if this attacker is a player (not a mob)
+      const combatData = combatSystem.stateService.getCombatData(attackerIdStr);
+      if (!combatData || combatData.attackerType !== "player") {
+        continue;
       }
 
-      this.initiateRespawn(playerId);
-    }, DEATH_ANIMATION_DURATION);
+      // Get attacker's attack style
+      const attackStyleData =
+        playerSystem?.getPlayerAttackStyle?.(attackerIdStr);
+      const attackStyle = attackStyleData?.id || "aggressive"; // Default to aggressive
 
-    this.respawnTimers.set(playerId, respawnTimer);
+      // Emit COMBAT_KILL event - SkillsSystem will handle XP distribution
+      this.emitTypedEvent(EventType.COMBAT_KILL, {
+        attackerId: attackerIdStr,
+        targetId: deadPlayerId,
+        damageDealt: maxHealth, // Use max health as damage (same as MobEntity)
+        attackStyle: attackStyle,
+      });
+    }
   }
 
   private async createHeadstoneEntity(
@@ -647,13 +783,16 @@ export class PlayerDeathSystem extends SystemBase {
       }
 
       if ("data" in playerEntity) {
-        const entityData = playerEntity.data as {
-          e?: string;
-          visible?: boolean;
-        };
+        const typedPlayerEntity = playerEntity as PlayerEntityLike;
+        const entityData = typedPlayerEntity.data!;
 
         entityData.e = "idle";
         entityData.visible = true;
+
+        // AAA QUALITY: Clear death state (single source of truth)
+        entityData.deathState = DeathState.ALIVE;
+        entityData.deathPosition = undefined;
+        entityData.respawnTick = undefined;
 
         if ("markNetworkDirty" in playerEntity) {
           (playerEntity as { markNetworkDirty: () => void }).markNetworkDirty();
@@ -1042,6 +1181,24 @@ export class PlayerDeathSystem extends SystemBase {
   }
 
   getDeathLocation(playerId: string): DeathLocationData | undefined {
+    // AAA QUALITY: Check entity deathPosition first (single source of truth)
+    const playerEntity = this.world.entities?.get?.(playerId);
+    if (playerEntity && "data" in playerEntity) {
+      const typedEntity = playerEntity as PlayerEntityLike;
+      if (
+        typedEntity.data?.deathState === DeathState.DYING &&
+        typedEntity.data?.deathPosition
+      ) {
+        const [x, y, z] = typedEntity.data.deathPosition;
+        return {
+          playerId,
+          deathPosition: { x, y, z },
+          timestamp: Date.now(), // Not available from entity, use now
+          items: this.deathLocations.get(playerId)?.items || [],
+        };
+      }
+    }
+    // Fallback to deathLocations Map for backward compatibility
     return this.deathLocations.get(playerId);
   }
 
@@ -1050,6 +1207,18 @@ export class PlayerDeathSystem extends SystemBase {
   }
 
   isPlayerDead(playerId: string): boolean {
+    // AAA QUALITY: Check entity deathState first (single source of truth)
+    const playerEntity = this.world.entities?.get?.(playerId);
+    if (playerEntity && "data" in playerEntity) {
+      const typedEntity = playerEntity as PlayerEntityLike;
+      if (typedEntity.data?.deathState) {
+        return (
+          typedEntity.data.deathState === DeathState.DYING ||
+          typedEntity.data.deathState === DeathState.DEAD
+        );
+      }
+    }
+    // Fallback to deathLocations Map for backward compatibility
     return this.deathLocations.has(playerId);
   }
 
@@ -1104,6 +1273,39 @@ export class PlayerDeathSystem extends SystemBase {
   processTick(currentTick: number): void {
     if (this.safeAreaHandler) {
       this.safeAreaHandler.processTick(currentTick);
+    }
+  }
+
+  /**
+   * Tick-based respawn processing (AAA quality - deterministic timing)
+   * Called every tick by TickSystem when registered.
+   * Checks all players in DYING state and respawns them when respawnTick is reached.
+   */
+  private processPendingRespawns(currentTick: number): void {
+    // Iterate over all player entities and check for pending respawns
+    // Use world.entities.players to get the players Map
+    const players = this.world.entities?.players;
+    if (!players) return;
+
+    for (const [playerId, playerEntity] of players) {
+      const typedEntity = playerEntity as PlayerEntityLike;
+      if (!typedEntity.data) continue;
+
+      // Check if player is in DYING state and respawn tick has been reached
+      if (
+        typedEntity.data.deathState === DeathState.DYING &&
+        typedEntity.data.respawnTick !== undefined &&
+        currentTick >= typedEntity.data.respawnTick
+      ) {
+        // Hide player briefly before respawn
+        typedEntity.data.visible = false;
+        if ("markNetworkDirty" in playerEntity) {
+          (playerEntity as { markNetworkDirty: () => void }).markNetworkDirty();
+        }
+
+        // Initiate respawn for this player
+        this.initiateRespawn(playerId);
+      }
     }
   }
 }

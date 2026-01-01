@@ -14,7 +14,11 @@
  */
 
 import type { World } from "../../../core/World";
-import type { DeathLock, ZoneType } from "../../../types/death";
+import type {
+  DeathLock,
+  ZoneType,
+  TransactionContext,
+} from "../../../types/death";
 import type { EntityManager } from "..";
 
 // Type for DatabaseSystem (only available on server)
@@ -29,7 +33,7 @@ type DatabaseSystem = {
       zoneType: string;
       itemCount: number;
     },
-    tx?: any, // Optional transaction context
+    tx?: TransactionContext,
   ) => Promise<void>;
   getDeathLockAsync: (playerId: string) => Promise<{
     playerId: string;
@@ -100,7 +104,7 @@ export class DeathStateManager {
       zoneType: ZoneType;
       itemCount: number;
     },
-    tx?: any, // Transaction context (server only, passed through to DatabaseSystem)
+    tx?: TransactionContext,
   ): Promise<void> {
     // CRITICAL: Server authority check - prevent client from creating fake death locks
     if (!this.world.isServer) {

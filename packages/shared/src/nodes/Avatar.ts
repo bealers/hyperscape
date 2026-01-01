@@ -187,8 +187,21 @@ export class Avatar extends Node {
   set emote(value: string | null) {
     if (!value) value = defaults.emote;
     if (this._emote === value) return;
+    // DEBUG: Log death emote setting
+    if (value?.includes("death")) {
+      console.log(`[Avatar] Setting death emote:`, {
+        oldEmote: this._emote,
+        newEmote: value,
+        hasInstance: !!this.instance,
+        instanceType: this.instance?.constructor?.name,
+      });
+    }
     this._emote = value;
     this.instance?.setEmote(value);
+    // DEBUG: Confirm setEmote was called
+    if (value?.includes("death")) {
+      console.log(`[Avatar] After setEmote call, instance:`, !!this.instance);
+    }
   }
 
   get onLoad() {

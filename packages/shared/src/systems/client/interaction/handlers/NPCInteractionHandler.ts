@@ -61,7 +61,6 @@ export class NPCInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "use-bank",
         label: "Use Bank",
-        icon: "🏦",
         enabled: true,
         priority: 1,
         handler: () => this.openBank(target),
@@ -73,7 +72,6 @@ export class NPCInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: "trade",
         label: "Trade",
-        icon: "🏪",
         enabled: true,
         priority: 2,
         handler: () => this.openStore(target),
@@ -84,7 +82,6 @@ export class NPCInteractionHandler extends BaseInteractionHandler {
     actions.push({
       id: "talk",
       label: "Talk-to",
-      icon: "💬",
       enabled: true,
       priority: 3,
       handler: () => this.startDialogue(target),

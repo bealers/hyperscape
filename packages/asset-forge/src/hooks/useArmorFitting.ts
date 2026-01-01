@@ -45,11 +45,11 @@ export interface ArmorFittingActions {
   setSelectedBone: (bone: number) => void;
   setShowWireframe: (show: boolean) => void;
   performFitting: (
-    viewerRef: React.RefObject<ArmorFittingViewerRef>,
+    viewerRef: React.RefObject<ArmorFittingViewerRef | null>,
   ) => Promise<void>;
   resetFitting: () => void;
   exportFittedArmor: (
-    viewerRef: React.RefObject<ArmorFittingViewerRef>,
+    viewerRef: React.RefObject<ArmorFittingViewerRef | null>,
   ) => Promise<void>;
   saveConfiguration: () => void;
 }
@@ -100,7 +100,7 @@ export function useArmorFitting(): ArmorFittingState & ArmorFittingActions {
   }, []);
 
   const performFitting = useCallback(
-    async (viewerRef: React.RefObject<ArmorFittingViewerRef>) => {
+    async (viewerRef: React.RefObject<ArmorFittingViewerRef | null>) => {
       if (!viewerRef.current || !selectedAvatar || !selectedArmor) return;
 
       setIsFitting(true);
@@ -245,7 +245,7 @@ export function useArmorFitting(): ArmorFittingState & ArmorFittingActions {
   }, []);
 
   const exportFittedArmor = useCallback(
-    async (viewerRef: React.RefObject<ArmorFittingViewerRef>) => {
+    async (viewerRef: React.RefObject<ArmorFittingViewerRef | null>) => {
       if (!viewerRef.current) return;
 
       try {

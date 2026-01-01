@@ -589,6 +589,8 @@ export interface ImageData extends NodeData {
 export interface NametagData extends NodeData {
   label?: string | number;
   health?: number;
+  /** Combat level for OSRS-style display: "Name (level-XX)" */
+  level?: number | null;
 }
 
 // Particles interfaces (minimal emitter handle)

@@ -1,11 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { COLORS } from "../../constants";
-import {
-  EventType,
-  getAvailableStyles,
-  WeaponType,
-  type CombatStyle,
-} from "@hyperscape/shared";
+import { EventType, getAvailableStyles, WeaponType } from "@hyperscape/shared";
 import type {
   ClientWorld,
   PlayerStats,
@@ -82,10 +77,22 @@ const autoRetaliateCache = new Map<string, boolean>();
 
 export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
   // Initialize from cache if available, otherwise default to "accurate"
+  // Check order: module cache > network cache > default
   const [style, setStyle] = useState<string>(() => {
     const playerId = world.entities?.player?.id;
+    // 1. Check module cache (for instant display on panel reopen)
     if (playerId && combatStyleCache.has(playerId)) {
       return combatStyleCache.get(playerId)!;
+    }
+    // 2. Check network cache (for fresh page loads - packet arrived before UI mounted)
+    const networkCache =
+      world.network?.lastAttackStyleByPlayerId?.[playerId || ""];
+    if (networkCache?.currentStyle?.id) {
+      // Also update module cache for future panel reopens
+      if (playerId) {
+        combatStyleCache.set(playerId, networkCache.currentStyle.id);
+      }
+      return networkCache.currentStyle.id;
     }
     return "accurate";
   });
@@ -129,6 +136,14 @@ export function CombatPanel({ world, stats, equipment }: CombatPanelProps) {
   useEffect(() => {
     const playerId = world.entities?.player?.id;
     if (!playerId) return;
+
+    // Immediately sync from network cache (handles fresh page loads)
+    // The packet may have arrived before this component mounted
+    const networkCache = world.network?.lastAttackStyleByPlayerId?.[playerId];
+    if (networkCache?.currentStyle?.id) {
+      combatStyleCache.set(playerId, networkCache.currentStyle.id);
+      setStyle(networkCache.currentStyle.id);
+    }
 
     const actions = world.getSystem("actions") as {
       actionMethods?: {

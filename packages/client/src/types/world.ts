@@ -42,11 +42,6 @@ export interface TargetSystem {
   hide: () => void;
 }
 
-export interface XRManager {
-  supportsVR: boolean;
-  enter: () => void;
-}
-
 export interface ChatSystem {
   send: (message: string) => void;
   command: (command: string) => void;
@@ -103,6 +98,8 @@ export interface WorldPreferences {
   shadows: string;
   postprocessing: boolean;
   bloom: boolean;
+  colorGrading: string;
+  colorGradingIntensity: number;
   music: number;
   sfx: number;
   voice: number;
@@ -116,6 +113,8 @@ export interface WorldPreferences {
   setShadows: (value: string) => void;
   setPostprocessing: (value: boolean) => void;
   setBloom: (value: boolean) => void;
+  setColorGrading: (value: string) => void;
+  setColorGradingIntensity: (value: number) => void;
   setMusic: (value: number) => void;
   setSFX: (value: number) => void;
   setVoice: (value: number) => void;

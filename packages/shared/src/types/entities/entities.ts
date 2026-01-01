@@ -125,6 +125,16 @@ export interface BaseEntityData extends EntityData {
   quaternion: [number, number, number, number];
 }
 
+/**
+ * Death state enum for player death system
+ * Single source of truth - synced via entity data
+ */
+export enum DeathState {
+  ALIVE = "alive",
+  DYING = "dying", // Playing death animation, position frozen
+  DEAD = "dead", // Brief state for gravestone spawn
+}
+
 // Player entity data
 export interface PlayerEntityData extends BaseEntityData {
   playerId: string;
@@ -138,6 +148,10 @@ export interface PlayerEntityData extends BaseEntityData {
   equipment: Record<string, Item | null>;
   inventory: Item[];
   skills: Record<string, { level: number; xp: number }>;
+  // Death state - synced to all clients automatically via entityModified
+  deathState?: DeathState;
+  deathPosition?: [number, number, number]; // Frozen position during death animation
+  respawnTick?: number; // Tick when respawn should occur
 }
 
 // Bank entity data

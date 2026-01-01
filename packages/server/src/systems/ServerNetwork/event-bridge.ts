@@ -341,16 +341,21 @@ export class EventBridge {
         }
       });
 
-      // Forward player death state changes to clients
+      // Forward player death state changes to ALL clients
+      // CRITICAL: Broadcast to all so other players see death animation and position updates
       this.world.on(EventType.PLAYER_SET_DEAD, (payload: unknown) => {
         const data = payload as { playerId: string; isDead: boolean };
 
         if (data.playerId) {
-          this.broadcast.sendToPlayer(data.playerId, "playerSetDead", data);
+          // Broadcast to ALL players so they can:
+          // 1. See death animation on the dying player
+          // 2. Clear tile interpolator state (allows respawn position to apply)
+          this.broadcast.sendToAll("playerSetDead", data);
         }
       });
 
-      // Forward player respawn events to clients
+      // Forward player respawn events to ALL clients
+      // CRITICAL: Broadcast to all so other players see respawned player at new position
       this.world.on(EventType.PLAYER_RESPAWNED, (payload: unknown) => {
         const data = payload as {
           playerId: string;
@@ -358,7 +363,8 @@ export class EventBridge {
         };
 
         if (data.playerId) {
-          this.broadcast.sendToPlayer(data.playerId, "playerRespawned", data);
+          // Broadcast to ALL players so they can see the respawned player
+          this.broadcast.sendToAll("playerRespawned", data);
         }
       });
 
@@ -726,7 +732,8 @@ export class EventBridge {
     const entity = this.world.entities?.get?.(entityId);
     if (entity) {
       // Try to get npcId from various possible locations on the entity
-      const entityWithConfig = entity as {
+      // Cast through unknown because Entity.config is protected but NPCEntity.config is public
+      const entityWithConfig = entity as unknown as {
         config?: { npcId?: string };
         data?: { npcId?: string };
         npcId?: string;

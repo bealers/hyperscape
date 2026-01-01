@@ -1,6 +1,6 @@
 import { isBoolean } from "lodash-es";
 import THREE from "../../extras/three/three";
-import { SystemBase } from "../shared";
+import { SystemBase } from "../shared/infrastructure/SystemBase";
 import { EventType } from "../../types/events";
 import { ControlPriorities } from "../../systems/client/ControlPriorities";
 import { storage } from "../../platform/shared/storage";
@@ -40,6 +40,8 @@ export interface ClientPrefsData {
   shadows?: string;
   postprocessing?: boolean;
   bloom?: boolean;
+  colorGrading?: string;
+  colorGradingIntensity?: number;
   music?: number;
   sfx?: number;
   voice?: number;
@@ -74,6 +76,8 @@ export class ClientInterface extends SystemBase {
   shadows: string = "med";
   postprocessing: boolean = true;
   bloom: boolean = true;
+  colorGrading: string = "cinematic";
+  colorGradingIntensity: number = 1;
   music: number = 1;
   sfx: number = 1;
   voice: number = 1;
@@ -142,6 +146,10 @@ export class ClientInterface extends SystemBase {
       if (parsed.postprocessing !== undefined)
         this.postprocessing = parsed.postprocessing;
       if (parsed.bloom !== undefined) this.bloom = parsed.bloom;
+      if (parsed.colorGrading !== undefined)
+        this.colorGrading = parsed.colorGrading;
+      if (parsed.colorGradingIntensity !== undefined)
+        this.colorGradingIntensity = parsed.colorGradingIntensity;
 
       if (parsed.chatVisible !== undefined)
         this.chatVisible = parsed.chatVisible;
@@ -448,6 +456,8 @@ export class ClientInterface extends SystemBase {
       shadows: this.shadows,
       postprocessing: this.postprocessing,
       bloom: this.bloom,
+      colorGrading: this.colorGrading,
+      colorGradingIntensity: this.colorGradingIntensity,
 
       music: this.music,
       sfx: this.sfx,
@@ -481,6 +491,12 @@ export class ClientInterface extends SystemBase {
   }
   setBloom(value: boolean) {
     this.modify("bloom", value);
+  }
+  setColorGrading(value: string) {
+    this.modify("colorGrading", value);
+  }
+  setColorGradingIntensity(value: number) {
+    this.modify("colorGradingIntensity", value);
   }
   setMusic(value: number) {
     this.modify("music", value);

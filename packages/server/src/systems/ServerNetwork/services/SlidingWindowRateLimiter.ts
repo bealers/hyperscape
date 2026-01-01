@@ -179,6 +179,7 @@ let equipLimiter: RateLimiter | null = null;
 let tileMovementLimiter: RateLimiter | null = null;
 let pathfindLimiter: RateLimiter | null = null;
 let combatLimiter: RateLimiter | null = null;
+let followLimiter: RateLimiter | null = null;
 
 /**
  * Get the pickup rate limiter (5/sec)
@@ -282,6 +283,21 @@ export function getCombatRateLimiter(): RateLimiter {
 }
 
 /**
+ * Get the follow rate limiter (5/sec)
+ * Limits follow player requests - more lenient than combat
+ * Prevents spam-clicking follow on players
+ */
+export function getFollowRateLimiter(): RateLimiter {
+  if (!followLimiter) {
+    followLimiter = createRateLimiter({
+      maxPerSecond: 5,
+      name: "follow",
+    });
+  }
+  return followLimiter;
+}
+
+/**
  * Destroy all singleton rate limiters
  * Call this during server shutdown
  */
@@ -293,6 +309,7 @@ export function destroyAllRateLimiters(): void {
   tileMovementLimiter?.destroy();
   pathfindLimiter?.destroy();
   combatLimiter?.destroy();
+  followLimiter?.destroy();
 
   pickupLimiter = null;
   moveLimiter = null;
@@ -301,4 +318,5 @@ export function destroyAllRateLimiters(): void {
   tileMovementLimiter = null;
   pathfindLimiter = null;
   combatLimiter = null;
+  followLimiter = null;
 }

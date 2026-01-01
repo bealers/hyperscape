@@ -130,18 +130,16 @@ export async function loadConfig(): Promise<ServerConfig> {
   const worldDir = path.isAbsolute(WORLD)
     ? WORLD
     : path.join(hyperscapeRoot, WORLD);
-  const assetsDir = path.join(worldDir, "assets");
+
+  // Use root assets directory (not per-world assets)
+  // This is the main assets folder at workspace root: /assets/
+  const workspaceRoot = path.resolve(hyperscapeRoot, "../..");
+  const assetsDir = path.join(workspaceRoot, "assets");
   const builtInAssetsDir = path.join(hyperscapeRoot, "src/world/assets");
 
   // Create world folders if needed
   await fs.ensureDir(worldDir);
-  await fs.ensureDir(assetsDir);
-
-  // Copy over built-in assets (only if assets directory is empty)
-  const assetFiles = await fs.readdir(assetsDir).catch(() => []);
-  if (assetFiles.length === 0 && (await fs.pathExists(builtInAssetsDir))) {
-    await fs.copy(builtInAssetsDir, assetsDir);
-  }
+  // Note: assetsDir points to root /assets/ which should always exist
 
   // Construct assets URL with trailing slash
   const assetsUrl = CDN_URL.endsWith("/") ? CDN_URL : `${CDN_URL}/`;

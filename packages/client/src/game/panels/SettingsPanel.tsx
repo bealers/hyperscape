@@ -15,6 +15,18 @@ const shadowOptions = [
   { label: "High", value: "high" },
 ];
 
+const colorGradingOptions = [
+  { label: "None", value: "none" },
+  { label: "Cinematic", value: "cinematic" },
+  { label: "Bourbon", value: "bourbon" },
+  { label: "Chemical", value: "chemical" },
+  { label: "Clayton", value: "clayton" },
+  { label: "Cubicle", value: "cubicle" },
+  { label: "Remy", value: "remy" },
+  { label: "B&W", value: "bw" },
+  { label: "Night", value: "night" },
+];
+
 type TabType = "visuals" | "interface" | "audio" | "backend";
 
 export function SettingsPanel({ world }: SettingsPanelProps) {
@@ -32,6 +44,12 @@ export function SettingsPanel({ world }: SettingsPanelProps) {
     prefs?.postprocessing ?? true,
   );
   const [bloom, setBloom] = useState(prefs?.bloom ?? true);
+  const [colorGrading, setColorGrading] = useState(
+    prefs?.colorGrading || "cinematic",
+  );
+  const [colorGradingIntensity, setColorGradingIntensity] = useState(
+    prefs?.colorGradingIntensity ?? 1,
+  );
   const [music, setMusic] = useState(prefs?.music || 0.5);
   const [sfx, setSFX] = useState(prefs?.sfx || 0.5);
   const [voice, setVoice] = useState(prefs?.voice || 1);
@@ -80,6 +98,10 @@ export function SettingsPanel({ world }: SettingsPanelProps) {
       if (changes.postprocessing)
         setPostprocessing(changes.postprocessing.value as boolean);
       if (changes.bloom) setBloom(changes.bloom.value as boolean);
+      if (changes.colorGrading)
+        setColorGrading(changes.colorGrading.value as string);
+      if (changes.colorGradingIntensity)
+        setColorGradingIntensity(changes.colorGradingIntensity.value as number);
       if (changes.music) setMusic(changes.music.value as number);
       if (changes.sfx) setSFX(changes.sfx.value as number);
       if (changes.voice) setVoice(changes.voice.value as number);
@@ -374,6 +396,112 @@ export function SettingsPanel({ world }: SettingsPanelProps) {
                         </div>
                       </div>
                     </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Color Grading Card */}
+              <div
+                className="bg-gradient-to-br from-black/40 to-black/25 border rounded p-1"
+                style={{ borderColor: "rgba(242, 208, 138, 0.25)" }}
+              >
+                <div className="flex items-center gap-0.5 mb-1">
+                  <span className="text-[10px]">🎬</span>
+                  <span
+                    className="text-[9px] font-semibold"
+                    style={{ color: COLORS.ACCENT }}
+                  >
+                    Color Grading
+                  </span>
+                </div>
+
+                <div className="space-y-1">
+                  {/* LUT Preset Selection */}
+                  <div>
+                    <div
+                      className="text-[8px] mb-0.5"
+                      style={{ color: "rgba(242, 208, 138, 0.9)" }}
+                    >
+                      Look
+                    </div>
+                    <div className="grid grid-cols-4 gap-0.5">
+                      {colorGradingOptions.map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            setColorGrading(opt.value);
+                            prefs?.setColorGrading?.(opt.value);
+                          }}
+                          disabled={!postprocessing}
+                          className="text-[7px] py-0.5 px-0.5 rounded transition-all border"
+                          style={{
+                            backgroundColor:
+                              colorGrading === opt.value
+                                ? "rgba(242, 208, 138, 0.15)"
+                                : "rgba(0, 0, 0, 0.2)",
+                            borderColor:
+                              colorGrading === opt.value
+                                ? "rgba(242, 208, 138, 0.4)"
+                                : "rgba(242, 208, 138, 0.2)",
+                            color:
+                              colorGrading === opt.value
+                                ? COLORS.ACCENT
+                                : "rgba(242, 208, 138, 0.6)",
+                            cursor: postprocessing ? "pointer" : "not-allowed",
+                            opacity: postprocessing ? 1 : 0.5,
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Intensity Slider */}
+                  <div
+                    style={{
+                      opacity:
+                        postprocessing && colorGrading !== "none" ? 1 : 0.5,
+                    }}
+                  >
+                    <div className="flex justify-between items-center mb-0.5">
+                      <span
+                        className="text-[8px]"
+                        style={{ color: "rgba(242, 208, 138, 0.9)" }}
+                      >
+                        Intensity
+                      </span>
+                      <span
+                        className="text-[8px] font-mono px-1 py-0.5 rounded"
+                        style={{
+                          backgroundColor: "rgba(242, 208, 138, 0.15)",
+                          color: COLORS.ACCENT,
+                        }}
+                      >
+                        {Math.round(colorGradingIntensity * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={colorGradingIntensity}
+                      disabled={!postprocessing || colorGrading === "none"}
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        setColorGradingIntensity(v);
+                        prefs?.setColorGradingIntensity?.(v);
+                      }}
+                      className="w-full h-1 rounded-full appearance-none cursor-pointer"
+                      style={{
+                        background: `linear-gradient(to right, ${COLORS.ACCENT} 0%, ${COLORS.ACCENT} ${colorGradingIntensity * 100}%, rgba(242, 208, 138, 0.2) ${colorGradingIntensity * 100}%, rgba(242, 208, 138, 0.2) 100%)`,
+                        cursor:
+                          postprocessing && colorGrading !== "none"
+                            ? "pointer"
+                            : "not-allowed",
+                      }}
+                    />
                   </div>
                 </div>
               </div>
@@ -864,7 +992,7 @@ export function SettingsPanel({ world }: SettingsPanelProps) {
                     className="text-sm font-bold mb-0.5"
                     style={{ color: COLORS.ACCENT }}
                   >
-                    {world.graphics?.isWebGPU ? "WebGPU" : "WebGL 2"}
+                    WebGPU
                   </div>
 
                   <div

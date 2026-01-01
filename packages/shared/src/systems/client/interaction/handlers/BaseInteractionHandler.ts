@@ -298,7 +298,6 @@ export abstract class BaseInteractionHandler {
     return {
       id: "examine",
       label: "Examine",
-      icon: "👁️",
       enabled: true,
       priority: 100, // Low priority = bottom of menu
       handler: () => this.showExamineMessage(examineText),
@@ -312,7 +311,6 @@ export abstract class BaseInteractionHandler {
     return {
       id: "walk_here",
       label: "Walk here",
-      icon: "👟",
       enabled: true,
       priority: 99, // Near bottom, above examine
       handler: () => this.sendWalkRequest(target.hitPoint),

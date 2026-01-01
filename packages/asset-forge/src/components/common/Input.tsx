@@ -113,7 +113,7 @@ export interface FormFieldProps {
   error?: string;
   helperText?: string;
   required?: boolean;
-  children: React.ReactElement;
+  children: React.ReactElement<{ id?: string; error?: boolean }>;
 }
 
 const FormField: React.FC<FormFieldProps> = ({

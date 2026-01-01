@@ -25,6 +25,12 @@
   "scripts": {
     "postinstall": "node scripts/ensure-assets.mjs",
     "assets:sync": "cd packages/server/world/assets && git pull origin main",
+    "assets:optimize": "node scripts/optimize-assets.mjs",
+    "assets:optimize:dry": "node scripts/optimize-assets.mjs --dry-run --verbose",
+    "assets:optimize:textures": "node scripts/optimize-assets.mjs --textures",
+    "assets:optimize:models": "node scripts/optimize-assets.mjs --models",
+    "assets:atlas": "node scripts/atlas-materials.mjs",
+    "assets:atlas:all": "node scripts/atlas-materials.mjs --dir assets --recursive",
     "build": "bun run docs:generate && turbo run build --filter='!3d-asset-forge'",
     "build:shared": "cd packages/shared && bun run build",
     "build:client": "cd packages/client && bun run build",
@@ -44,6 +50,7 @@
     "start": "cd packages/server && bun run start",
     "test": "turbo run test --filter='!3d-asset-forge'",
     "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck --filter='!3d-asset-forge' --filter='!@hyperscape/physx-js-webidl' --filter='!@hyperscape/docs'",
     "clean": "turbo run clean && rm -rf test-*.json test-*.png *.log **/*.log test-results packages/docs-site/docs/api",
     "ios": "cd packages/client && bun run ios",
     "ios:dev": "cd packages/client && bun run ios:dev",
@@ -63,6 +70,10 @@
     "prepare": "husky"
   },
   "devDependencies": {
+    "@gltf-transform/cli": "^4.1.1",
+    "@gltf-transform/core": "^4.1.1",
+    "@gltf-transform/extensions": "^4.1.1",
+    "@gltf-transform/functions": "^4.1.1",
     "@docusaurus/core": "^3.9.1",
     "@docusaurus/preset-classic": "^3.9.2",
     "@elizaos/cli": "^1.6.4",
@@ -97,7 +108,8 @@
     "react-dom": "^19.2.0",
     "three": "0.180.0",
     "@types/three": "0.180.0",
-    "@pixiv/three-vrm": "3.4.3"
+    "@pixiv/three-vrm": "3.4.3",
+    "jws": "^3.2.3"
   },
   "packageManager": "bun@1.1.38",
   "lint-staged": {
@@ -107,6 +119,8 @@
   "dependencies": {
     "@hyperscape/plugin-hyperscape": "workspace:*",
     "@rollup/rollup-darwin-x64": "^4.52.4",
+    "sharp": "^0.33.5",
+    "meshoptimizer": "^0.22.0",
     "@types/pg": "^8.15.5",
     "better-sqlite3": "^12.2.0",
     "canvas": "^3.1.2",

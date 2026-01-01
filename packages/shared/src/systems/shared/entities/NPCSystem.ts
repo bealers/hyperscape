@@ -16,7 +16,7 @@ import {
   Town,
 } from "../../../types/core/core";
 import { NPCSystemInfo as SystemInfo } from "../../../types/systems/system-interfaces";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import { InventorySystem } from "..";
 import { EventType } from "../../../types/events";
 import { TerrainSystem } from "..";
@@ -112,6 +112,7 @@ export class NPCSystem extends SystemBase {
       attempts++;
 
       if (attempts % 10 === 0) {
+        // Log progress every 10 attempts
       }
     }
 
@@ -132,7 +133,7 @@ export class NPCSystem extends SystemBase {
       id: "bank_clerk_1",
       type: "npc" as const,
       name: "Bank Clerk",
-      position: { x: 5, y: groundY + 1.0, z: -5 }, // Match world-areas.json position
+      position: { x: 5, y: groundY, z: -5 }, // At ground level (model pivot handles foot placement)
       rotation: { x: 0, y: 0, z: 0, w: 1 },
       scale: { x: 100, y: 100, z: 100 }, // Scale up rigged model
       visible: true,
@@ -153,15 +154,13 @@ export class NPCSystem extends SystemBase {
     };
 
     try {
-      const spawnedEntity = (await entityManager.spawnEntity(npcConfig)) as {
-        id?: string;
-      } | null;
+      await entityManager.spawnEntity(npcConfig);
 
       // Verify it's in the world
       const verify = this.world.entities.get("bank_clerk_1");
       if (verify) {
         console.log(
-          "[NPCSystem] ✅ Bank Clerk spawned at (5, " + (groundY + 1) + ", -5)",
+          "[NPCSystem] ✅ Bank Clerk spawned at (5, " + groundY + ", -5)",
         );
       }
     } catch (err) {

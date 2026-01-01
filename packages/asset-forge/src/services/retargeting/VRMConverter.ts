@@ -37,7 +37,7 @@ import { MESHY_VARIATIONS } from "./BoneMappings";
  * VRM HumanoidBone names (VRM 1.0 standard)
  * These are the standardized bone names used by VRM format
  */
-const VRM_HUMANOID_BONES = {
+const _VRM_HUMANOID_BONES = {
   // Torso
   hips: "hips",
   spine: "spine",
@@ -102,35 +102,36 @@ const VRM_HUMANOID_BONES = {
  * Meshy bone name → VRM HumanoidBone mapping
  * Uses fuzzy matching to handle case variations
  */
-const MESHY_TO_VRM_BONE_MAP: Record<string, keyof typeof VRM_HUMANOID_BONES> = {
-  // Torso
-  Hips: "hips",
-  Spine: "spine",
-  Spine01: "chest",
-  Spine02: "upperChest",
-  neck: "neck",
-  Head: "head",
-  // Left Arm
-  LeftShoulder: "leftShoulder",
-  LeftArm: "leftUpperArm",
-  LeftForeArm: "leftLowerArm",
-  LeftHand: "leftHand",
-  // Right Arm
-  RightShoulder: "rightShoulder",
-  RightArm: "rightUpperArm",
-  RightForeArm: "rightLowerArm",
-  RightHand: "rightHand",
-  // Left Leg
-  LeftUpLeg: "leftUpperLeg",
-  LeftLeg: "leftLowerLeg",
-  LeftFoot: "leftFoot",
-  LeftToe: "leftToes",
-  // Right Leg
-  RightUpLeg: "rightUpperLeg",
-  RightLeg: "rightLowerLeg",
-  RightFoot: "rightFoot",
-  RightToe: "rightToes",
-};
+const MESHY_TO_VRM_BONE_MAP: Record<string, keyof typeof _VRM_HUMANOID_BONES> =
+  {
+    // Torso
+    Hips: "hips",
+    Spine: "spine",
+    Spine01: "chest",
+    Spine02: "upperChest",
+    neck: "neck",
+    Head: "head",
+    // Left Arm
+    LeftShoulder: "leftShoulder",
+    LeftArm: "leftUpperArm",
+    LeftForeArm: "leftLowerArm",
+    LeftHand: "leftHand",
+    // Right Arm
+    RightShoulder: "rightShoulder",
+    RightArm: "rightUpperArm",
+    RightForeArm: "rightLowerArm",
+    RightHand: "rightHand",
+    // Left Leg
+    LeftUpLeg: "leftUpperLeg",
+    LeftLeg: "leftLowerLeg",
+    LeftFoot: "leftFoot",
+    LeftToe: "leftToes",
+    // Right Leg
+    RightUpLeg: "rightUpperLeg",
+    RightLeg: "rightLowerLeg",
+    RightFoot: "rightFoot",
+    RightToe: "rightToes",
+  };
 
 export interface VRMConversionOptions {
   avatarName?: string;
@@ -159,6 +160,19 @@ export class VRMConverter {
   private boneMappings = new Map<string, string>();
   private warnings: string[] = [];
   private coordinateSystemFixed = false;
+
+  /**
+   * Helper to find the Armature object in the scene
+   */
+  private findArmature(): THREE.Object3D | null {
+    let armature: THREE.Object3D | null = null;
+    this.scene.traverse((obj) => {
+      if (obj.name === "Armature" && obj !== this.skinnedMesh) {
+        armature = obj;
+      }
+    });
+    return armature;
+  }
 
   /**
    * Convert Meshy GLB to VRM format
@@ -275,12 +289,7 @@ export class VRMConverter {
 
     // CRITICAL FIX: Find and bake out the Armature parent scale FIRST
     // Meshy models have an Armature with scale 0.01 that needs to be baked
-    let armature: THREE.Object3D | null = null;
-    this.scene.traverse((obj) => {
-      if (obj.name === "Armature" && obj !== this.skinnedMesh) {
-        armature = obj;
-      }
-    });
+    const armature = this.findArmature();
 
     if (armature && armature.parent) {
       const armatureScale = armature.scale.x; // Assume uniform scale
@@ -930,7 +939,7 @@ export class VRMConverter {
     let convertedCount = 0;
 
     if (gltfJson.nodes) {
-      gltfJson.nodes.forEach((node: any, index: number) => {
+      gltfJson.nodes.forEach((node: any) => {
         if (node.matrix) {
           matrixCount++;
 

@@ -29,7 +29,7 @@ import {
  * Create an ElizaOS agent record for a character
  * This allows the character to appear in the dashboard and be managed as an agent
  */
-async function createElizaOSAgent(
+async function _createElizaOSAgent(
   characterId: string,
   accountId: string,
   name: string,
@@ -383,13 +383,22 @@ export async function handleEnterWorld(
   sendFn: (name: string, data: unknown, ignoreSocketId?: string) => void,
   sendToFn: (socketId: string, name: string, data: unknown) => void,
 ): Promise<void> {
+  const payload = (data as { characterId?: string }) || {};
+  const characterId = payload.characterId || null;
+
+  console.log("[PlayerLoading] enterWorld received", {
+    socketId: socket.id,
+    accountId: socket.accountId,
+    characterId,
+    hasExistingPlayer: !!socket.player,
+  });
+
   // Spawn the entity now, preserving legacy spawn shape
   if (socket.player) {
+    console.log("[PlayerLoading] enterWorld skipped - player already exists");
     return; // Already spawned
   }
   const accountId = socket.accountId || undefined;
-  const payload = (data as { characterId?: string }) || {};
-  const characterId = payload.characterId || null;
 
   // Set socket.characterId IMMEDIATELY for synchronous duplicate detection
   // This must happen BEFORE any async operations (DB queries, entity creation)
@@ -726,12 +735,10 @@ export async function handleEnterWorld(
       // CRITICAL: Send all existing entities (mobs, items, NPCs) to new client
       // These entities were spawned before this player connected
       if (world.entities?.items) {
-        let entityCount = 0;
         for (const [entityId, entity] of world.entities.items.entries()) {
           // Skip the player we just added
           if (entityId !== socket.player.id) {
             sendToFn(socket.id, "entityAdded", entity.serialize());
-            entityCount++;
           }
         }
       }

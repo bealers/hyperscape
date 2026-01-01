@@ -33,7 +33,6 @@ export class BankInteractionHandler extends BaseInteractionHandler {
     actions.push({
       id: "use-bank",
       label: "Use Bank",
-      icon: "🏦",
       enabled: true,
       priority: 1,
       handler: () => this.openBank(target),

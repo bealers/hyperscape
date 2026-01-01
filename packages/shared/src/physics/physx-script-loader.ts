@@ -31,9 +31,9 @@ export async function loadPhysXScript(
     // Load from CDN (always absolute URL to avoid Vite conflicts)
     const windowWithCdn = window as Window & { __CDN_URL?: string };
     const cdnUrl = windowWithCdn.__CDN_URL || "http://localhost:8080";
-    // Add cache-busting parameter to force browser to reload correct UMD version
-    const cacheBust = Date.now();
-    const scriptUrl = `${cdnUrl}/web/physx-js-webidl.js?v=${cacheBust}`;
+    // Use static version for cache key - only change this when PhysX binary is updated
+    // This allows browser caching between page loads while still allowing forced refresh when needed
+    const scriptUrl = `${cdnUrl}/web/physx-js-webidl.js?v=1.0.0`;
 
     script.src = scriptUrl;
     script.async = true;

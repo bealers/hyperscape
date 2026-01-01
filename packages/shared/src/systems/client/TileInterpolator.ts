@@ -124,11 +124,13 @@ export class TileInterpolator {
   private entityStates: Map<string, EntityMovementState> = new Map();
   private debugMode = false;
 
-  // Reusable vectors
+  // Reusable vectors - pre-allocated to avoid per-frame allocations
   private _tempDir = new THREE.Vector3();
   private _tempQuat = new THREE.Quaternion();
   // Y-axis for yaw rotation
   private _up = new THREE.Vector3(0, 1, 0);
+  // Pre-allocated Vector3 for tile transitions in update()
+  private _nextPos = new THREE.Vector3();
 
   /**
    * Calculate Chebyshev distance between two tiles (max of dx, dz)
@@ -865,14 +867,11 @@ export class TileInterpolator {
             // Calculate rotation to face next tile (only update if distance is sufficient)
             const nextTile = state.fullPath[state.targetTileIndex];
             const nextWorld = tileToWorld(nextTile);
-            const nextPos = new THREE.Vector3(
-              nextWorld.x,
-              state.visualPosition.y,
-              nextWorld.z,
-            );
+            // Use pre-allocated Vector3 to avoid per-frame allocations
+            this._nextPos.set(nextWorld.x, state.visualPosition.y, nextWorld.z);
             const nextRotation = this.calculateFacingRotation(
               state.visualPosition,
-              nextPos,
+              this._nextPos,
             );
             if (nextRotation) {
               // Only update rotation if direction changed significantly (>~16°)
@@ -1025,6 +1024,58 @@ export class TileInterpolator {
    */
   removeEntity(entityId: string): void {
     this.entityStates.delete(entityId);
+  }
+
+  /**
+   * Set combat rotation for an entity (AAA Single Source of Truth)
+   *
+   * When combat rotation arrives via entityModified, it should be routed here
+   * so TileInterpolator maintains ownership of all rotation. This prevents
+   * race conditions where multiple systems try to set rotation.
+   *
+   * Combat rotation is applied immediately when:
+   * 1. Entity has TileInterpolator state
+   * 2. Entity is NOT currently moving (standing still in combat)
+   *
+   * When moving, movement direction takes priority (OSRS-accurate behavior).
+   *
+   * @param entityId - Entity to update
+   * @param quaternion - Combat rotation from server [x, y, z, w]
+   * @returns true if rotation was applied, false if entity is moving or has no state
+   */
+  setCombatRotation(entityId: string, quaternion: number[]): boolean {
+    const state = this.entityStates.get(entityId);
+    if (!state) {
+      return false; // No state - caller should handle rotation directly
+    }
+
+    // Only apply combat rotation when NOT moving
+    // When moving, movement direction rotation takes priority (OSRS-accurate)
+    // CRITICAL: Must match update()'s "finished moving" condition:
+    //   fullPath.length === 0 || targetTileIndex >= fullPath.length
+    // The old check `fullPath.length > 0` was wrong because path isn't cleared after completion
+    const isActivelyMoving =
+      state.fullPath.length > 0 &&
+      state.targetTileIndex < state.fullPath.length;
+    if (isActivelyMoving) {
+      return false; // Moving - ignore combat rotation, movement direction wins
+    }
+
+    // Apply combat rotation to state - TileInterpolator.update() will apply to entity.base
+    state.quaternion.set(
+      quaternion[0],
+      quaternion[1],
+      quaternion[2],
+      quaternion[3],
+    );
+    state.targetQuaternion.set(
+      quaternion[0],
+      quaternion[1],
+      quaternion[2],
+      quaternion[3],
+    );
+
+    return true; // Rotation accepted
   }
 
   /**

@@ -52,7 +52,6 @@ import {
   World,
   EventType,
   CombatSystem,
-  LootSystem,
   ResourceSystem,
   worldToTile,
   tilesWithinMeleeRange,
@@ -87,6 +86,7 @@ import { InteractionSessionManager } from "./InteractionSessionManager";
 import { handleChatAdded } from "./handlers/chat";
 import {
   handleAttackMob,
+  handleAttackPlayer,
   handleChangeAttackStyle,
   handleSetAutoRetaliate,
 } from "./handlers/combat";
@@ -136,6 +136,8 @@ import {
   handleDialogueClose,
 } from "./handlers/dialogue";
 import { PendingAttackManager } from "./PendingAttackManager";
+import { FollowManager } from "./FollowManager";
+import { handleFollowPlayer } from "./handlers/player";
 
 const defaultSpawn = '{ "position": [0, 50, 0], "quaternion": [0, 0, 0, 1] }';
 
@@ -201,6 +203,7 @@ export class ServerNetwork extends System implements NetworkWithSocket {
   private tileMovementManager!: TileMovementManager;
   private mobTileMovementManager!: MobTileMovementManager;
   private pendingAttackManager!: PendingAttackManager;
+  private followManager!: FollowManager;
   private actionQueue!: ActionQueue;
   private tickSystem!: TickSystem;
   private socketManager!: SocketManager;
@@ -338,6 +341,19 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       this.pendingAttackManager.processTick(tickNumber);
     }, TickPriority.MOVEMENT); // Same priority as movement, runs after player moves
 
+    // Follow manager - server-authoritative tracking of players following other players
+    // OSRS-style: follower walks behind leader, re-paths when leader moves
+    this.followManager = new FollowManager(
+      this.world,
+      this.tileMovementManager,
+    );
+
+    // Register follow processing (same priority as movement)
+    // Pass tick number for OSRS-accurate 1-tick delay tracking
+    this.tickSystem.onTick((tickNumber) => {
+      this.followManager.processTick(tickNumber);
+    }, TickPriority.MOVEMENT);
+
     // Register combat system to process on each tick (after movement, before AI)
     // This is OSRS-accurate: combat runs on the game tick, not per-frame
     this.tickSystem.onTick((tickNumber) => {
@@ -354,7 +370,7 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     this.tickSystem.onTick((tickNumber) => {
       const playerDeathSystem = this.world.getSystem(
         "player-death",
-      ) as unknown as PlayerDeathSystemWithTick | null;
+      ) as unknown as PlayerDeathSystemWithTick | undefined;
       if (
         playerDeathSystem &&
         typeof playerDeathSystem.processTick === "function"
@@ -366,15 +382,11 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     // Register loot system to process on each tick (after combat)
     // Handles mob corpse despawn (OSRS-accurate tick-based timing)
     this.tickSystem.onTick((tickNumber) => {
-      const lootSystem = this.world.getSystem("loot") as LootSystem | null;
-      if (
-        lootSystem &&
-        typeof (lootSystem as unknown as PlayerDeathSystemWithTick)
-          .processTick === "function"
-      ) {
-        (lootSystem as unknown as PlayerDeathSystemWithTick).processTick(
-          tickNumber,
-        );
+      const lootSystem = this.world.getSystem("loot") as unknown as
+        | PlayerDeathSystemWithTick
+        | undefined;
+      if (lootSystem && typeof lootSystem.processTick === "function") {
+        lootSystem.processTick(tickNumber);
       }
     }, TickPriority.COMBAT); // Same priority as combat (after movement)
 
@@ -408,25 +420,23 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     // Sync tile position when player respawns at spawn point
     // CRITICAL: Without this, TileMovementManager has stale tile position from death location
     // and paths would be calculated from wrong starting tile
-    this.world.on(
-      EventType.PLAYER_RESPAWNED,
-      (event: {
+    this.world.on(EventType.PLAYER_RESPAWNED, (eventData) => {
+      const event = eventData as {
         playerId: string;
         spawnPosition: { x: number; y: number; z: number };
-      }) => {
-        if (event.playerId && event.spawnPosition) {
-          this.tileMovementManager.syncPlayerPosition(
-            event.playerId,
-            event.spawnPosition,
-          );
-          // Also clear any pending actions from before death
-          this.actionQueue.cleanup(event.playerId);
-          console.log(
-            `[ServerNetwork] Synced tile position for respawned player ${event.playerId} at (${event.spawnPosition.x}, ${event.spawnPosition.z})`,
-          );
-        }
-      },
-    );
+      };
+      if (event.playerId && event.spawnPosition) {
+        this.tileMovementManager.syncPlayerPosition(
+          event.playerId,
+          event.spawnPosition,
+        );
+        // Also clear any pending actions from before death
+        this.actionQueue.cleanup(event.playerId);
+        console.log(
+          `[ServerNetwork] Synced tile position for respawned player ${event.playerId} at (${event.spawnPosition.x}, ${event.spawnPosition.z})`,
+        );
+      }
+    });
 
     // Handle mob tile movement requests from MobEntity AI
     this.world.on(EventType.MOB_NPC_MOVE_REQUEST, (event) => {
@@ -540,10 +550,11 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       this.world as { interactionSessionManager?: InteractionSessionManager }
     ).interactionSessionManager = this.interactionSessionManager;
 
-    // Clean up interaction sessions and pending attacks when player disconnects
+    // Clean up interaction sessions, pending attacks, and follows when player disconnects
     this.world.on(EventType.PLAYER_LEFT, (event: { playerId: string }) => {
       this.interactionSessionManager.onPlayerDisconnect(event.playerId);
       this.pendingAttackManager.onPlayerDisconnect(event.playerId);
+      this.followManager.onPlayerDisconnect(event.playerId);
     });
 
     // Initialization manager
@@ -573,8 +584,7 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       handleCharacterSelected(
         socket,
         data,
-        this.world,
-        this.broadcastManager.sendTo.bind(this.broadcastManager),
+        this.broadcastManager.sendToSocket.bind(this.broadcastManager),
       );
 
     this.handlers["enterWorld"] = (socket, data) =>
@@ -582,8 +592,9 @@ export class ServerNetwork extends System implements NetworkWithSocket {
         socket,
         data,
         this.world,
-        this.db,
+        this.spawn,
         this.broadcastManager.sendToAll.bind(this.broadcastManager),
+        this.broadcastManager.sendToSocket.bind(this.broadcastManager),
       );
 
     this.handlers["onChatAdded"] = (socket, data) =>
@@ -627,9 +638,10 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     // Route movement and combat through action queue for OSRS-style tick processing
     // Actions are queued and processed on tick boundaries, not immediately
     this.handlers["onMoveRequest"] = (socket, data) => {
-      // Cancel any pending attack when player moves elsewhere (OSRS behavior)
+      // Cancel any pending attack or follow when player moves elsewhere (OSRS behavior)
       if (socket.player) {
         this.pendingAttackManager.cancelPendingAttack(socket.player.id);
+        this.followManager.stopFollowing(socket.player.id);
       }
       this.actionQueue.queueMovement(socket, data);
     };
@@ -642,9 +654,10 @@ export class ServerNetwork extends System implements NetworkWithSocket {
         runMode?: boolean;
       };
       if (payload.type === "click" && Array.isArray(payload.target)) {
-        // Cancel any pending attack when player moves elsewhere (OSRS behavior)
+        // Cancel any pending attack or follow when player moves elsewhere (OSRS behavior)
         if (socket.player) {
           this.pendingAttackManager.cancelPendingAttack(socket.player.id);
+          this.followManager.stopFollowing(socket.player.id);
         }
         this.actionQueue.queueMovement(socket, {
           target: payload.target,
@@ -706,6 +719,94 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       }
     };
 
+    // PvP - attack another player (only in PvP zones)
+    this.handlers["onAttackPlayer"] = (socket, data) => {
+      const playerEntity = socket.player;
+      if (!playerEntity) return;
+
+      const payload = data as { targetPlayerId?: string };
+      const targetPlayerId = payload.targetPlayerId;
+      if (!targetPlayerId) return;
+
+      // Cancel any existing combat and pending attacks when switching targets
+      this.world.emit(EventType.COMBAT_STOP_ATTACK, {
+        attackerId: playerEntity.id,
+      });
+      this.pendingAttackManager.cancelPendingAttack(playerEntity.id);
+
+      // Get target player entity
+      const targetPlayer = this.world.entities?.players?.get(
+        targetPlayerId,
+      ) as {
+        position?: { x: number; y: number; z: number };
+      } | null;
+
+      if (!targetPlayer || !targetPlayer.position) return;
+
+      // Get player's weapon melee range from equipment system
+      const meleeRange = this.getPlayerWeaponRange(playerEntity.id);
+
+      // OSRS-accurate melee range check (cardinal-only for range 1)
+      const playerPos = playerEntity.position;
+      const playerTile = worldToTile(playerPos.x, playerPos.z);
+      const targetTile = worldToTile(
+        targetPlayer.position.x,
+        targetPlayer.position.z,
+      );
+
+      if (tilesWithinMeleeRange(playerTile, targetTile, meleeRange)) {
+        // In melee range - validate zones and start combat immediately
+        handleAttackPlayer(socket, data, this.world);
+      } else {
+        // Not in range - validate zones first, then queue pending attack
+        // Zone validation happens in handleAttackPlayer, so we do basic checks here
+        const zoneSystem = this.world.getSystem("zone-detection") as {
+          isPvPEnabled?: (pos: { x: number; z: number }) => boolean;
+        } | null;
+
+        if (zoneSystem?.isPvPEnabled) {
+          const attackerPos = playerEntity.position;
+          if (
+            !attackerPos ||
+            !zoneSystem.isPvPEnabled({ x: attackerPos.x, z: attackerPos.z })
+          ) {
+            // Attacker not in PvP zone - silently ignore
+            return;
+          }
+          if (
+            !zoneSystem.isPvPEnabled({
+              x: targetPlayer.position.x,
+              z: targetPlayer.position.z,
+            })
+          ) {
+            // Target not in PvP zone - silently ignore
+            return;
+          }
+        }
+
+        // Queue pending attack - will move toward target and attack when in range
+        this.pendingAttackManager.queuePendingAttack(
+          playerEntity.id,
+          targetPlayerId,
+          this.world.currentTick,
+          meleeRange,
+          "player", // PvP target type
+        );
+      }
+    };
+
+    // Follow another player (OSRS-style)
+    this.handlers["onFollowPlayer"] = (socket, data) => {
+      const playerEntity = socket.player;
+      if (!playerEntity) return;
+
+      // Cancel any pending attack when starting to follow
+      this.pendingAttackManager.cancelPendingAttack(playerEntity.id);
+
+      // Validate and start following
+      handleFollowPlayer(socket, data, this.world, this.followManager);
+    };
+
     this.handlers["onChangeAttackStyle"] = (socket, data) =>
       handleChangeAttackStyle(socket, data, this.world);
 
@@ -728,7 +829,7 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       handleMoveItem(socket, data, this.world);
 
     // Death/respawn handlers
-    this.handlers["onRequestRespawn"] = (socket, data) => {
+    this.handlers["onRequestRespawn"] = (socket, _data) => {
       const playerEntity = socket.player;
       if (playerEntity) {
         console.log(
@@ -779,6 +880,13 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       if (!socket.player) {
         console.warn(
           "[PlayerLoading] clientReady received but no player on socket",
+          {
+            socketId: socket.id,
+            accountId: socket.accountId,
+            characterId: socket.characterId,
+            selectedCharacterId: socket.selectedCharacterId,
+            isRegistered: this.sockets.has(socket.id),
+          },
         );
         return;
       }
@@ -875,7 +983,11 @@ export class ServerNetwork extends System implements NetworkWithSocket {
       );
 
     this.handlers["onBankDepositAll"] = (socket, data) =>
-      handleBankDepositAll(socket, data, this.world);
+      handleBankDepositAll(
+        socket,
+        data as { targetTabIndex?: number },
+        this.world,
+      );
 
     this.handlers["onBankDepositCoins"] = (socket, data) =>
       handleBankDepositCoins(socket, data as { amount: number }, this.world);
@@ -889,7 +1001,12 @@ export class ServerNetwork extends System implements NetworkWithSocket {
     this.handlers["onBankMove"] = (socket, data) =>
       handleBankMove(
         socket,
-        data as { fromSlot: number; toSlot: number; mode: "swap" | "insert" },
+        data as {
+          fromSlot: number;
+          toSlot: number;
+          mode: "swap" | "insert";
+          tabIndex: number;
+        },
         this.world,
       );
 

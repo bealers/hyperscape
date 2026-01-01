@@ -21,6 +21,7 @@ import {
   TILES_PER_TICK_WALK,
   TILES_PER_TICK_RUN,
   worldToTile,
+  worldToTileInto,
   tileToWorld,
   tilesEqual,
   tilesWithinMeleeRange,
@@ -51,11 +52,37 @@ export class TileMovementManager {
   private _up = new THREE.Vector3(0, 1, 0);
   private _tempQuat = new THREE.Quaternion();
 
+  /**
+   * OSRS-ACCURATE: Tick-start positions for all players
+   * Captured at the VERY START of onTick(), BEFORE any movement processing.
+   * Used by FollowManager to create the 1-tick delay effect.
+   *
+   * Key insight from OSRS: "The important part is to set the previousTile
+   * at the start (or the end) of the tick not when they actually move"
+   */
+  private tickStartTiles: Map<string, TileCoord> = new Map();
+
   // Security: Input validation and anti-cheat monitoring
   private readonly inputValidator = new MovementInputValidator();
   private readonly antiCheat = new MovementAntiCheat();
   private readonly movementRateLimiter = getTileMovementRateLimiter();
   private readonly pathfindRateLimiter = getPathfindRateLimiter();
+
+  // ============================================================================
+  // PRE-ALLOCATED BUFFERS (Zero-allocation hot path support)
+  // ============================================================================
+
+  /** Reusable tile coordinate for previous position in onTick/processPlayerTick */
+  private readonly _prevTile: TileCoord = { x: 0, z: 0 };
+
+  /** Reusable tile coordinate for target position calculations */
+  private readonly _targetTile: TileCoord = { x: 0, z: 0 };
+
+  /** Reusable tile coordinate for entity position sync */
+  private readonly _actualEntityTile: TileCoord = { x: 0, z: 0 };
+
+  /** Pre-allocated buffer for network path transmission (avoids .map() allocation) */
+  private readonly _networkPathBuffer: Array<{ x: number; z: number }> = [];
 
   constructor(
     private world: World,
@@ -159,7 +186,7 @@ export class TileMovementManager {
 
     // Handle cancellation
     if (payload.cancel) {
-      state.path = [];
+      state.path.length = 0; // Zero-allocation clear
       state.pathIndex = 0;
 
       // RS3-style: Clear movement flag so combat can resume
@@ -260,10 +287,21 @@ export class TileMovementManager {
       // destinationTile: final target (for verification)
       // moveSeq: packet ordering to ignore stale packets
       // emote: bundled animation (OSRS-style, no separate packet)
+
+      // Zero-allocation: copy path to pre-allocated network buffer
+      this._networkPathBuffer.length = path.length;
+      for (let i = 0; i < path.length; i++) {
+        if (!this._networkPathBuffer[i]) {
+          this._networkPathBuffer[i] = { x: 0, z: 0 };
+        }
+        this._networkPathBuffer[i].x = path[i].x;
+        this._networkPathBuffer[i].z = path[i].z;
+      }
+
       this.sendFn("tileMovementStart", {
         id: playerId,
         startTile: { x: state.currentTile.x, z: state.currentTile.z },
-        path: path.map((t) => ({ x: t.x, z: t.z })),
+        path: this._networkPathBuffer,
         running: state.isRunning,
         destinationTile: { x: payload.targetTile.x, z: payload.targetTile.z },
         moveSeq: state.moveSeq,
@@ -303,6 +341,22 @@ export class TileMovementManager {
    * Called every server tick (600ms) - advance all players along their paths
    */
   onTick(tickNumber: number): void {
+    // OSRS-ACCURATE: Capture tick-start positions for ALL players FIRST
+    // This happens BEFORE any movement, so FollowManager can see where
+    // players were at the START of this tick (creating 1-tick delay effect)
+    this.tickStartTiles.clear();
+    for (const [playerId, state] of this.playerStates) {
+      this.tickStartTiles.set(playerId, { ...state.currentTile });
+    }
+
+    // Initialize previousTile for newly spawned players only
+    // Movement processing will update it to "last stepped off" tile
+    for (const [_playerId, state] of this.playerStates) {
+      if (state.previousTile === null) {
+        state.previousTile = { ...state.currentTile };
+      }
+    }
+
     // Decay anti-cheat scores every 100 ticks (~60 seconds)
     // This rewards good behavior over time
     if (tickNumber % 100 === 0) {
@@ -323,8 +377,9 @@ export class TileMovementManager {
         continue;
       }
 
-      // Store previous position for rotation calculation
-      const prevTile = { ...state.currentTile };
+      // Store previous position for rotation calculation (zero allocation)
+      this._prevTile.x = state.currentTile.x;
+      this._prevTile.z = state.currentTile.z;
 
       // Move 1 tile (walk) or 2 tiles (run) per tick
       const tilesToMove = state.isRunning
@@ -334,8 +389,15 @@ export class TileMovementManager {
       for (let i = 0; i < tilesToMove; i++) {
         if (state.pathIndex >= state.path.length) break;
 
+        // OSRS-ACCURATE: Capture the tile we're stepping OFF of
+        // This ensures previousTile is always 1 tile behind currentTile
+        // Used by FollowManager for 1-tile trailing effect
+        state.previousTile = { ...state.currentTile };
+
         const nextTile = state.path[state.pathIndex];
-        state.currentTile = { ...nextTile };
+        // Copy values instead of spread (zero allocation)
+        state.currentTile.x = nextTile.x;
+        state.currentTile.z = nextTile.z;
         state.pathIndex++;
       }
 
@@ -355,7 +417,7 @@ export class TileMovementManager {
       entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
 
       // Calculate rotation based on movement direction (from previous to current tile)
-      const prevWorld = tileToWorld(prevTile);
+      const prevWorld = tileToWorld(this._prevTile);
       const dx = worldPos.x - prevWorld.x;
       const dz = worldPos.z - prevWorld.z;
 
@@ -401,7 +463,7 @@ export class TileMovementManager {
         });
 
         // Clear path
-        state.path = [];
+        state.path.length = 0; // Zero-allocation clear
         state.pathIndex = 0;
 
         // RS3-style: Clear movement flag so combat can resume
@@ -426,6 +488,8 @@ export class TileMovementManager {
    * OSRS-ACCURATE: Called by GameTickProcessor during player phase
    * This processes just one player's movement instead of all players.
    *
+   * Zero-allocation: Uses pre-allocated tile buffers.
+   *
    * @param playerId - The player to process movement for
    * @param tickNumber - Current tick number
    */
@@ -446,8 +510,9 @@ export class TileMovementManager {
 
     const terrain = this.getTerrain();
 
-    // Store previous position for rotation calculation
-    const prevTile = { ...state.currentTile };
+    // Store previous position for rotation calculation (zero allocation)
+    this._prevTile.x = state.currentTile.x;
+    this._prevTile.z = state.currentTile.z;
 
     // Move 1 tile (walk) or 2 tiles (run) per tick
     const tilesToMove = state.isRunning
@@ -457,8 +522,15 @@ export class TileMovementManager {
     for (let i = 0; i < tilesToMove; i++) {
       if (state.pathIndex >= state.path.length) break;
 
+      // OSRS-ACCURATE: Capture the tile we're stepping OFF of
+      // This ensures previousTile is always 1 tile behind currentTile
+      // Used by FollowManager for 1-tile trailing effect
+      state.previousTile = { ...state.currentTile };
+
       const nextTile = state.path[state.pathIndex];
-      state.currentTile = { ...nextTile };
+      // Copy values instead of spread (zero allocation)
+      state.currentTile.x = nextTile.x;
+      state.currentTile.z = nextTile.z;
       state.pathIndex++;
     }
 
@@ -477,8 +549,8 @@ export class TileMovementManager {
     entity.position.set(worldPos.x, worldPos.y, worldPos.z);
     entity.data.position = [worldPos.x, worldPos.y, worldPos.z];
 
-    // Calculate rotation based on movement direction
-    const prevWorld = tileToWorld(prevTile);
+    // Calculate rotation based on movement direction (zero allocation - use pre-allocated tile)
+    const prevWorld = tileToWorld(this._prevTile);
     const dx = worldPos.x - prevWorld.x;
     const dz = worldPos.z - prevWorld.z;
 
@@ -519,7 +591,7 @@ export class TileMovementManager {
       });
 
       // Clear path
-      state.path = [];
+      state.path.length = 0; // Zero-allocation clear
       state.pathIndex = 0;
 
       // RS3-style: Clear movement flag so combat can resume
@@ -575,7 +647,7 @@ export class TileMovementManager {
     if (state) {
       // Clear any pending movement and update tile
       state.currentTile = newTile;
-      state.path = [];
+      state.path.length = 0; // Zero-allocation clear
       state.pathIndex = 0;
       state.moveSeq = (state.moveSeq || 0) + 1; // Increment to invalidate stale client packets
 
@@ -604,6 +676,68 @@ export class TileMovementManager {
   getCurrentTile(playerId: string): TileCoord | null {
     const state = this.playerStates.get(playerId);
     return state ? state.currentTile : null;
+  }
+
+  /**
+   * Get the previous tile for a player (where they were at START of tick)
+   *
+   * OSRS-ACCURATE: Used by FollowManager for follow mechanic.
+   * Followers path to target's PREVIOUS tile, creating the
+   * characteristic 1-tick trailing effect.
+   *
+   * Edge cases:
+   * - If no previous tile (just spawned/teleported): use tile WEST of current
+   * - This matches OSRS behavior per private server community research
+   *
+   * @see https://rune-server.org/threads/help-with-player-dancing-spinning-when-following-each-other.706121/
+   */
+  getPreviousTile(playerId: string): TileCoord {
+    const state = this.playerStates.get(playerId);
+
+    // Use captured previous tile if available
+    if (state?.previousTile) {
+      return state.previousTile;
+    }
+
+    // Fallback: If no previous tile (just spawned/teleported), use tile WEST of current
+    // This matches OSRS behavior per private server research
+    if (state) {
+      return {
+        x: state.currentTile.x - 1,
+        z: state.currentTile.z,
+      };
+    }
+
+    // No state at all - try to get from entity position
+    const entity = this.world.entities.get(playerId);
+    if (entity?.position) {
+      const currentTile = worldToTile(entity.position.x, entity.position.z);
+      return {
+        x: currentTile.x - 1,
+        z: currentTile.z,
+      };
+    }
+
+    // Ultimate fallback (should never happen)
+    return { x: 0, z: 0 };
+  }
+
+  /**
+   * Get the tick-start tile for a player
+   *
+   * OSRS-ACCURATE: Returns where the player was at the VERY START of the
+   * current tick, BEFORE any movement was processed. This is different from
+   * previousTile (which is the last tile stepped off during movement).
+   *
+   * Used by FollowManager to create the authentic 1-tick delay effect:
+   * - Tick N: Target is at tile A (tick-start), then moves to tile B
+   * - Tick N: Follower sees target's tick-start position (A)
+   * - Tick N+1: Follower moves toward A, while target is now at B
+   *
+   * This creates the characteristic "always one step behind" feel.
+   */
+  getTickStartTile(playerId: string): TileCoord | null {
+    return this.tickStartTiles.get(playerId) ?? null;
   }
 
   /**
@@ -647,14 +781,19 @@ export class TileMovementManager {
     const state = this.getOrCreateState(playerId);
 
     // CRITICAL: Sync state.currentTile with entity's actual position
-    // The state might be stale if the player has been moving
-    const actualEntityTile = worldToTile(entity.position.x, entity.position.z);
-    if (!tilesEqual(state.currentTile, actualEntityTile)) {
-      state.currentTile = actualEntityTile;
+    // The state might be stale if the player has been moving (zero allocation)
+    worldToTileInto(
+      entity.position.x,
+      entity.position.z,
+      this._actualEntityTile,
+    );
+    if (!tilesEqual(state.currentTile, this._actualEntityTile)) {
+      state.currentTile.x = this._actualEntityTile.x;
+      state.currentTile.z = this._actualEntityTile.z;
     }
 
-    // Convert target to tile
-    const targetTile = worldToTile(targetPosition.x, targetPosition.z);
+    // Convert target to tile (zero allocation)
+    worldToTileInto(targetPosition.x, targetPosition.z, this._targetTile);
 
     // Determine destination tile based on combat or non-combat movement
     let destinationTile: TileCoord;
@@ -662,13 +801,15 @@ export class TileMovementManager {
     if (meleeRange > 0) {
       // COMBAT MOVEMENT: Use OSRS-accurate melee positioning
       // Check if already in valid melee range (cardinal-only for range 1)
-      if (tilesWithinMeleeRange(state.currentTile, targetTile, meleeRange)) {
+      if (
+        tilesWithinMeleeRange(state.currentTile, this._targetTile, meleeRange)
+      ) {
         return; // Already in position, no movement needed
       }
 
       // Find best melee tile (cardinal-only for range 1, diagonal allowed for range 2+)
       const meleeTile = getBestMeleeTile(
-        targetTile,
+        this._targetTile,
         state.currentTile,
         meleeRange,
         (tile) => this.isTileWalkable(tile),
@@ -681,10 +822,10 @@ export class TileMovementManager {
       destinationTile = meleeTile;
     } else {
       // NON-COMBAT MOVEMENT: Go directly to target tile
-      if (tilesEqual(targetTile, state.currentTile)) {
+      if (tilesEqual(this._targetTile, state.currentTile)) {
         return; // Already at target
       }
-      destinationTile = targetTile;
+      destinationTile = this._targetTile;
     }
 
     // Calculate BFS path to the destination tile (NOT to target, then truncate!)
@@ -734,10 +875,21 @@ export class TileMovementManager {
 
     // Send movement start packet
     const actualDestination = path[path.length - 1];
+
+    // Zero-allocation: copy path to pre-allocated network buffer
+    this._networkPathBuffer.length = path.length;
+    for (let i = 0; i < path.length; i++) {
+      if (!this._networkPathBuffer[i]) {
+        this._networkPathBuffer[i] = { x: 0, z: 0 };
+      }
+      this._networkPathBuffer[i].x = path[i].x;
+      this._networkPathBuffer[i].z = path[i].z;
+    }
+
     this.sendFn("tileMovementStart", {
       id: playerId,
       startTile: { x: state.currentTile.x, z: state.currentTile.z },
-      path: path.map((t) => ({ x: t.x, z: t.z })),
+      path: this._networkPathBuffer,
       running: state.isRunning,
       destinationTile: { x: actualDestination.x, z: actualDestination.z },
       moveSeq: state.moveSeq,

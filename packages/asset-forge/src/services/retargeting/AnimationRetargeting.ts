@@ -11,8 +11,6 @@ import * as THREE from "three";
 const q1 = new THREE.Quaternion();
 const restRotationInverse = new THREE.Quaternion();
 const parentRestWorldRotation = new THREE.Quaternion();
-const v1 = new THREE.Vector3();
-const v2 = new THREE.Vector3();
 
 /**
  * Retarget Mixamo animation to VRM skeleton
@@ -67,13 +65,11 @@ export function retargetAnimation(
   );
 
   // Filter tracks - keep only root position and quaternions
-  let haveRoot = false;
   clip.tracks = clip.tracks.filter((track) => {
     if (track instanceof THREE.VectorKeyframeTrack) {
       const [name, type] = track.name.split(".");
       if (type !== "position") return false;
       if (name === "Root") {
-        haveRoot = true;
         return true;
       }
       if (name === "mixamorigHips") {
@@ -205,7 +201,7 @@ export function retargetAnimation(
     firstQuatTrack &&
     firstQuatTrack instanceof THREE.QuaternionKeyframeTrack
   ) {
-    const firstValues = firstQuatTrack.values.slice(0, 4);
+    const firstValues = Array.from(firstQuatTrack.values.slice(0, 4));
     console.log(
       "[AnimationRetargeting] Sample quaternion values (first keyframe):",
     );

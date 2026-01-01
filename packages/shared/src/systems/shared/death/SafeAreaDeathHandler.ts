@@ -19,7 +19,7 @@ import type { InventoryItem } from "../../../types/core/core";
 import type { GroundItemSystem } from "../economy/GroundItemSystem";
 import type { DeathStateManager } from "./DeathStateManager";
 import type { EntityManager } from "..";
-import { ZoneType } from "../../../types/death";
+import { ZoneType, type TransactionContext } from "../../../types/death";
 import { EntityType, InteractionType } from "../../../types/entities";
 import type { HeadstoneEntityConfig } from "../../../types/entities";
 import { COMBAT_CONSTANTS } from "../../../constants/CombatConstants";
@@ -63,7 +63,7 @@ export class SafeAreaDeathHandler {
     position: { x: number; y: number; z: number },
     items: InventoryItem[],
     killedBy: string,
-    tx?: any, // Transaction context for atomic death processing
+    tx?: TransactionContext,
   ): Promise<void> {
     // CRITICAL: Server authority check - prevent client from spawning fake gravestones
     if (!this.world.isServer) {
@@ -153,6 +153,13 @@ export class SafeAreaDeathHandler {
       return "";
     }
 
+    // Get the player entity to retrieve their actual display name
+    const playerEntity = this.world.entities.players.get(playerId) as
+      | { playerName?: string; name?: string }
+      | undefined;
+    const playerName =
+      playerEntity?.playerName || playerEntity?.name || playerId;
+
     const gravestoneId = `gravestone_${playerId}_${Date.now()}`;
     // Calculate despawnTime in ms for entity config (backwards compatible)
     const despawnTime =
@@ -161,7 +168,7 @@ export class SafeAreaDeathHandler {
     // Create gravestone entity
     const gravestoneConfig: HeadstoneEntityConfig = {
       id: gravestoneId,
-      name: `${playerId}'s Gravestone`,
+      name: `${playerName}'s Gravestone`,
       type: EntityType.HEADSTONE,
       position: position,
       rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -170,11 +177,11 @@ export class SafeAreaDeathHandler {
       interactable: true,
       interactionType: InteractionType.LOOT,
       interactionDistance: 2,
-      description: `Gravestone of ${playerId} (killed by ${killedBy})`,
+      description: `Gravestone of ${playerName} (killed by ${killedBy})`,
       model: "models/environment/gravestone.glb",
       headstoneData: {
         playerId: playerId,
-        playerName: playerId, // TODO: Get actual player name
+        playerName: playerName,
         deathTime: Date.now(),
         deathMessage: `Slain by ${killedBy}`,
         position: position,

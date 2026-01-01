@@ -8,8 +8,10 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mount world assets directly into nginx html directory
+      # Mount root assets directory - changes are live-updated
       - ${HYPERSCAPE_ASSETS_DIR:-./world/assets}:/usr/share/nginx/html/assets:ro
+    environment:
+      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/conf.d
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

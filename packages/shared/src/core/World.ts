@@ -43,7 +43,6 @@ import { Physics, Physics as PhysicsSystem } from "../systems/shared";
 import { Settings, Settings as SettingsSystem } from "../systems/shared";
 import { Stage, Stage as StageSystem } from "../systems/shared";
 import { System, SystemConstructor } from "../systems/shared";
-import { XR } from "../systems/client/XR";
 import { Environment } from "../systems/shared";
 import {
   ClientAudio,
@@ -66,6 +65,8 @@ import type { ServerRuntime } from "../systems/server/ServerRuntime";
  * Allows World to reference network functionality without knowing which implementation is active.
  *
  * The actual network system (client or server) is registered by create*World() functions.
+ * ServerNetwork implements NetworkWithSocket (enqueue, onDisconnect, sockets),
+ * while ClientNetwork does not.
  */
 interface NetworkSystem extends System {
   id?: string;
@@ -75,6 +76,25 @@ interface NetworkSystem extends System {
   upload?: (file: File) => Promise<unknown>;
   onConnection?: (socket: unknown, query: unknown) => void;
   disconnect?: () => Promise<void>;
+  // NetworkWithSocket methods (server-side only, optional for client)
+  enqueue?: (socket: unknown, method: string, data: unknown) => void;
+  onDisconnect?: (socket: unknown, code?: number | string) => void;
+  sockets?: Map<string, unknown>;
+}
+
+// Type guard to check if network system implements NetworkWithSocket (reserved for future use)
+function _isNetworkWithSocket(
+  network: NetworkSystem,
+): network is NetworkSystem & {
+  enqueue: (socket: unknown, method: string, data: unknown) => void;
+  onDisconnect: (socket: unknown, code?: number | string) => void;
+  sockets: Map<string, unknown>;
+} {
+  return (
+    typeof network.enqueue === "function" &&
+    typeof network.onDisconnect === "function" &&
+    network.sockets instanceof Map
+  );
 }
 
 /**
@@ -189,7 +209,7 @@ export class World extends EventEmitter {
     on?: (event: string, callback: () => void) => void;
   };
 
-  /** Manages spatial anchors for XR and positioned objects */
+  /** Manages spatial anchors for positioned objects */
   anchors!: Anchors;
 
   /** Legacy event system (being replaced by EventBus) */
@@ -285,12 +305,20 @@ export class World extends EventEmitter {
       Record<string, { level: number; xp: number }>
     >;
     lastEquipmentByPlayerId?: Record<string, unknown>;
+    lastAttackStyleByPlayerId?: Record<
+      string,
+      {
+        currentStyle: { id: string };
+        availableStyles: unknown;
+        canChange: boolean;
+      }
+    >;
   };
 
   /** Environment system (lighting, skybox, fog, shadows) */
   environment?: Environment;
 
-  /** Graphics rendering system (WebGL/WebGPU renderer, post-processing) */
+  /** Graphics rendering system (WebGPU renderer, post-processing) */
   graphics?: ClientGraphics & {
     renderer?: {
       domElement: HTMLCanvasElement;
@@ -302,6 +330,19 @@ export class World extends EventEmitter {
     isWebGPU?: boolean;
   };
 
+  /** Dev mode performance stats (FPS counter, system timing) */
+  devStats?: {
+    toggle: () => void;
+    show: () => void;
+    hide: () => void;
+    getFps: () => number;
+    getFrameTime: () => number;
+    isVisible: () => boolean;
+    enableSystemTiming: () => void;
+    disableSystemTiming: () => void;
+    recordSystemTime: (systemName: string, timeMs: number) => void;
+  };
+
   /** Input handling system (keyboard, mouse, touch, gamepad) */
   controls?: ClientInput;
 
@@ -311,6 +352,8 @@ export class World extends EventEmitter {
     shadows?: string;
     postprocessing?: boolean;
     bloom?: boolean;
+    colorGrading?: string;
+    colorGradingIntensity?: number;
     music?: number;
     sfx?: number;
     voice?: number;
@@ -323,6 +366,8 @@ export class World extends EventEmitter {
     setShadows?: (value: string) => void;
     setPostprocessing?: (value: boolean) => void;
     setBloom?: (value: boolean) => void;
+    setColorGrading?: (value: string) => void;
+    setColorGradingIntensity?: (value: number) => void;
     setMusic?: (value: number) => void;
     setSFX?: (value: number) => void;
     setVoice?: (value: number) => void;
@@ -394,9 +439,6 @@ export class World extends EventEmitter {
     ) => Promise<unknown>;
     getAvailable?: () => string[];
   };
-
-  /** XR (VR/AR) system for immersive experiences */
-  xr?: XR;
 
   /** Terrain generation and heightmap system */
   terrain?: {
@@ -1110,7 +1152,8 @@ export class World extends EventEmitter {
    * @param delta - Fixed timestep delta (always fixedDeltaTime)
    */
   private fixedUpdate(delta: number): void {
-    for (const item of Array.from(this.hot)) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const item of this.hot) {
       if (item.fixedUpdate) {
         item.fixedUpdate(delta);
       }
@@ -1146,7 +1189,8 @@ export class World extends EventEmitter {
    * @param _alpha - Interpolation factor (unused but provided for consistency)
    */
   private update(delta: number, _alpha: number): void {
-    for (const item of Array.from(this.hot)) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const item of this.hot) {
       item.update(delta);
     }
     for (const system of this.systems) {
@@ -1170,7 +1214,8 @@ export class World extends EventEmitter {
    * @param _alpha - Interpolation factor (unused)
    */
   private lateUpdate(delta: number, _alpha: number): void {
-    for (const item of Array.from(this.hot)) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const item of this.hot) {
       if (item.lateUpdate) {
         item.lateUpdate(delta);
       }
@@ -1185,7 +1230,8 @@ export class World extends EventEmitter {
    * @param delta - Time since last frame in seconds
    */
   private postLateUpdate(delta: number): void {
-    for (const item of Array.from(this.hot)) {
+    // Iterate Set directly instead of Array.from to avoid allocation each frame
+    for (const item of this.hot) {
       if (item.postLateUpdate) {
         item.postLateUpdate(delta);
       }
@@ -1280,7 +1326,16 @@ export class World extends EventEmitter {
         const assetsUrl = this.assetsUrl.endsWith("/")
           ? this.assetsUrl
           : this.assetsUrl + "/";
-        return url.replace("asset://", assetsUrl);
+        let resolved = url.replace("asset://", assetsUrl);
+        // Add cache-busting for localhost to bypass stale browser cache
+        if (
+          typeof window !== "undefined" &&
+          resolved.startsWith("http://localhost")
+        ) {
+          const separator = resolved.includes("?") ? "&" : "?";
+          resolved = `${resolved}${separator}`;
+        }
+        return resolved;
       } else {
         console.error("resolveURL: no assetsUrl or assetsDir defined");
         return url;
@@ -1320,12 +1375,15 @@ export class World extends EventEmitter {
    * Convenience method that delegates to entities system.
    * If no ID provided, returns the local player.
    *
-   * @param playerId - Optional player ID to fetch
+   * @param playerId - Optional player ID to fetch (accepts string or PlayerID)
    * @returns Player instance or null if not found
    */
-  getPlayer(playerId?: string): Player | null {
+  getPlayer(
+    playerId?: string | import("../types/core/identifiers").PlayerID,
+  ): Player | null {
     if (playerId) {
-      return this.entities.getPlayer(playerId);
+      // PlayerID is a branded string, safe to pass as string
+      return this.entities.getPlayer(playerId as string);
     }
     return this.entities.getLocalPlayer();
   }

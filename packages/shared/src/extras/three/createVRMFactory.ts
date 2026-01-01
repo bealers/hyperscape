@@ -42,9 +42,7 @@ import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 
 import type { GLBData } from "../../types";
 import type { VRMHooks } from "../../types/systems/physics";
-
-/** Degrees to radians conversion */
-const DEG2RAD = Math.PI / 180;
+import type { VRMHumanBoneName } from "@pixiv/three-vrm";
 
 import { getTextureBytesFromMaterial } from "./getTextureBytesFromMaterial";
 import { getTrianglesFromGeometry } from "./getTrianglesFromGeometry";
@@ -52,6 +50,13 @@ import THREE from "./three";
 
 const v1 = new THREE.Vector3();
 const v2 = new THREE.Vector3();
+
+// Pre-allocated matrices for VRM instance move() to avoid per-frame allocations
+// These are used by the create() closure for each instance
+const _rotationMatrix = new THREE.Matrix4();
+const _scaleMatrix = new THREE.Matrix4();
+const _tempMatrix1 = new THREE.Matrix4();
+const _tempMatrix2 = new THREE.Matrix4();
 
 /** How often to check avatar distance for LOD (seconds) */
 const DIST_CHECK_RATE = 1;
@@ -95,11 +100,63 @@ export function createVRMFactory(
   // remove secondary
   const secondaries = glb.scene.children.filter(n => n.name === 'secondary') // prettier-ignore
   for (const node of secondaries) node.removeFromParent();
-  // enable shadows
+  // enable shadows and convert MToon materials to MeshStandardMaterial for proper lighting
   glb.scene.traverse((obj) => {
     if (obj instanceof THREE.Mesh) {
       obj.castShadow = true;
       obj.receiveShadow = true;
+
+      // Convert materials to MeshStandardMaterial for proper sun/moon/environment lighting
+      const convertMaterial = (
+        mat: THREE.Material,
+      ): THREE.MeshStandardMaterial => {
+        // Extract textures and colors from original material
+        const originalMat = mat as THREE.Material & {
+          map?: THREE.Texture | null;
+          normalMap?: THREE.Texture | null;
+          emissiveMap?: THREE.Texture | null;
+          color?: THREE.Color;
+          emissive?: THREE.Color;
+          emissiveIntensity?: number;
+          opacity?: number;
+          transparent?: boolean;
+          alphaTest?: number;
+          side?: THREE.Side;
+          // MToon specific properties
+          shadeMultiplyTexture?: THREE.Texture | null;
+          matcapTexture?: THREE.Texture | null;
+        };
+
+        const newMat = new THREE.MeshStandardMaterial({
+          map: originalMat.map || null,
+          normalMap: originalMat.normalMap || null,
+          emissiveMap: originalMat.emissiveMap || null,
+          color: originalMat.color?.clone() || new THREE.Color(0xffffff),
+          emissive: originalMat.emissive?.clone() || new THREE.Color(0x000000),
+          emissiveIntensity: originalMat.emissiveIntensity ?? 0,
+          opacity: originalMat.opacity ?? 1,
+          transparent: originalMat.transparent ?? false,
+          alphaTest: originalMat.alphaTest ?? 0,
+          side: originalMat.side ?? THREE.FrontSide,
+          roughness: 0.7,
+          metalness: 0.0,
+          envMapIntensity: 1.0, // Respond to environment map
+        });
+
+        // Copy name for debugging
+        newMat.name = originalMat.name || "VRM_Standard";
+
+        // Dispose old material
+        originalMat.dispose();
+
+        return newMat;
+      };
+
+      if (Array.isArray(obj.material)) {
+        obj.material = obj.material.map(convertMaterial);
+      } else {
+        obj.material = convertMaterial(obj.material);
+      }
     }
   });
   // MMO APPROACH: Use cloning with raw bones for memory efficiency
@@ -158,8 +215,6 @@ export function createVRMFactory(
     }
   });
 
-  const skeleton = skinnedMeshes[0].skeleton;
-
   // HYBRID APPROACH: Using Asset Forge's normalized bone system for automatic A-pose handling
   // By keeping VRMHumanoidRig and using getNormalizedBoneNode() for bone names,
   // the VRM library's normalized bone abstraction layer handles bind pose compensation automatically
@@ -189,10 +244,6 @@ export function createVRMFactory(
   // Calculate head to height for camera positioning
   const headPos = normBones.head?.node?.getWorldPosition(v1) || v1.set(0, 0, 0);
   const headToHeight = height - headPos.y;
-
-  const noop = () => {
-    // ...
-  };
 
   return {
     create,
@@ -259,7 +310,7 @@ export function createVRMFactory(
 
       // Get normalized bone node from CLONED humanoid - this handles A-pose automatically
       const normalizedNode = clonedHumanoid.getNormalizedBoneNode?.(
-        vrmBoneName as any,
+        vrmBoneName as VRMHumanBoneName,
       );
       if (!normalizedNode) {
         // Don't warn for finger bones - many VRMs don't have them
@@ -379,9 +430,10 @@ export function createVRMFactory(
     let rateCheckedAt = 999;
     let rateCheck = true;
     let updateCallCount = 0;
-    const hasLoggedUpdatePipeline = false;
+    let hasLoggedUpdatePipeline = false;
+    let deathAnimationActive = false;
+    let deathUpdateLogCount = 0;
     const update = (delta) => {
-      updateCallCount++;
       elapsed += delta;
       let should = true;
       if (rateCheck) {
@@ -413,13 +465,18 @@ export function createVRMFactory(
         if (_tvrm?.humanoid?.update) {
           _tvrm.humanoid.update(elapsed);
         } else if (!hasLoggedUpdatePipeline) {
+          hasLoggedUpdatePipeline = true;
           console.warn(
             `[VRM] ⚠️ humanoid.update NOT available - animations may not propagate to visible skeleton!`,
           );
         }
 
         // Step 3: Update skeleton matrices for skinning
-        skeleton.bones.forEach((bone) => bone.updateMatrixWorld());
+        // Use for-loop instead of forEach to avoid callback allocation
+        const bones = skeleton.bones;
+        for (let i = 0; i < bones.length; i++) {
+          bones[i].updateMatrixWorld();
+        }
         skeleton.update();
 
         elapsed = 0;
@@ -440,18 +497,21 @@ export function createVRMFactory(
       // }
     };
     let currentEmote: EmoteData | null;
-    let setEmoteCallCount = 0;
     const setEmote = (url) => {
-      setEmoteCallCount++;
-
       if (currentEmote?.url === url) {
         return;
       }
       if (currentEmote) {
         currentEmote.action?.fadeOut(0.15);
+        // Reset death animation tracking when switching to a different emote
+        if (currentEmote.url?.includes("death") && !url?.includes("death")) {
+          deathAnimationActive = false;
+          deathUpdateLogCount = 0;
+        }
         currentEmote = null;
       }
       if (!url) {
+        deathAnimationActive = false; // Also reset if emote is cleared
         return;
       }
       const opts = getQueryParams(url);
@@ -461,12 +521,22 @@ export function createVRMFactory(
       if (emotes[url]) {
         currentEmote = emotes[url];
         if (currentEmote.action) {
-          currentEmote.action.clampWhenFinished = !loop;
-          currentEmote.action.setLoop(
-            loop ? THREE.LoopRepeat : THREE.LoopOnce,
-            Infinity,
-          );
-          currentEmote.action.reset().fadeIn(0.15).play();
+          const action = currentEmote.action;
+          // CRITICAL FIX: Fully reset action state before replaying
+          // After clampWhenFinished animations complete, they enter a "finished" state
+          // that requires explicit enabling and weight reset to play again
+          action.stop(); // Stop any current playback
+          action.enabled = true; // Ensure action is enabled (disabled after stop in some cases)
+          action.setEffectiveWeight(1); // Reset weight in case it was faded out
+          action.setEffectiveTimeScale(1); // Reset time scale
+          action.clampWhenFinished = !loop;
+          action.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, Infinity);
+          action.reset().fadeIn(0.15).play();
+          // Track death animation state for update timing
+          if (url?.includes("death")) {
+            deathAnimationActive = true;
+            deathUpdateLogCount = 0;
+          }
         }
       } else {
         const newEmote: EmoteData = {
@@ -501,7 +571,14 @@ export function createVRMFactory(
                 loop ? THREE.LoopRepeat : THREE.LoopOnce,
                 Infinity,
               );
-              action.play();
+              // CRITICAL: Use same reset().fadeIn().play() sequence as cached animations
+              // Without this, the animation won't blend properly with the previous one
+              action.reset().fadeIn(0.15).play();
+              // Track death animation state for update timing
+              if (url?.includes("death")) {
+                deathAnimationActive = true;
+                deathUpdateLogCount = 0;
+              }
             }
           })
           .catch((err) => {
@@ -559,27 +636,23 @@ export function createVRMFactory(
         matrix.copy(_matrix);
         // CRITICAL: Also update the VRM scene's transform to follow the player
         // Apply 180-degree Y-axis rotation only for VRM 1.0+ models
+        // Using pre-allocated matrices to avoid per-frame allocations
         let finalMatrix = _matrix;
         if (isVRM1OrHigher) {
-          const rotationMatrix = new THREE.Matrix4().makeRotationY(Math.PI);
-          finalMatrix = new THREE.Matrix4().multiplyMatrices(
-            _matrix,
-            rotationMatrix,
-          );
+          _rotationMatrix.makeRotationY(Math.PI);
+          _tempMatrix1.multiplyMatrices(_matrix, _rotationMatrix);
+          finalMatrix = _tempMatrix1;
         }
         // CRITICAL: Compose scale into the matrix to preserve height normalization
-        const scaleMatrix = new THREE.Matrix4().makeScale(
+        _scaleMatrix.makeScale(
           vrm.scene.scale.x,
           vrm.scene.scale.y,
           vrm.scene.scale.z,
         );
-        finalMatrix = new THREE.Matrix4().multiplyMatrices(
-          finalMatrix,
-          scaleMatrix,
-        );
+        _tempMatrix2.multiplyMatrices(finalMatrix, _scaleMatrix);
 
-        vrm.scene.matrix.copy(finalMatrix);
-        vrm.scene.matrixWorld.copy(finalMatrix);
+        vrm.scene.matrix.copy(_tempMatrix2);
+        vrm.scene.matrixWorld.copy(_tempMatrix2);
         vrm.scene.updateMatrixWorld(true); // Force update all children
         if (hooks?.octree && hooks.octree.move) {
           hooks.octree.move(sItem);
@@ -663,7 +736,14 @@ function cloneGLB(glb: GLBData): GLBData {
  * This preserves the VRMHumanoidRig class methods (getBoneNode, update, etc.)
  */
 function remapHumanoidBonesToClonedScene(
-  humanoid: any,
+  humanoid: {
+    _rawHumanBones?: {
+      humanBones?: Record<string, { node?: THREE.Object3D }>;
+    };
+    _normalizedHumanBones?: {
+      humanBones?: Record<string, { node?: THREE.Object3D }>;
+    };
+  },
   clonedScene: THREE.Scene,
 ): void {
   // Build map of cloned bones by name
@@ -683,7 +763,7 @@ function remapHumanoidBonesToClonedScene(
   // Create NEW humanBones object for raw bones (don't mutate shared reference!)
   const rawRig = humanoid._rawHumanBones;
   if (rawRig?.humanBones) {
-    const newHumanBones: Record<string, unknown> = {};
+    const newHumanBones: Record<string, { node?: THREE.Object3D }> = {};
     for (const [boneName, boneData] of Object.entries(rawRig.humanBones)) {
       const typedBoneData = boneData as { node?: THREE.Object3D };
       if (typedBoneData?.node) {
@@ -707,7 +787,7 @@ function remapHumanoidBonesToClonedScene(
   // Create NEW humanBones object for normalized bones (don't mutate shared reference!)
   const normRig = humanoid._normalizedHumanBones;
   if (normRig?.humanBones) {
-    const newHumanBones: Record<string, unknown> = {};
+    const newHumanBones: Record<string, { node?: THREE.Object3D }> = {};
     for (const [boneName, boneData] of Object.entries(normRig.humanBones)) {
       const typedBoneData = boneData as { node?: THREE.Object3D };
       if (typedBoneData?.node) {

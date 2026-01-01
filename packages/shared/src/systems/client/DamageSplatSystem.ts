@@ -40,6 +40,9 @@ export class DamageSplatSystem extends System {
   private readonly RISE_DISTANCE = 1.5; // Units to float upward
   private readonly SPLAT_SIZE = 0.6; // Size of the splat sprite
 
+  // Pre-allocated array for removal indices to avoid per-frame allocation
+  private readonly _toRemove: number[] = [];
+
   constructor(world: World) {
     super(world);
   }
@@ -190,7 +193,9 @@ export class DamageSplatSystem extends System {
     if (!this.world.isClient) return;
 
     const now = performance.now();
-    const toRemove: number[] = [];
+    // Reuse pre-allocated array to avoid per-frame allocation
+    this._toRemove.length = 0;
+    const toRemove = this._toRemove;
 
     // Animate all active splats
     for (let i = 0; i < this.activeSplats.length; i++) {
@@ -209,10 +214,8 @@ export class DamageSplatSystem extends System {
       // Mark for removal when done
       if (progress >= 1) {
         this.world.stage.scene.remove(splat.sprite);
-        splat.sprite.material.dispose();
-        if (splat.sprite.material.map) {
-          splat.sprite.material.map.dispose();
-        }
+        // NOTE: Don't dispose material/texture - let GC handle it
+        // to avoid WebGPU texture cache corruption with dual-renderer setup
         toRemove.push(i);
       }
     }
@@ -227,10 +230,8 @@ export class DamageSplatSystem extends System {
     // Clean up all active splats
     for (const splat of this.activeSplats) {
       this.world.stage.scene.remove(splat.sprite);
-      splat.sprite.material.dispose();
-      if (splat.sprite.material.map) {
-        splat.sprite.material.map.dispose();
-      }
+      // NOTE: Don't dispose material/texture - let GC handle it
+      // to avoid WebGPU texture cache corruption with dual-renderer setup
     }
     this.activeSplats = [];
   }

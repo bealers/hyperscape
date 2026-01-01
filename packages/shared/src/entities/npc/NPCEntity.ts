@@ -64,15 +64,24 @@ import type {
   EntityInteractionData,
   NPCEntityConfig,
 } from "../../types/entities";
-import type { EntityData } from "../../types/index";
+import type {
+  EntityData,
+  VRMAvatarInstance,
+  LoadedAvatar,
+} from "../../types/index";
 import { modelCache } from "../../utils/rendering/ModelCache";
 import { EventType } from "../../types/events";
+import { Emotes } from "../../data/playerEmotes";
 
 // Re-export types for external use
 export type { NPCEntityConfig } from "../../types/entities";
 
 export class NPCEntity extends Entity {
   public config: NPCEntityConfig;
+
+  // VRM avatar instance (for VRM models with emote support)
+  private _avatarInstance: VRMAvatarInstance | null = null;
+  private _currentEmote: string | null = null;
 
   async init(): Promise<void> {
     await super.init();
@@ -188,9 +197,10 @@ export class NPCEntity extends Entity {
 
   /**
    * Setup idle animation for NPCs (usually a subtle idle loop)
+   * Uses embedded animations if available, otherwise loads from model's animation directory
    */
   private setupIdleAnimation(animations: THREE.AnimationClip[]): void {
-    if (!this.mesh || animations.length === 0) return;
+    if (!this.mesh) return;
 
     // Find the SkinnedMesh to apply animation to
     let skinnedMesh: THREE.SkinnedMesh | null = null;
@@ -201,28 +211,146 @@ export class NPCEntity extends Entity {
     });
 
     if (!skinnedMesh) {
-      console.warn(`[NPCEntity] No SkinnedMesh found in model for animations`);
+      // No SkinnedMesh = static model, no animations needed
       return;
     }
 
     // Create AnimationMixer
     const mixer = new THREE.AnimationMixer(skinnedMesh);
 
-    // Find idle or walking animation
-    const idleClip =
-      animations.find(
-        (clip) =>
-          clip.name.toLowerCase().includes("idle") ||
-          clip.name.toLowerCase().includes("standing"),
-      ) ||
-      animations.find((clip) => clip.name.toLowerCase().includes("walk")) ||
-      animations[0];
+    // Find idle animation (prioritize "idle" or "standing")
+    const idleClip = animations.find(
+      (clip) =>
+        clip.name.toLowerCase().includes("idle") ||
+        clip.name.toLowerCase().includes("standing"),
+    );
 
-    const action = mixer.clipAction(idleClip);
-    action.play();
+    if (idleClip) {
+      // Use embedded idle animation
+      const action = mixer.clipAction(idleClip);
+      action.setLoop(THREE.LoopRepeat, Infinity);
+      action.play();
 
-    // Store mixer on entity for update in clientUpdate
-    (this as { mixer?: THREE.AnimationMixer }).mixer = mixer;
+      // Store mixer on entity for update in clientUpdate
+      (this as { mixer?: THREE.AnimationMixer }).mixer = mixer;
+    } else {
+      // No idle animation found in embedded clips
+      // Try to load from model's animation directory (same skeleton = compatible)
+      (this as { mixer?: THREE.AnimationMixer }).mixer = mixer;
+      this.loadModelIdleAnimation(mixer);
+    }
+  }
+
+  /**
+   * Load idle animation from the model's own animation directory
+   * This ensures bone name compatibility (same skeleton)
+   * Service NPCs (bank, store) should stand still, not walk
+   *
+   * Note: If no idle animation exists, the NPC stays in bind pose (standing)
+   * which is appropriate for service NPCs. This is not an error condition.
+   */
+  private async loadModelIdleAnimation(
+    _mixer: THREE.AnimationMixer,
+  ): Promise<void> {
+    // Service NPCs (banker, shopkeeper, trainer) should stand still
+    // The bind pose of human_rigged.glb is a standing pose which is appropriate
+    // We intentionally don't load walk/run animations for service NPCs
+    // If an idle animation is needed later, add idle.glb to the model's animations folder
+  }
+
+  /**
+   * Load VRM model and create avatar instance with emote support
+   * This uses the same avatar system as player avatars, enabling proper emote playback
+   */
+  private async loadVRMModel(): Promise<void> {
+    if (!this.world.loader) {
+      console.warn(
+        `[NPCEntity] ${this.id}: No world.loader available for VRM loading`,
+      );
+      return;
+    }
+    if (!this.config.model) {
+      console.warn(`[NPCEntity] ${this.id}: No model path configured`);
+      return;
+    }
+    if (!this.world.stage?.scene) {
+      console.warn(`[NPCEntity] ${this.id}: No world.stage.scene available`);
+      return;
+    }
+
+    // Create VRM hooks with scene reference (CRITICAL for visibility!)
+    const vrmHooks = {
+      scene: this.world.stage.scene,
+      octree: this.world.stage?.octree,
+      camera: this.world.camera,
+      loader: this.world.loader,
+    };
+
+    // Load the VRM avatar using the same loader as players
+    const src = (await this.world.loader.load(
+      "avatar",
+      this.config.model,
+    )) as LoadedAvatar;
+
+    // Convert to nodes
+    const nodeMap = src.toNodes(vrmHooks);
+    const avatarNode = nodeMap.get("avatar") || nodeMap.get("root");
+
+    if (!avatarNode) {
+      console.warn(
+        `[NPCEntity] ${this.id}: No avatar/root node found in VRM for ${this.config.model}`,
+      );
+      return;
+    }
+
+    // Get the factory from the avatar node
+    const avatarNodeWithFactory = avatarNode as {
+      factory?: {
+        create: (matrix: THREE.Matrix4, hooks?: unknown) => VRMAvatarInstance;
+      };
+    };
+
+    if (!avatarNodeWithFactory?.factory) {
+      console.warn(
+        `[NPCEntity] ${this.id}: No VRM factory found on avatar node for ${this.config.model}`,
+      );
+      return;
+    }
+
+    // Update our node's transform
+    this.node.updateMatrix();
+    this.node.updateMatrixWorld(true);
+
+    // Create the VRM instance using the factory
+    this._avatarInstance = avatarNodeWithFactory.factory.create(
+      this.node.matrixWorld,
+      vrmHooks,
+    );
+
+    // Set initial emote to idle (service NPCs should stand still)
+    this._currentEmote = Emotes.IDLE;
+    this._avatarInstance.setEmote(this._currentEmote);
+
+    // Set up userData for interaction detection on the avatar
+    // Get the VRM scene from the instance
+    const instanceWithRaw = this._avatarInstance as {
+      raw?: { scene?: THREE.Object3D };
+    };
+    if (instanceWithRaw?.raw?.scene) {
+      const userData = {
+        type: "npc",
+        entityId: this.id,
+        npcId: this.config.npcId,
+        name: this.config.name,
+        interactable: true,
+        npcType: this.config.npcType,
+        services: this.config.services,
+      };
+      instanceWithRaw.raw.scene.userData = userData;
+      instanceWithRaw.raw.scene.traverse((child) => {
+        child.userData = { ...userData };
+      });
+    }
   }
 
   /**
@@ -252,9 +380,17 @@ export class NPCEntity extends Entity {
       return;
     }
 
-    // Try to load 3D model if available (same approach as ItemEntity/ResourceEntity)
+    // Try to load 3D model if available
     if (this.config.model && this.world.loader) {
       try {
+        // Check if this is a VRM file (uses Avatar system with emote support)
+        if (this.config.model.endsWith(".vrm")) {
+          // Load VRM via avatar system - this handles emote retargeting
+          await this.loadVRMModel();
+          return;
+        }
+
+        // GLB model - load directly
         const { scene, animations } = await modelCache.loadModel(
           this.config.model,
           this.world,
@@ -322,7 +458,12 @@ export class NPCEntity extends Entity {
     }
 
     const geometry = new THREE.CapsuleGeometry(0.35, 1.4, 4, 8);
-    const material = new THREE.MeshLambertMaterial({ color: 0x6b4423 });
+    // Use MeshStandardMaterial for proper lighting (responds to sun, moon, and environment maps)
+    const material = new THREE.MeshStandardMaterial({
+      color: 0x6b4423,
+      roughness: 0.8,
+      metalness: 0.0,
+    });
     this.mesh = new THREE.Mesh(geometry, material);
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
@@ -376,9 +517,16 @@ export class NPCEntity extends Entity {
   protected clientUpdate(deltaTime: number): void {
     super.clientUpdate(deltaTime);
 
-    // Mesh is child of node, so it follows automatically
-    // No manual position sync needed
+    // VRM avatar path: Update avatar instance
+    if (this._avatarInstance) {
+      // Update avatar position to follow node
+      this._avatarInstance.move(this.node.matrixWorld);
+      // Update VRM avatar animation
+      this._avatarInstance.update(deltaTime);
+      return;
+    }
 
+    // GLB mesh path: Update animation mixer
     this.updateAnimations(deltaTime);
   }
 
@@ -431,10 +579,16 @@ export class NPCEntity extends Entity {
   }
 
   /**
-   * Override destroy to clean up animations
+   * Override destroy to clean up animations and avatar
    */
   override destroy(): void {
-    // Clean up animation mixer
+    // Clean up VRM avatar instance
+    if (this._avatarInstance) {
+      this._avatarInstance.destroy();
+      this._avatarInstance = null;
+    }
+
+    // Clean up animation mixer (for GLB models)
     const mixer = (this as { mixer?: THREE.AnimationMixer }).mixer;
     if (mixer) {
       mixer.stopAllAction();

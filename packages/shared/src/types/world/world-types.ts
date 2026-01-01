@@ -80,6 +80,92 @@ export interface WorldInitConfig {
   };
 }
 
+// ============== VEGETATION SYSTEM TYPES ==============
+// (Defined before BiomeData since BiomeData references these types)
+
+/**
+ * Vegetation category type - defines the type of vegetation
+ */
+export type VegetationCategory =
+  | "tree"
+  | "bush"
+  | "grass"
+  | "flower"
+  | "fern"
+  | "rock"
+  | "fallen_tree";
+
+/**
+ * Single vegetation asset model definition
+ * Each asset represents a GLB model that can be instanced
+ */
+export interface VegetationAsset {
+  /** Unique identifier for this asset */
+  id: string;
+  /** Path to the GLB model file (relative to assets folder) */
+  model: string;
+  /** Category of vegetation this asset belongs to */
+  category: VegetationCategory;
+  /** Base scale of the model (1.0 = original size) */
+  baseScale: number;
+  /** Random scale variation range [min, max] applied as multiplier */
+  scaleVariation: [number, number];
+  /** Whether the asset can have random Y-axis rotation */
+  randomRotation: boolean;
+  /** Probability weight for this asset when selecting from category (higher = more common) */
+  weight: number;
+  /** Minimum slope this can be placed on (0-1, 0 = flat only) */
+  minSlope?: number;
+  /** Maximum slope this can be placed on (0-1, 1 = any slope) */
+  maxSlope?: number;
+  /** Whether to align to terrain normal (tilt with ground) */
+  alignToNormal?: boolean;
+  /** Y offset to apply after placement (for buried objects, etc.) */
+  yOffset?: number;
+}
+
+/**
+ * Vegetation layer configuration for a biome
+ * Each layer defines how a category of vegetation is distributed
+ */
+export interface VegetationLayer {
+  /** Category of vegetation for this layer */
+  category: VegetationCategory;
+  /** Density of instances per 100x100m tile (approximate) */
+  density: number;
+  /** Asset IDs to use for this layer (references VegetationAsset.id) */
+  assets: string[];
+  /** Minimum distance between instances of this category */
+  minSpacing: number;
+  /** Whether to cluster instances (creates natural groupings) */
+  clustering?: boolean;
+  /** Cluster size if clustering is enabled */
+  clusterSize?: number;
+  /** Noise scale for distribution (higher = larger patterns) */
+  noiseScale?: number;
+  /** Noise threshold (0-1, instances only placed where noise > threshold) */
+  noiseThreshold?: number;
+  /** Minimum height this layer spawns at */
+  minHeight?: number;
+  /** Maximum height this layer spawns at */
+  maxHeight?: number;
+  /** Whether to avoid water areas */
+  avoidWater?: boolean;
+  /** Whether to avoid steep slopes */
+  avoidSteepSlopes?: boolean;
+}
+
+/**
+ * Complete vegetation configuration for a biome
+ * Defines all vegetation layers and their assets for procedural placement
+ */
+export interface BiomeVegetationConfig {
+  /** Whether vegetation is enabled for this biome */
+  enabled: boolean;
+  /** All vegetation layers for this biome */
+  layers: VegetationLayer[];
+}
+
 // ============== BIOME TYPES ==============
 
 /**
@@ -97,7 +183,10 @@ export interface BiomeData {
     | "frozen"
     | "corrupted"
     | "lake"
-    | "mountain";
+    | "mountain"
+    | "mountains"
+    | "desert"
+    | "swamp";
   resources: string[]; // Available resource types
   mobs: string[]; // Mob types that spawn here
   fogIntensity: number; // 0-1 for visual atmosphere
@@ -118,6 +207,8 @@ export interface BiomeData {
   heightVariation: number; // Height variation factor
   resourceDensity: number; // Resource spawn density
   resourceTypes: string[]; // Types of resources that can spawn
+  /** Vegetation configuration for procedural placement (optional) */
+  vegetation?: BiomeVegetationConfig;
 }
 
 /**
@@ -178,6 +269,8 @@ export interface WorldArea {
   };
   biomeType: string;
   safeZone: boolean;
+  /** PvP enabled - players can attack each other in this zone */
+  pvpEnabled?: boolean;
   npcs: NPCLocation[];
   resources: BiomeResource[];
   mobSpawns: MobSpawnPoint[];
@@ -387,4 +480,46 @@ export interface TreasureLocation {
   description: string;
   respawnTime: number; // milliseconds
   maxItems: number;
+}
+
+// ============== VEGETATION RUNTIME TYPES ==============
+
+/**
+ * Runtime vegetation instance data
+ * Used by VegetationSystem to track placed instances
+ */
+export interface VegetationInstance {
+  /** Unique instance ID */
+  id: string;
+  /** Asset ID this instance uses */
+  assetId: string;
+  /** Category of vegetation */
+  category: VegetationCategory;
+  /** World position */
+  position: { x: number; y: number; z: number };
+  /** Rotation (Euler angles in radians) */
+  rotation: { x: number; y: number; z: number };
+  /** Scale multiplier */
+  scale: number;
+  /** Tile key this instance belongs to */
+  tileKey: string;
+  /** Matrix index in the InstancedMesh (runtime only) */
+  matrixIndex?: number;
+}
+
+/**
+ * Vegetation tile data for persistence
+ * Stores vegetation state for a terrain tile
+ */
+export interface VegetationTileData {
+  /** Tile key (format: "tileX_tileZ") */
+  tileKey: string;
+  /** Biome this tile belongs to */
+  biome: string;
+  /** All vegetation instances in this tile */
+  instances: VegetationInstance[];
+  /** Timestamp when this tile was generated */
+  generatedAt: number;
+  /** Seed used for procedural generation */
+  seed: number;
 }

@@ -122,6 +122,9 @@ import { DialogueSystem } from "..";
 // Client-only visual systems
 import { DamageSplatSystem } from "../../client";
 
+// Zone systems
+import { ZoneDetectionSystem } from "../death/ZoneDetectionSystem";
+
 import type { CameraSystem as CameraSystemInterface } from "../../../types/systems/physics";
 import { ActionRegistry } from "..";
 import { SkillsSystem } from "..";
@@ -366,6 +369,11 @@ export async function registerSystems(world: World): Promise<void> {
   world.register("mob-npc-spawner", MobNPCSpawnerSystem);
   world.register("item-spawner", ItemSpawnerSystem);
 
+  // Zone Detection System - registered on server only (client registers in createClientWorld.ts)
+  if (world.isServer) {
+    world.register("zone-detection", ZoneDetectionSystem);
+  }
+
   // Get system instances after world initialization
   // Systems are directly available as properties on the world object after registration
   // Database system is only available on server
@@ -373,7 +381,7 @@ export async function registerSystems(world: World): Promise<void> {
   systems.database =
     dbSystem && "getPlayer" in dbSystem
       ? (dbSystem as DatabaseSystem)
-      : (null as any);
+      : undefined;
   systems.combat = getSystem(world, "combat") as CombatSystem;
   systems.inventory = getSystem(world, "inventory") as InventorySystem;
   systems.skills = getSystem(world, "skills") as SkillsSystem;

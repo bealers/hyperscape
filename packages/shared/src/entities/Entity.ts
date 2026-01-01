@@ -1395,7 +1395,9 @@ export class Entity implements IEntity {
     // Players are managed by PlayerSystem, not EntityManager's update loop
     // So we must explicitly notify EntityManager when players are dirty
     if (this.world.isServer) {
-      const entityManager = this.world.getSystem("entity-manager") as any;
+      const entityManager = this.world.getSystem(
+        "entity-manager",
+      ) as unknown as { networkDirtyEntities?: Set<string> };
       if (entityManager?.networkDirtyEntities) {
         entityManager.networkDirtyEntities.add(this.id);
         // Disabled - too spammy
@@ -1504,18 +1506,23 @@ export class Entity implements IEntity {
     if (this.destroyed) return;
     this.destroyed = true;
 
+    // IMMEDIATELY hide mesh to prevent raycast hits during async cleanup
+    // This fixes the dead mob / item drop overlap issue where the mesh
+    // is still raycastable while the entity is being destroyed
+    if (this.node) {
+      this.node.visible = false;
+    }
+
     // Clean up UI elements first - from BaseEntity
     if (this.nameSprite) {
       // Remove from node (not scene since we added it to node)
       if (this.node) {
         this.node.remove(this.nameSprite);
       }
-      // Strong type assumption - sprite material is SpriteMaterial
-      const spriteMaterial = this.nameSprite.material as THREE.SpriteMaterial;
-      if (spriteMaterial.map) {
-        spriteMaterial.map.dispose();
-      }
-      spriteMaterial.dispose();
+      // NOTE: Don't dispose sprite material or texture - they will be GC'd
+      // when the sprite is no longer referenced. Disposing synchronously
+      // causes WebGPU texture cache corruption with dual-renderer setup
+      // (main renderer + minimap renderer share the same scene).
       this.nameSprite = null;
     }
 
@@ -1524,12 +1531,7 @@ export class Entity implements IEntity {
       if (this.node) {
         this.node.remove(this.healthSprite);
       }
-      // Strong type assumption - sprite material is SpriteMaterial
-      const spriteMaterial = this.healthSprite.material as THREE.SpriteMaterial;
-      if (spriteMaterial.map) {
-        spriteMaterial.map.dispose();
-      }
-      spriteMaterial.dispose();
+      // NOTE: Don't dispose - same reason as nameSprite above
       this.healthSprite = null;
     }
 
@@ -1599,15 +1601,14 @@ export class Entity implements IEntity {
       // Strong type assumption - mesh children have geometry and material
       const mesh = child as THREE.Mesh;
       if (mesh.geometry) {
+        // Geometry is cloned per entity, safe to dispose
         mesh.geometry.dispose();
       }
-      if (mesh.material) {
-        // Strong type assumption - material is either array or single
-        const materials = Array.isArray(mesh.material)
-          ? mesh.material
-          : [mesh.material];
-        materials.forEach((material) => material.dispose());
-      }
+      // NOTE: Materials are NOT disposed here because they are shared across
+      // instances via ModelCache (for GLB) and VRM factories (for VRM avatars).
+      // Material lifecycle is managed by the caching systems, not individual entities.
+      // Disposing materials here would corrupt WebGPU's texture cache when
+      // other entities are still using the same shared materials.
     });
   }
 

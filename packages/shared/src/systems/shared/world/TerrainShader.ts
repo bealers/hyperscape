@@ -1,329 +1,465 @@
 /**
- * TerrainShader.ts
- *
- * Beautiful terrain shader system inspired by upstreet
- * Features:
- * - Triplanar texture mapping (no UV stretching)
- * - Multi-texture blending (grass, dirt, rock, sand, snow)
- * - Height-based texture switching (snow on peaks)
- * - Slope-based texture switching (rock on cliffs)
- * - Biome weight blending
- * - Day/night cycle support
- * - Distance fog
+ * TerrainShader - TSL Node Material for OSRS-style vertex color terrain
+ * Flat shaded, no textures - pure vertex colors based on height/slope/noise
  */
 
-import * as THREE from "three";
+import THREE, {
+  MeshStandardNodeMaterial,
+  texture,
+  positionWorld,
+  normalWorld,
+  uniform,
+  float,
+  vec2,
+  vec3,
+  pow,
+  add,
+  sub,
+  mul,
+  mix,
+  smoothstep,
+  sin,
+  abs,
+} from "../../../extras/three/three";
 
-// Shader constants
 export const TERRAIN_CONSTANTS = {
-  TRIPLANAR_SCALE: 0.02, // 50m texture repeat for fine detail
-  TRIPLANAR_BLEND_SHARPNESS: 4.0, // Sharp transitions between planes
-  SNOW_HEIGHT: 50.0, // Elevation threshold for snow
-  ROCK_SLOPE_THRESHOLD: 0.6, // Normal Y threshold for rock (60° angle)
-  FOG_NEAR: 200.0,
-  FOG_FAR: 500.0,
+  TRIPLANAR_SCALE: 0.5, // Unused in OSRS style but kept for compatibility
+  SNOW_HEIGHT: 50.0,
+  FOG_NEAR: 150.0,
+  FOG_FAR: 350.0,
+  NOISE_SCALE: 0.0008, // For dirt patch variation
+  DIRT_THRESHOLD: 0.5,
+  LOD_FULL_DETAIL: 100.0,
+  LOD_MEDIUM_DETAIL: 200.0,
+  // OSRS style water level
+  WATER_LEVEL: 5.0,
+};
+
+// ============================================================================
+// PERLIN NOISE TEXTURE GENERATION
+// ============================================================================
+
+// Cached noise texture - generated once, reused everywhere
+let cachedNoiseTexture: THREE.DataTexture | null = null;
+const NOISE_SIZE = 256; // Texture resolution
+
+// Simple Perlin-like noise implementation
+function fade(t: number): number {
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + t * (b - a);
+}
+
+function grad(hash: number, x: number, y: number): number {
+  const h = hash & 3;
+  const u = h < 2 ? x : y;
+  const v = h < 2 ? y : x;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+// Seeded permutation table for deterministic noise
+function createPermutation(seed: number): number[] {
+  const p: number[] = [];
+  for (let i = 0; i < 256; i++) p[i] = i;
+
+  // Fisher-Yates shuffle with seed
+  let s = seed;
+  for (let i = 255; i > 0; i--) {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    const j = s % (i + 1);
+    [p[i], p[j]] = [p[j], p[i]];
+  }
+
+  // Double the permutation table
+  return [...p, ...p];
+}
+
+function perlin2D(x: number, y: number, perm: number[]): number {
+  const X = Math.floor(x) & 255;
+  const Y = Math.floor(y) & 255;
+
+  const xf = x - Math.floor(x);
+  const yf = y - Math.floor(y);
+
+  const u = fade(xf);
+  const v = fade(yf);
+
+  const aa = perm[perm[X] + Y];
+  const ab = perm[perm[X] + Y + 1];
+  const ba = perm[perm[X + 1] + Y];
+  const bb = perm[perm[X + 1] + Y + 1];
+
+  const x1 = lerp(grad(aa, xf, yf), grad(ba, xf - 1, yf), u);
+  const x2 = lerp(grad(ab, xf, yf - 1), grad(bb, xf - 1, yf - 1), u);
+
+  return lerp(x1, x2, v);
+}
+
+// Multi-octave fractal noise (non-seamless version, kept for reference)
+function _fbm(
+  x: number,
+  y: number,
+  perm: number[],
+  octaves: number = 4,
+): number {
+  let value = 0;
+  let amplitude = 0.5;
+  let frequency = 1;
+  let maxValue = 0;
+
+  for (let i = 0; i < octaves; i++) {
+    value += amplitude * perlin2D(x * frequency, y * frequency, perm);
+    maxValue += amplitude;
+    amplitude *= 0.5;
+    frequency *= 2;
+  }
+
+  return value / maxValue;
+}
+
+/**
+ * Seamless 2D Perlin noise using proper torus mapping
+ * Maps the 2D plane onto a 4D torus to eliminate seams
+ */
+function seamlessPerlin2D(x: number, y: number, perm: number[]): number {
+  // Map 2D coordinates to 4D torus
+  // This creates truly seamless tiling
+  const TWO_PI = Math.PI * 2;
+  const radius = 1.0;
+
+  // Convert to angles (0-1 maps to 0-2PI)
+  const angleX = x * TWO_PI;
+  const angleY = y * TWO_PI;
+
+  // Map to 4D coordinates on a torus
+  const nx = Math.cos(angleX) * radius;
+  const ny = Math.sin(angleX) * radius;
+  const nz = Math.cos(angleY) * radius;
+  const nw = Math.sin(angleY) * radius;
+
+  // Sample 2D noise at 4 different 2D positions and blend
+  // This simulates 4D noise sampling using 2D noise
+  const n1 = perlin2D(nx * 4 + 100, nz * 4 + 100, perm);
+  const n2 = perlin2D(ny * 4 + 200, nw * 4 + 200, perm);
+  const n3 = perlin2D(nx * 4 + ny * 4 + 300, nz * 4 + nw * 4 + 300, perm);
+
+  return (n1 + n2 + n3) / 3;
+}
+
+/**
+ * Multi-octave seamless fractal noise
+ */
+function seamlessFbm(
+  x: number,
+  y: number,
+  perm: number[],
+  octaves: number = 4,
+): number {
+  let value = 0;
+  let amplitude = 0.5;
+  let maxValue = 0;
+
+  for (let i = 0; i < octaves; i++) {
+    // Each octave uses a different offset to add variation
+    const ox = x + i * 17.3;
+    const oy = y + i * 31.7;
+    value += amplitude * seamlessPerlin2D(ox, oy, perm);
+    maxValue += amplitude;
+    amplitude *= 0.5;
+  }
+
+  return value / maxValue;
+}
+
+/**
+ * Generate a Perlin noise texture - call once at startup
+ * Returns a DataTexture that tiles seamlessly
+ */
+export function generateNoiseTexture(seed: number = 12345): THREE.DataTexture {
+  if (cachedNoiseTexture) return cachedNoiseTexture;
+
+  const perm = createPermutation(seed);
+  const data = new Uint8Array(NOISE_SIZE * NOISE_SIZE * 4);
+
+  for (let y = 0; y < NOISE_SIZE; y++) {
+    for (let x = 0; x < NOISE_SIZE; x++) {
+      // Normalize to 0-1 range
+      const nx = x / NOISE_SIZE;
+      const ny = y / NOISE_SIZE;
+
+      // Use seamless noise that tiles perfectly
+      const noise = seamlessFbm(nx, ny, perm, 4);
+
+      // Normalize from [-1, 1] to [0, 1]
+      const value = (noise + 1) * 0.5;
+      const byte = Math.floor(Math.max(0, Math.min(255, value * 255)));
+
+      const idx = (y * NOISE_SIZE + x) * 4;
+      data[idx] = byte; // R
+      data[idx + 1] = byte; // G
+      data[idx + 2] = byte; // B
+      data[idx + 3] = 255; // A
+    }
+  }
+
+  const tex = new THREE.DataTexture(
+    data,
+    NOISE_SIZE,
+    NOISE_SIZE,
+    THREE.RGBAFormat,
+  );
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+
+  cachedNoiseTexture = tex;
+  console.log("[TerrainShader] Generated seamless Perlin noise texture");
+  return tex;
+}
+
+/**
+ * Get the cached noise texture (for GrassSystem alignment)
+ */
+export function getNoiseTexture(): THREE.DataTexture | null {
+  return cachedNoiseTexture;
+}
+
+// Cached permutation for CPU sampling
+let cachedPerm: number[] | null = null;
+
+/**
+ * Sample noise at world position (for CPU-side grass placement)
+ * Returns 0-1 value matching EXACTLY what the shader samples from the texture
+ */
+export function sampleNoiseAtPosition(
+  worldX: number,
+  worldZ: number,
+  seed: number = 12345,
+): number {
+  // Ensure permutation is created
+  if (!cachedPerm) {
+    cachedPerm = createPermutation(seed);
+  }
+
+  // Calculate UV the same way the shader does
+  const u = worldX * TERRAIN_CONSTANTS.NOISE_SCALE;
+  const v = worldZ * TERRAIN_CONSTANTS.NOISE_SCALE;
+
+  // The texture tiles, so wrap to 0-1
+  const wrappedU = u - Math.floor(u);
+  const wrappedV = v - Math.floor(v);
+
+  // Sample the same seamless noise function used to generate the texture
+  const noise = seamlessFbm(wrappedU, wrappedV, cachedPerm, 4);
+  return (noise + 1) * 0.5;
+}
+
+// ============================================================================
+// TERRAIN MATERIAL - OSRS Style (No Textures)
+// ============================================================================
+
+export type TerrainUniforms = {
+  sunPosition: { value: THREE.Vector3 };
+  time: { value: number };
 };
 
 /**
- * Vertex Shader
- * Passes data to fragment shader for texture blending
- */
-export const terrainVertexShader = /* glsl */ `
-varying vec3 vWorldPosition;
-varying vec3 vNormal;
-
-void main() {
-  vNormal = normalize(normalMatrix * normal);
-  vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`;
-
-/**
- * Fragment Shader
- * Phase 2: Normal maps for photorealistic surface detail
- */
-export const terrainFragmentShader = /* glsl */ `
-precision highp float;
-
-varying vec3 vWorldPosition;
-varying vec3 vNormal;
-
-uniform sampler2D terrainGrassTexture;
-uniform sampler2D terrainDirtTexture;
-uniform sampler2D terrainRockTexture;
-uniform sampler2D terrainSandTexture;
-uniform sampler2D terrainSnowTexture;
-
-uniform sampler2D terrainGrassNormal;
-uniform sampler2D terrainDirtNormal;
-uniform sampler2D terrainRockNormal;
-uniform sampler2D terrainSandNormal;
-uniform sampler2D terrainSnowNormal;
-
-uniform vec3 cameraPosition;
-
-// Triplanar texture sampling - eliminates UV stretching on slopes
-vec3 triplanarSample(sampler2D tex, vec3 worldPos, vec3 normal) {
-  float scale = 0.02;
-  vec3 scaledPos = worldPos * scale;
-
-  vec3 blendWeights = abs(normal);
-  blendWeights = pow(blendWeights, vec3(4.0));
-  blendWeights = blendWeights / (blendWeights.x + blendWeights.y + blendWeights.z);
-
-  vec3 xAxis = texture2D(tex, scaledPos.yz).rgb;
-  vec3 yAxis = texture2D(tex, scaledPos.xz).rgb;
-  vec3 zAxis = texture2D(tex, scaledPos.xy).rgb;
-
-  return xAxis * blendWeights.x + yAxis * blendWeights.y + zAxis * blendWeights.z;
-}
-
-// Triplanar normal map sampling
-vec3 triplanarNormal(sampler2D normalTex, vec3 worldPos, vec3 normal) {
-  float scale = 0.02;
-  vec3 scaledPos = worldPos * scale;
-
-  vec3 blendWeights = abs(normal);
-  blendWeights = pow(blendWeights, vec3(4.0));
-  blendWeights = blendWeights / (blendWeights.x + blendWeights.y + blendWeights.z);
-
-  // Sample normal maps and convert from [0,1] to [-1,1]
-  vec3 xNormal = texture2D(normalTex, scaledPos.yz).rgb * 2.0 - 1.0;
-  vec3 yNormal = texture2D(normalTex, scaledPos.xz).rgb * 2.0 - 1.0;
-  vec3 zNormal = texture2D(normalTex, scaledPos.xy).rgb * 2.0 - 1.0;
-
-  // Blend normals
-  vec3 blendedNormal = xNormal * blendWeights.x + yNormal * blendWeights.y + zNormal * blendWeights.z;
-  return normalize(blendedNormal);
-}
-
-void main() {
-  float height = vWorldPosition.y;
-  float slope = 1.0 - abs(vNormal.y);
-
-  // Sample all textures
-  vec3 grass = triplanarSample(terrainGrassTexture, vWorldPosition, vNormal);
-  vec3 dirt = triplanarSample(terrainDirtTexture, vWorldPosition, vNormal);
-  vec3 rock = triplanarSample(terrainRockTexture, vWorldPosition, vNormal);
-  vec3 sand = triplanarSample(terrainSandTexture, vWorldPosition, vNormal);
-  vec3 snow = triplanarSample(terrainSnowTexture, vWorldPosition, vNormal);
-
-  // Blend textures based on height and slope
-  vec3 color = grass;
-
-  float dirtBlend = smoothstep(0.3, 0.5, slope);
-  color = mix(color, dirt, dirtBlend * 0.4);
-
-  float rockBlend = smoothstep(0.6, 0.75, slope);
-  color = mix(color, rock, rockBlend);
-
-  float snowBlend = smoothstep(50.0, 60.0, height);
-  color = mix(color, snow, snowBlend);
-
-  float sandBlend = smoothstep(5.0, 0.0, height) * smoothstep(0.3, 0.0, slope);
-  color = mix(color, sand, sandBlend);
-
-  // IMPROVED LIGHTING
-  vec3 N = normalize(vNormal);
-
-  // Sun direction (slightly behind and above camera for nice shadows)
-  vec3 sunDir = normalize(vec3(0.5, 0.8, 0.3));
-
-  // Half-Lambert diffuse for softer falloff
-  float NdotL = dot(N, sunDir);
-  float diffuse = NdotL * 0.5 + 0.5;
-  diffuse = diffuse * diffuse; // Square for better contrast
-
-  // Sky ambient (blue-tinted from above)
-  vec3 skyColor = vec3(0.6, 0.7, 0.9);
-  float skyLight = N.y * 0.5 + 0.5; // More light from above
-  vec3 ambient = skyColor * skyLight * 0.3;
-
-  // Sun color (warm daylight)
-  vec3 sunColor = vec3(1.0, 0.98, 0.95);
-  vec3 diffuseLight = sunColor * diffuse * 0.8;
-
-  // Combine lighting
-  vec3 litColor = color * (ambient + diffuseLight);
-
-  // DISTANCE FOG
-  float dist = length(vWorldPosition - cameraPosition);
-  float fogStart = 200.0;
-  float fogEnd = 500.0;
-  float fogFactor = smoothstep(fogStart, fogEnd, dist);
-  vec3 fogColor = vec3(0.7, 0.8, 0.9); // Light sky blue
-  vec3 finalColor = mix(litColor, fogColor, fogFactor);
-
-  // GAMMA CORRECTION (linear to sRGB)
-  finalColor = pow(finalColor, vec3(1.0 / 2.2));
-
-  gl_FragColor = vec4(finalColor, 1.0);
-}
-`;
-
-/**
- * Create a simple solid color texture as placeholder
- */
-function createPlaceholderTexture(color: number): THREE.Texture {
-  // Server-safe: Use DataTexture if no document
-  if (typeof document === "undefined") {
-    const data = new Uint8Array([
-      (color >> 16) & 0xff,
-      (color >> 8) & 0xff,
-      color & 0xff,
-      255,
-    ]);
-    const texture = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
-    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-    texture.needsUpdate = true;
-    return texture;
-  }
-
-  // Client: Use CanvasTexture
-  const canvas = document.createElement("canvas");
-  canvas.width = 2;
-  canvas.height = 2;
-  const ctx = canvas.getContext("2d")!;
-  const c = new THREE.Color(color);
-  ctx.fillStyle = `rgb(${c.r * 255}, ${c.g * 255}, ${c.b * 255})`;
-  ctx.fillRect(0, 0, 2, 2);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-  return texture;
-}
-
-/**
- * Create terrain shader material
+ * OSRS-style vertex color terrain material
+ * No textures - pure flat shaded colors based on height, slope, and noise
  */
 export function createTerrainMaterial(
-  textures: Map<string, THREE.Texture>,
-): THREE.ShaderMaterial {
-  // Create placeholder textures if real ones aren't loaded yet
-  const placeholders = {
-    grass: createPlaceholderTexture(0x5a9216),
-    dirt: createPlaceholderTexture(0x6b4423),
-    rock: createPlaceholderTexture(0x7a7265),
-    sand: createPlaceholderTexture(0xc2b280),
-    snow: createPlaceholderTexture(0xf0f8ff),
-  };
+  _textures: Map<string, THREE.Texture>,
+): THREE.Material & { terrainUniforms: TerrainUniforms } {
+  // Ensure noise texture is generated (still used for dirt patch variation)
+  const noiseTex = generateNoiseTexture();
 
-  const uniforms = {
-    // Textures (use real if available, fallback to placeholder)
-    terrainGrassTexture: { value: textures.get("grass") || placeholders.grass },
-    terrainDirtTexture: { value: textures.get("dirt") || placeholders.dirt },
-    terrainRockTexture: { value: textures.get("rock") || placeholders.rock },
-    terrainSandTexture: { value: textures.get("sand") || placeholders.sand },
-    terrainSnowTexture: { value: textures.get("snow") || placeholders.snow },
+  const sunPositionUniform = uniform(vec3(100, 100, 100));
+  const timeUniform = uniform(float(0));
+  const noiseScale = uniform(float(TERRAIN_CONSTANTS.NOISE_SCALE));
 
-    // Lighting
-    sunPosition: { value: new THREE.Vector3(100, 100, 100) },
-    cameraPosition: { value: new THREE.Vector3(0, 50, 100) }, // Will be updated each frame
-    isDay: { value: true },
-    uDayCycleProgress: { value: 0.5 },
+  const worldPos = positionWorld;
+  const worldNormal = normalWorld;
+  const height = worldPos.y;
+  const slope = sub(float(1.0), abs(worldNormal.y));
 
-    // Day/night colors
-    uColorDayCycleLow: { value: new THREE.Color(0xf0fff9) },
-    uColorDayCycleHigh: { value: new THREE.Color(0x87ceeb) },
-    uColorNightLow: { value: new THREE.Color(0x001428) },
-    uColorNightHigh: { value: new THREE.Color(0x000814) },
-    uColorDawn: { value: new THREE.Color(0xff6b35) },
-    uColorSun: { value: new THREE.Color(0xffd700) },
-  };
+  // ============================================================================
+  // OSRS-STYLE VERTEX COLORS
+  // Flat, distinct colors - no gradients, no textures
+  // ============================================================================
 
-  const material = new THREE.ShaderMaterial({
-    uniforms,
-    vertexShader: terrainVertexShader,
-    fragmentShader: terrainFragmentShader,
-    side: THREE.FrontSide,
-    transparent: false,
-    depthWrite: true,
-    depthTest: true,
-  });
+  // Core terrain colors (OSRS palette)
+  const grassGreen = vec3(0.3, 0.55, 0.15); // Rich green grass
+  const grassDark = vec3(0.22, 0.42, 0.1); // Darker grass variation
+  const dirtBrown = vec3(0.45, 0.32, 0.18); // Light brown dirt
+  const dirtDark = vec3(0.32, 0.22, 0.12); // Dark brown dirt
+  const rockGray = vec3(0.45, 0.42, 0.38); // Gray rock
+  const rockDark = vec3(0.3, 0.28, 0.25); // Dark rock
+  const sandYellow = vec3(0.7, 0.6, 0.38); // Sandy beach
+  const snowWhite = vec3(0.92, 0.94, 0.96); // Snow caps
+  const mudBrown = vec3(0.18, 0.12, 0.08); // Wet mud near water
+  const waterEdge = vec3(0.08, 0.06, 0.04); // Dark water's edge
 
-  console.log(
-    "[TerrainShader] Material created with uniforms:",
-    Object.keys(uniforms),
+  // Sample Perlin noise for variation (multiple frequencies)
+  const noiseUV = mul(vec2(worldPos.x, worldPos.z), noiseScale);
+  const noiseValue = texture(noiseTex, noiseUV).r;
+
+  // Secondary noise for grass variation (different frequency)
+  const noiseUV2 = mul(
+    vec2(worldPos.x, worldPos.z),
+    mul(noiseScale, float(3.0)),
+  );
+  const noiseValue2 = texture(noiseTex, noiseUV2).r;
+
+  // High-frequency noise to break up banding/dithering (fine detail)
+  const noiseUV3 = mul(vec2(worldPos.x, worldPos.z), float(0.15));
+  const fineNoise = texture(noiseTex, noiseUV3).r;
+
+  // Micro noise for color variation (very fine)
+  const noiseUV4 = mul(vec2(worldPos.x, worldPos.z), float(0.5));
+  const microNoise = texture(noiseTex, noiseUV4).r;
+
+  // === BASE: GRASS with light/dark variation ===
+  const grassVariation = smoothstep(float(0.4), float(0.6), noiseValue2);
+  let baseColor = mix(grassGreen, grassDark, grassVariation);
+
+  // === DIRT PATCHES (noise-based, flat ground only) ===
+  // Wider transition for smoother blending
+  const dirtPatchFactor = smoothstep(
+    float(TERRAIN_CONSTANTS.DIRT_THRESHOLD - 0.05),
+    float(TERRAIN_CONSTANTS.DIRT_THRESHOLD + 0.15),
+    noiseValue,
+  );
+  const flatnessFactor = smoothstep(float(0.3), float(0.05), slope);
+  const dirtVariation = smoothstep(float(0.3), float(0.7), noiseValue2);
+  const dirtColor = mix(dirtBrown, dirtDark, dirtVariation);
+  baseColor = mix(baseColor, dirtColor, mul(dirtPatchFactor, flatnessFactor));
+
+  // === SLOPE-BASED DIRT (steeper = more dirt) ===
+  // Gradual transition
+  baseColor = mix(
+    baseColor,
+    dirtColor,
+    mul(smoothstep(float(0.15), float(0.5), slope), float(0.6)),
   );
 
-  // Add shader compilation error logging
-  material.onBeforeCompile = () => {
-    console.log("[TerrainShader] Shader compiling...");
-    console.log(
-      "[TerrainShader] Vertex shader length:",
-      terrainVertexShader.length,
-    );
-    console.log(
-      "[TerrainShader] Fragment shader length:",
-      terrainFragmentShader.length,
-    );
+  // === ROCK ON STEEP SLOPES ===
+  const rockVariation = smoothstep(float(0.3), float(0.7), noiseValue);
+  const rockColorFinal = mix(rockGray, rockDark, rockVariation);
+  baseColor = mix(
+    baseColor,
+    rockColorFinal,
+    smoothstep(float(0.45), float(0.75), slope),
+  );
 
-    // Log the actual shader code being compiled (first 500 chars)
-    console.log(
-      "[TerrainShader] Fragment shader start:",
-      terrainFragmentShader.substring(0, 500),
-    );
+  // === SNOW AT HIGH ELEVATION ===
+  // Very gradual snow transition
+  baseColor = mix(
+    baseColor,
+    snowWhite,
+    smoothstep(float(TERRAIN_CONSTANTS.SNOW_HEIGHT - 5.0), float(60.0), height),
+  );
+
+  // === SAND NEAR WATER (flat areas only) ===
+  const sandBlend = mul(
+    smoothstep(float(10.0), float(6.0), height),
+    smoothstep(float(0.25), float(0.0), slope),
+  );
+  baseColor = mix(baseColor, sandYellow, mul(sandBlend, float(0.6)));
+
+  // === SHORELINE TRANSITIONS (gradual) ===
+  // Zone 1: Wet dirt (8-14m) - wider zone
+  const wetDirtZone = smoothstep(float(14.0), float(8.0), height);
+  baseColor = mix(baseColor, dirtDark, mul(wetDirtZone, float(0.4)));
+
+  // Zone 2: Mud (6-9m)
+  const mudZone = smoothstep(float(9.0), float(6.0), height);
+  baseColor = mix(baseColor, mudBrown, mul(mudZone, float(0.7)));
+
+  // Zone 3: Water's edge (5-6.5m)
+  const edgeZone = smoothstep(float(6.5), float(5.0), height);
+  baseColor = mix(baseColor, waterEdge, mul(edgeZone, float(0.9)));
+
+  // === UNDERWATER CAUSTICS (keep these, they look good) ===
+  const causticTime = mul(timeUniform, float(0.25));
+  const causticScale = float(0.12);
+  const causticUV = mul(vec2(worldPos.x, worldPos.z), causticScale);
+
+  const c1 = sin(
+    add(
+      mul(causticUV.x, float(1.0)),
+      add(mul(causticUV.y, float(0.8)), causticTime),
+    ),
+  );
+  const c2 = sin(
+    add(
+      mul(causticUV.x, float(0.7)),
+      add(mul(causticUV.y, float(-1.1)), mul(causticTime, float(1.2))),
+    ),
+  );
+  const c3 = sin(
+    add(
+      mul(causticUV.x, float(-0.9)),
+      add(mul(causticUV.y, float(0.9)), mul(causticTime, float(0.85))),
+    ),
+  );
+  const c4 = sin(
+    add(
+      mul(add(causticUV.x, causticUV.y), float(1.0)),
+      mul(causticTime, float(1.1)),
+    ),
+  );
+
+  const causticPattern = pow(
+    mul(add(add(add(c1, c2), c3), c4), float(0.25)),
+    float(2.0),
+  );
+  const causticBrightness = mul(causticPattern, float(0.12));
+
+  const underwaterMask = smoothstep(float(5.0), float(4.0), height);
+  const depthFade = smoothstep(float(-5.0), float(4.0), height);
+  const causticMask = mul(underwaterMask, depthFade);
+
+  const causticLight = mul(
+    vec3(0.5, 0.7, 0.8),
+    mul(causticBrightness, causticMask),
+  );
+
+  // === ANTI-DITHERING: Add fine noise variation to break up banding ===
+  // Subtle brightness variation based on high-frequency noise
+  const brightnessVar = mul(sub(fineNoise, float(0.5)), float(0.08)); // ±4% brightness
+  const colorVar = mul(sub(microNoise, float(0.5)), float(0.04)); // ±2% color shift
+
+  // Apply variations to break up vertex interpolation artifacts
+  const variedColor = add(
+    baseColor,
+    vec3(
+      add(brightnessVar, colorVar),
+      brightnessVar,
+      sub(brightnessVar, colorVar),
+    ),
+  );
+
+  const finalColor = add(variedColor, causticLight);
+
+  // === CREATE MATERIAL ===
+  const material = new MeshStandardNodeMaterial();
+  material.colorNode = finalColor;
+  material.roughness = 1.0; // Fully matte - no specular
+  material.metalness = 0.0;
+  material.side = THREE.FrontSide;
+  // Smooth shading (default) - no flat shading
+
+  const terrainUniforms: TerrainUniforms = {
+    sunPosition: sunPositionUniform,
+    time: timeUniform,
   };
-
-  // Check for compilation errors after first render
-  let checked = false;
-  const originalOnBeforeRender = material.onBeforeRender;
-  material.onBeforeRender = function (
-    renderer,
-    scene,
-    camera,
-    geometry,
-    object,
-    group,
-  ) {
-    if (!checked) {
-      checked = true;
-
-      // Check WebGL program for errors
-      const program = (renderer as any).properties.get(material).program;
-      if (program) {
-        const gl = (renderer as any).getContext();
-        const valid = gl.getProgramParameter(
-          program.program,
-          gl.VALIDATE_STATUS,
-        );
-        const linked = gl.getProgramParameter(program.program, gl.LINK_STATUS);
-
-        console.log("[TerrainShader] Program status:", { valid, linked });
-
-        if (!valid || !linked) {
-          const log = gl.getProgramInfoLog(program.program);
-          console.error("[TerrainShader] ❌ Program error:", log);
-
-          const vertLog = gl.getShaderInfoLog(program.vertexShader);
-          const fragLog = gl.getShaderInfoLog(program.fragmentShader);
-          console.error("[TerrainShader] Vertex shader log:", vertLog);
-          console.error("[TerrainShader] Fragment shader log:", fragLog);
-        } else {
-          console.log("[TerrainShader] ✅ Material rendered successfully");
-        }
-      }
-
-      console.log("[TerrainShader] Uniforms:", {
-        hasGrass: !!material.uniforms.terrainGrassTexture.value,
-        hasDirt: !!material.uniforms.terrainDirtTexture.value,
-        hasRock: !!material.uniforms.terrainRockTexture.value,
-        hasSand: !!material.uniforms.terrainSandTexture.value,
-        hasSnow: !!material.uniforms.terrainSnowTexture.value,
-      });
-    }
-    if (originalOnBeforeRender) {
-      originalOnBeforeRender.call(
-        this,
-        renderer,
-        scene,
-        camera,
-        geometry,
-        object,
-        group,
-      );
-    }
+  const result = material as typeof material & {
+    terrainUniforms: TerrainUniforms;
   };
-
-  return material;
+  result.terrainUniforms = terrainUniforms;
+  return result;
 }

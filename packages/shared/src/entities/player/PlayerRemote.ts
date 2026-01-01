@@ -69,6 +69,8 @@ import type {
   HealthBars as HealthBarsSystem,
   HealthBarHandle,
 } from "../../systems/client/HealthBars";
+import { COMBAT_CONSTANTS } from "../../constants/CombatConstants";
+import { ticksToMs } from "../../utils/game/CombatCalculations";
 
 interface AvatarWithInstance {
   instance: {
@@ -103,6 +105,7 @@ export class PlayerRemote extends Entity implements HotReloadable {
   aura!: Group;
   nametag!: Nametag;
   private _healthBarHandle: HealthBarHandle | null = null; // Separate health bar (HealthBars system)
+  private _healthBarVisibleUntil: number = 0; // Timestamp when health bar should hide (fallback timer)
   bubble!: UI;
   bubbleBox!: UIView;
   bubbleText!: UIText;
@@ -122,12 +125,26 @@ export class PlayerRemote extends Entity implements HotReloadable {
   public enableInterpolation: boolean = false; // Disabled - ensure basic movement works first
   private _tempMatrix1 = new THREE.Matrix4();
   private _tempVector3_1 = new THREE.Vector3();
+  // Pre-allocated temps for update/lateUpdate to avoid per-frame allocations
+  private _combatQuat = new THREE.Quaternion();
+  private _combatAxis = new THREE.Vector3(0, 1, 0);
+  private _nametagMatrix = new THREE.Matrix4();
+  private _healthBarMatrix = new THREE.Matrix4();
+
+  // Raycast proxy mesh - added directly to THREE.Scene for fast raycasting
+  // This bypasses the Node system and avoids expensive SkinnedMesh raycast
+  private raycastProxy: THREE.Mesh | null = null;
 
   // Combat state for RuneScape-style auto-retaliate
   combat = {
     inCombat: false,
     combatTarget: null as string | null,
   };
+
+  /** Combat level for OSRS-style display and PvP range checks */
+  get combatLevel(): number {
+    return (this.data.combatLevel as number) || 3; // Default to OSRS minimum
+  }
 
   // Guard to prevent double initialization
   private _initialized: boolean = false;
@@ -173,18 +190,36 @@ export class PlayerRemote extends Entity implements HotReloadable {
     }) as Mesh;
     this.body.add(this.collider);
 
-    // this.caps = createNode('mesh', {
-    //   type: 'geometry',
-    //   geometry: capsuleGeometry,
-    //   material: new THREE.MeshStandardMaterial({ color: 'white' }),
-    // })
-    // this.base.add(this.caps)
+    // Create raycast proxy mesh for fast entity detection
+    // PERFORMANCE: VRM SkinnedMesh raycast is extremely slow (~700ms) because THREE.js
+    // must transform every vertex by bone weights. This simple capsule mesh is instant.
+    // The proxy is added directly to THREE.Scene, bypassing the Node system entirely.
+    this.raycastProxy = new THREE.Mesh(
+      capsuleGeometry,
+      new THREE.MeshBasicMaterial({
+        visible: false, // Invisible but still raycastable
+      }),
+    );
+    this.raycastProxy.userData = {
+      type: "player",
+      entityId: this.id,
+      name: this.data.name || "Player",
+      interactable: true,
+    };
+    // Add directly to THREE.Scene - bypasses Node.add() validation
+    const scene = this.world.stage?.scene;
+    if (scene) {
+      scene.add(this.raycastProxy);
+      // Sync initial position
+      this.raycastProxy.position.copy(this.position);
+    }
 
     this.aura = createNode("group") as Group;
 
-    // Create nametag for name display only (no health - that's now in HealthBars system)
+    // Create nametag with name and combat level (OSRS format: "Name (level-XX)")
     this.nametag = createNode("nametag", {
       label: this.data.name || "",
+      level: (this.data.combatLevel as number) || 3, // Default to OSRS minimum
       active: true,
     }) as Nametag;
     // Set world context for nametag (needed for mounting to Nametags system)
@@ -342,7 +377,12 @@ export class PlayerRemote extends Entity implements HotReloadable {
       // Set the parent so the node knows where it belongs in the hierarchy
       // Note: PlayerRemote uses Hyperscape Group node (not raw THREE.Group like PlayerLocal)
       // The node system handles matrix updates automatically
-      (nodeObj as any).parent = { matrixWorld: this.base.matrixWorld };
+      interface NodeWithParent {
+        parent?: { matrixWorld: THREE.Matrix4 };
+      }
+      (nodeObj as NodeWithParent).parent = {
+        matrixWorld: this.base.matrixWorld,
+      };
 
       // CRITICAL: Avatar node position should be at origin (0,0,0) (matches PlayerLocal)
       // The instance.move() method will position it at the base's world position
@@ -376,16 +416,38 @@ export class PlayerRemote extends Entity implements HotReloadable {
       }
 
       // CRITICAL: Make avatar visible and ensure proper positioning (matches PlayerLocal)
-      (this.avatar as unknown as { visible: boolean }).visible = true;
+      // Avatar visibility is controlled through the instance's raw scene object
+      if (this.avatar?.instance) {
+        const avatarWithRaw = this.avatar.instance as unknown as {
+          raw?: { scene?: { visible?: boolean } };
+        };
+        if (avatarWithRaw.raw?.scene) {
+          avatarWithRaw.raw.scene.visible = true;
+        }
+      }
       nodeObj.position.set(0, 0, 0);
+
+      // PERFORMANCE: Disable raycasting on VRM meshes - use raycastProxy instead
+      // SkinnedMesh raycast is extremely slow (~700ms) because THREE.js must
+      // transform every vertex by bone weights. The capsule proxy mesh is instant.
+      const instanceWithRaw = avatarWithInstance.instance as unknown as {
+        raw?: { scene?: THREE.Object3D };
+      };
+      if (instanceWithRaw?.raw?.scene) {
+        instanceWithRaw.raw.scene.traverse((child: THREE.Object3D) => {
+          child.raycast = () => {}; // No-op raycast
+        });
+      }
 
       // Ensure a default idle emote after mount so avatar isn't frozen
       (this.avatar as Avatar).setEmote(Emotes.IDLE);
       this.lastEmote = Emotes.IDLE;
 
       // Calculate camera height for spectator mode (same as PlayerLocal)
-      const avatarHeight = (this.avatar as unknown as { height: number })
-        .height;
+      interface AvatarWithHeight {
+        height?: number;
+      }
+      const avatarHeight = (this.avatar as AvatarWithHeight).height ?? 1.5;
       const camHeight = Math.max(1.2, avatarHeight * 0.9);
 
       // Avatar loaded successfully
@@ -466,79 +528,17 @@ export class PlayerRemote extends Entity implements HotReloadable {
           this.base.updateTransform();
         }
       } else {
-        // TileInterpolator is controlling position - just update base transform
+        // AAA ARCHITECTURE: TileInterpolator is Single Source of Truth for transform
+        // When TileInterpolator controls this entity, it handles BOTH position AND rotation:
+        // - Position: Smooth tile-to-tile interpolation
+        // - Rotation: Movement direction when walking, combat rotation when standing still
+        //
+        // Combat rotation comes via entityModified → ClientNetwork → TileInterpolator.setCombatRotation()
+        // TileInterpolator applies rotation to base.quaternion in its update()
+        //
+        // We just need to sync the transform here - TileInterpolator does the rest.
         this.base.updateTransform();
       }
-    }
-
-    // COMBAT ROTATION: Rotate to face target when in combat (RuneScape-style)
-    // Priority: 1) Our combat target (from server), 2) Mob attacking us
-    let combatTarget: {
-      position: { x: number; z: number };
-      id: string;
-    } | null = null;
-
-    // First check if WE have a combat target (player attacking mob)
-    if (this.combat.combatTarget) {
-      const targetEntity = this.world.entities.items.get(
-        this.combat.combatTarget,
-      );
-      if (targetEntity?.position) {
-        const dx = targetEntity.position.x - this.position.x;
-        const dz = targetEntity.position.z - this.position.z;
-        const distance2D = Math.sqrt(dx * dx + dz * dz);
-        // Only rotate if target is within reasonable combat range
-        if (distance2D <= 10) {
-          combatTarget = {
-            position: targetEntity.position,
-            id: targetEntity.id,
-          };
-        }
-      }
-    }
-
-    // If no target from our combat state, check for mobs attacking us
-    if (!combatTarget) {
-      for (const entity of this.world.entities.items.values()) {
-        if (entity.type === "mob" && entity.position) {
-          const mobEntity = entity as any;
-          // Check if mob is in ATTACK state and targeting this player
-          if (
-            mobEntity.config?.aiState === "attack" &&
-            mobEntity.config?.targetPlayerId === this.id
-          ) {
-            const dx = entity.position.x - this.position.x;
-            const dz = entity.position.z - this.position.z;
-            const distance2D = Math.sqrt(dx * dx + dz * dz);
-
-            // Only rotate if mob is within reasonable combat range
-            if (distance2D <= 3) {
-              combatTarget = { position: entity.position, id: entity.id };
-              break; // Only face one mob at a time
-            }
-          }
-        }
-      }
-    }
-
-    // OSRS behavior: Only face combat target when STANDING STILL
-    // When moving, face movement direction (handled by TileInterpolator)
-    const isMoving = this.data.tileMovementActive === true;
-
-    if (combatTarget && !isMoving) {
-      // Calculate angle to target (XZ plane only, like RuneScape)
-      const dx = combatTarget.position.x - this.position.x;
-      const dz = combatTarget.position.z - this.position.z;
-      let angle = Math.atan2(dx, dz);
-
-      // VRM 1.0+ models have 180° base rotation, so we need to compensate
-      // Otherwise entities face AWAY from each other instead of towards
-      angle += Math.PI;
-
-      // Apply rotation to node quaternion
-      const tempQuat = new THREE.Quaternion();
-      tempQuat.setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
-      this.node.quaternion.copy(tempQuat);
     }
 
     // Update node matrices for rendering
@@ -550,9 +550,10 @@ export class PlayerRemote extends Entity implements HotReloadable {
     // Update avatar position to follow player
     if (this.avatar && (this.avatar as AvatarWithInstance).instance) {
       const instance = (this.avatar as AvatarWithInstance).instance;
-      const instanceWithRaw = instance as unknown as {
+      interface InstanceWithRaw {
         raw?: { scene?: THREE.Object3D };
-      };
+      }
+      const instanceWithRaw = instance as InstanceWithRaw;
 
       // Directly set the avatar scene position
       if (instanceWithRaw?.raw?.scene) {
@@ -629,14 +630,38 @@ export class PlayerRemote extends Entity implements HotReloadable {
 
       // Update animation if changed
       if (desiredUrl !== this.lastEmote) {
+        // DEBUG: Log death emote application
+        if (serverEmote === "death" || desiredUrl === Emotes.DEATH) {
+          console.log(`[PlayerRemote] update() applying death emote:`, {
+            id: this.id,
+            serverEmote,
+            desiredUrl,
+            lastEmote: this.lastEmote,
+            hasEmoteProperty: "emote" in this.avatar,
+            hasSetEmoteMethod: "setEmote" in this.avatar,
+          });
+        }
         if ("emote" in this.avatar) {
-          (this.avatar as unknown as { emote: string | null }).emote =
-            desiredUrl;
+          interface AvatarWithEmote {
+            emote?: string | null;
+          }
+          (this.avatar as AvatarWithEmote).emote = desiredUrl;
         } else if ("setEmote" in this.avatar) {
           (this.avatar as Avatar).setEmote(desiredUrl);
         }
         this.lastEmote = desiredUrl;
       }
+    } else if (this.data.emote === "death") {
+      // DEBUG: Avatar not available when death emote is set
+      console.warn(`[PlayerRemote] update() death emote but NO AVATAR:`, {
+        id: this.id,
+        emote: this.data.emote,
+      });
+    }
+
+    // Sync raycast proxy position with player
+    if (this.raycastProxy) {
+      this.raycastProxy.position.copy(this.position);
     }
 
     // Update prev position at end of frame
@@ -660,19 +685,27 @@ export class PlayerRemote extends Entity implements HotReloadable {
     // Update nametag position in Nametags system (name only - no health)
     // This matches PlayerLocal behavior - without this, the nametag renders at origin
     if (this.nametag && this.nametag.handle && this.base) {
-      // Position nametag slightly higher than health bar
-      const nametagMatrix = new THREE.Matrix4();
-      nametagMatrix.copy(this.base.matrixWorld);
-      nametagMatrix.elements[13] += 2.2; // Name slightly higher
-      this.nametag.handle.move(nametagMatrix);
+      // Position nametag slightly higher than health bar using pre-allocated matrix
+      this._nametagMatrix.copy(this.base.matrixWorld);
+      this._nametagMatrix.elements[13] += 2.2; // Name slightly higher
+      this.nametag.handle.move(this._nametagMatrix);
     }
 
     // Update health bar position in HealthBars system (separate from nametag)
     if (this._healthBarHandle && this.base) {
-      const healthBarMatrix = new THREE.Matrix4();
-      healthBarMatrix.copy(this.base.matrixWorld);
-      healthBarMatrix.elements[13] += 2.0; // Health bar at Y=2.0
-      this._healthBarHandle.move(healthBarMatrix);
+      // Use pre-allocated matrix to avoid per-frame allocations
+      this._healthBarMatrix.copy(this.base.matrixWorld);
+      this._healthBarMatrix.elements[13] += 2.0; // Health bar at Y=2.0
+      this._healthBarHandle.move(this._healthBarMatrix);
+    }
+
+    // Fallback: Hide health bar after combat timeout if server c:false was missed
+    // This handles edge cases where network packet is lost or getPlayer() fails on server
+    if (this._healthBarHandle && this._healthBarVisibleUntil > 0) {
+      if (Date.now() >= this._healthBarVisibleUntil) {
+        this._healthBarHandle.hide();
+        this._healthBarVisibleUntil = 0;
+      }
     }
   }
 
@@ -726,16 +759,31 @@ export class PlayerRemote extends Entity implements HotReloadable {
       }
     }
     if (data.q !== undefined) {
-      // CRITICAL: Skip quaternion updates when TileInterpolator is controlling rotation
-      // TileInterpolator handles rotation smoothly for tile-based movement
-      const tileControlled = this.data.tileInterpolatorControlled === true;
-      if (!tileControlled) {
-        // Rotation is no longer stored in EntityData, apply directly to entity transform
-        this.lerpQuaternion.pushArray(data.q, this.teleport || null);
-        // When explicit rotation update arrives, clear any movement-facing override to avoid fighting network
-      }
+      // AAA ARCHITECTURE: Rotation handling depends on whether TileInterpolator is active
+      //
+      // When TileInterpolator IS active:
+      //   - ClientNetwork routes rotation to TileInterpolator.setCombatRotation()
+      //   - data.q will NOT arrive here (stripped from entityModified)
+      //   - TileInterpolator applies rotation to base.quaternion
+      //
+      // When TileInterpolator is NOT active (e.g., entity not in world.entities.players):
+      //   - data.q arrives here and is pushed to lerpQuaternion
+      //   - update() applies lerpQuaternion to node.quaternion
+      //
+      // This ensures single source of truth: TileInterpolator when active, lerpQuaternion otherwise.
+      this.lerpQuaternion.pushArray(data.q, this.teleport || null);
     }
     if (data.e !== undefined) {
+      // DEBUG: Log emote changes for death animation tracking
+      if (data.e === "death") {
+        console.log(`[PlayerRemote] Setting death emote:`, {
+          id: this.id,
+          oldEmote: this.data.emote,
+          newEmote: data.e,
+          hasAvatar: !!this.avatar,
+          lastEmote: this.lastEmote,
+        });
+      }
       this.data.emote = data.e;
     }
     if (data.ef !== undefined) {
@@ -744,6 +792,11 @@ export class PlayerRemote extends Entity implements HotReloadable {
     if (data.name !== undefined) {
       this.data.name = data.name as string;
       this.nametag.label = (data.name as string) || "";
+    }
+    // Update combat level on nametag (OSRS format: "Name (level-XX)")
+    if (data.combatLevel !== undefined) {
+      this.data.combatLevel = data.combatLevel as number;
+      this.nametag.level = data.combatLevel as number;
     }
     if (data.health !== undefined) {
       const currentHealth = data.health as number;
@@ -786,9 +839,14 @@ export class PlayerRemote extends Entity implements HotReloadable {
       // Show/hide health bar via HealthBars system (RuneScape pattern)
       if (this._healthBarHandle) {
         if (newInCombat) {
+          // In combat - show health bar and set/extend timeout
           this._healthBarHandle.show();
+          this._healthBarVisibleUntil =
+            Date.now() + ticksToMs(COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS);
         } else {
+          // Combat ended - hide and clear timer
           this._healthBarHandle.hide();
+          this._healthBarVisibleUntil = 0;
         }
       }
     }
@@ -813,27 +871,66 @@ export class PlayerRemote extends Entity implements HotReloadable {
   }
 
   override destroy(local?: boolean) {
+    // Guard uses inherited Entity.destroyed flag
     if (this.destroyed) return;
-    this.destroyed = true;
+    // NOTE: Do NOT set this.destroyed = true here!
+    // Entity.destroy() sets it, and if we set it first, super.destroy() will
+    // immediately return and the node won't be removed from the scene.
 
+    // 1. Remove raycast proxy from scene
+    if (this.raycastProxy) {
+      const scene = this.world.stage?.scene;
+      if (scene) {
+        scene.remove(this.raycastProxy);
+      }
+      this.raycastProxy.geometry.dispose();
+      (this.raycastProxy.material as THREE.Material).dispose();
+      this.raycastProxy = null;
+    }
+
+    // 2. Clear timers
     if (this.chatTimer) clearTimeout(this.chatTimer);
+
+    // 3. Clean up avatar (VRM instance is added directly to world.stage.scene)
+    // Must destroy the instance to remove from scene, not just set to undefined
+    if (this.avatar) {
+      this.avatar.deactivate();
+      // Destroy VRM instance to remove from scene
+      const avatarWithInstance = this.avatar as AvatarWithInstance;
+      if (avatarWithInstance.instance) {
+        avatarWithInstance.instance.destroy();
+      }
+      this.avatar = undefined;
+    }
+
+    // 4. Unmount nametag (registered with Nametags system)
+    if (this.nametag && this.nametag.unmount) {
+      this.nametag.unmount();
+    }
+
+    // 5. Deactivate visual components
     this.base.deactivate();
-    this.avatar = undefined;
-    this.world.setHot(this, false);
-    this.world.emit(EventType.PLAYER_LEFT, { playerId: this.data.id });
     this.aura.deactivate();
 
-    // Clean up health bar from HealthBars system
+    // 6. Unregister from hot updates
+    this.world.setHot(this, false);
+
+    // 7. Clean up health bar from HealthBars system
     if (this._healthBarHandle) {
       this._healthBarHandle.destroy();
       this._healthBarHandle = null;
     }
 
-    this.world.entities.remove(this.data.id);
-    // if removed locally we need to broadcast to server/clients
-    if (local) {
-      this.world.network.send("entityRemoved", this.data.id);
-    }
+    // 8. Call parent destroy to:
+    //    - Set destroyed = true
+    //    - Remove node from scene
+    //    - Dispose mesh/materials
+    //    - Clean up physics
+    //    - Clean up components
+    // Pass false to prevent duplicate entityRemoved broadcast
+    // (server already sent it via handleDisconnect, and Entities.remove()
+    // is what called us so we don't need to call it again)
+    super.destroy(false);
   }
 
   public toggleInterpolation(enabled: boolean): void {

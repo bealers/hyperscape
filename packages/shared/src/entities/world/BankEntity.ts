@@ -81,9 +81,11 @@ export class BankEntity extends InteractableEntity {
     // Create a black box for the bank (1 tile size, chest-like proportions)
     const boxHeight = 0.7;
     const geometry = new THREE.BoxGeometry(0.9, boxHeight, 0.9);
-    const material = new THREE.MeshLambertMaterial({
+    // Use MeshStandardMaterial for proper lighting (responds to sun, moon, and environment maps)
+    const material = new THREE.MeshStandardMaterial({
       color: 0x111111, // Very dark black
-      transparent: false,
+      roughness: 0.3,
+      metalness: 0.8, // Metallic chest
     });
 
     const mesh = new THREE.Mesh(geometry, material);

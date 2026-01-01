@@ -123,7 +123,6 @@ export class ItemInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: `pickup_${pileItem.id}`,
         label: `Take ${pileItem.name}`,
-        icon: "🎒",
         enabled: true,
         priority: priority++,
         handler: () => this.pickupItem(pileItem.id, pileItem.position),
@@ -141,7 +140,6 @@ export class ItemInteractionHandler extends BaseInteractionHandler {
       actions.push({
         id: `examine_${pileItem.id}`,
         label: `Examine ${pileItem.name}`,
-        icon: "👁️",
         enabled: true,
         priority: 100 + priority++,
         handler: () => this.showExamineMessage(examineText),

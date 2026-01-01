@@ -49,7 +49,7 @@ import { isNumber } from "lodash-es";
 
 import { LooseOctree } from "../../../utils/physics/LooseOctree";
 import THREE from "../../../extras/three/three";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import { World } from "../../../core/World";
 
 import type { SkyHandle } from "../../../types";
@@ -195,7 +195,10 @@ export class Stage extends SystemBase {
   }
 
   override update(_delta: number): void {
-    this.models.forEach((model) => model.clean());
+    // Use for-of instead of forEach to avoid callback allocation each frame
+    for (const model of this.models.values()) {
+      model.clean();
+    }
   }
 
   override postUpdate(): void {
@@ -325,34 +328,37 @@ export class Stage extends SystemBase {
     }
     const textures: THREE.Texture[] = [];
 
+    // Cast to MaterialWithTexture for texture map access
+    const matWithTex = raw as MaterialWithTexture;
+
     const mapTexture = this.cloneMaterialTexture(raw, "map");
     if (mapTexture) {
-      raw.map = mapTexture;
+      matWithTex.map = mapTexture;
       textures.push(mapTexture);
     }
     const emissiveMapTexture = this.cloneMaterialTexture(raw, "emissiveMap");
     if (emissiveMapTexture) {
-      raw.emissiveMap = emissiveMapTexture;
+      matWithTex.emissiveMap = emissiveMapTexture;
       textures.push(emissiveMapTexture);
     }
     const normalMapTexture = this.cloneMaterialTexture(raw, "normalMap");
     if (normalMapTexture) {
-      raw.normalMap = normalMapTexture;
+      matWithTex.normalMap = normalMapTexture;
       textures.push(normalMapTexture);
     }
     const bumpMapTexture = this.cloneMaterialTexture(raw, "bumpMap");
     if (bumpMapTexture) {
-      raw.bumpMap = bumpMapTexture;
+      matWithTex.bumpMap = bumpMapTexture;
       textures.push(bumpMapTexture);
     }
     const roughnessMapTexture = this.cloneMaterialTexture(raw, "roughnessMap");
     if (roughnessMapTexture) {
-      raw.roughnessMap = roughnessMapTexture;
+      matWithTex.roughnessMap = roughnessMapTexture;
       textures.push(roughnessMapTexture);
     }
     const metalnessMapTexture = this.cloneMaterialTexture(raw, "metalnessMap");
     if (metalnessMapTexture) {
-      raw.metalnessMap = metalnessMapTexture;
+      matWithTex.metalnessMap = metalnessMapTexture;
       textures.push(metalnessMapTexture);
     }
 

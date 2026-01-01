@@ -1,7 +1,8 @@
 /**
  * Nametag.ts - Player/NPC Name Label
  *
- * Displays character names above entities.
+ * Displays character names above entities with optional combat level.
+ * OSRS format: "Name (level-XX)"
  *
  * IMPORTANT: Health bars are now handled separately by the HealthBars system.
  * This node ONLY handles name display.
@@ -16,22 +17,23 @@ import type {
 } from "../systems/client/Nametags";
 import type { NametagData } from "../types/rendering/nodes";
 import { Node } from "./Node";
-import THREE from "../extras/three/three";
 
 const defaults = {
   label: "...",
+  level: null as number | null,
 };
 
 /**
  * Nametag Node - Frontend handle for the Nametags system
  *
- * Provides a clean API for entities to manage their name label.
+ * Provides a clean API for entities to manage their name label and combat level.
  * Health bars are handled separately by the HealthBar node/HealthBars system.
  */
 export class Nametag extends Node {
   handle: NametagHandle | null = null;
 
   private _label: string = defaults.label;
+  private _level: number | null = defaults.level;
 
   constructor(data: NametagData = {}) {
     super(data);
@@ -39,6 +41,9 @@ export class Nametag extends Node {
 
     if (data.label !== undefined) {
       this._label = String(data.label);
+    }
+    if (data.level !== undefined) {
+      this._level = data.level;
     }
   }
 
@@ -57,7 +62,7 @@ export class Nametag extends Node {
     ) as NametagsSystem | undefined;
 
     if (nametags) {
-      this.handle = nametags.add({ name: this._label });
+      this.handle = nametags.add({ name: this._label, level: this._level });
       if (this.handle) {
         this.handle.move(this.matrixWorld);
       }
@@ -80,6 +85,7 @@ export class Nametag extends Node {
   copy(source: Nametag, recursive: boolean) {
     super.copy(source, recursive);
     this._label = source._label;
+    this._level = source._level;
     return this;
   }
 
@@ -94,6 +100,19 @@ export class Nametag extends Node {
     this.handle?.setName(newValue);
   }
 
+  /** Combat level (null = don't display) */
+  get level(): number | null {
+    return this._level;
+  }
+
+  /** Set combat level for OSRS-style display: "Name (level-XX)" */
+  set level(value: number | null | undefined) {
+    const newValue = value !== undefined ? value : defaults.level;
+    if (this._level === newValue) return;
+    this._level = newValue;
+    this.handle?.setLevel(newValue);
+  }
+
   getProxy() {
     const self = this;
     if (!this.proxy) {
@@ -103,6 +122,12 @@ export class Nametag extends Node {
         },
         set label(value: string) {
           self.label = value;
+        },
+        get level() {
+          return self.level;
+        },
+        set level(value: number | null) {
+          self.level = value;
         },
       };
       proxy = Object.defineProperties(

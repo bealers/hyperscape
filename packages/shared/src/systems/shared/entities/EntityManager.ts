@@ -37,11 +37,12 @@ import {
   MobAIState,
   NPCType,
   ResourceType,
+  DeathState,
 } from "../../../types/entities";
 import { NPCBehavior, NPCState } from "../../../types/core/core";
 import { EventType } from "../../../types/events";
 import { TerrainSystem } from "..";
-import { SystemBase } from "..";
+import { SystemBase } from "../infrastructure/SystemBase";
 import { getItem } from "../../../data/items";
 import { getNPCById } from "../../../data/npcs";
 import { getExternalNPC } from "../../../utils/ExternalAssetUtils";
@@ -296,7 +297,8 @@ export class EntityManager extends SystemBase {
 
   update(deltaTime: number): void {
     // Update all entities that need updates
-    this.entitiesNeedingUpdate.forEach((entityId) => {
+    // Use for-of instead of forEach to avoid callback allocation each frame
+    for (const entityId of this.entitiesNeedingUpdate) {
       const entity = this.entities.get(entityId);
       if (entity) {
         entity.update(deltaTime);
@@ -307,7 +309,7 @@ export class EntityManager extends SystemBase {
           entity.networkDirty = false; // Reset flag after adding to set
         }
       }
-    });
+    }
 
     // Send network updates
     if (this.world.isServer && this.networkDirtyEntities.size > 0) {
@@ -317,9 +319,10 @@ export class EntityManager extends SystemBase {
 
   fixedUpdate(deltaTime: number): void {
     // Fixed update for physics
-    this.entities.forEach((entity) => {
+    // Use for-of instead of forEach to avoid callback allocation each frame
+    for (const entity of this.entities.values()) {
       entity.fixedUpdate(deltaTime);
-    });
+    }
   }
 
   async spawnEntity(config: EntityConfig): Promise<Entity | null> {
@@ -847,32 +850,58 @@ export class EntityManager extends SystemBase {
 
       if (entity) {
         // Get current position from entity
-        const pos = entity.position;
-        const rot = entity.node?.quaternion;
+        let pos = entity.position;
+        // Get rotation: prefer node.quaternion (client) but fallback to entity.rotation (server)
+        const rot = entity.node?.quaternion ?? entity.rotation;
 
         // Get network data from entity (includes health and other properties)
         const networkData = entity.getNetworkData();
 
-        // Debug logging disabled (too spammy)
-        // if (entity.type === 'player') {
-        //   console.log(`[EntityManager] 📤 Syncing player ${entityId}`);
-        //   console.log(`[EntityManager] 📤 networkData keys:`, Object.keys(networkData));
-        //   console.log(`[EntityManager] 📤 networkData.c (inCombat):`, (networkData as { c?: boolean }).c);
-        //   console.log(`[EntityManager] 📤 networkData.e (emote):`, (networkData as { e?: string }).e);
-        //   console.log(`[EntityManager] 📤 Full networkData:`, JSON.stringify(networkData, null, 2));
-        // }
+        // AAA QUALITY: Check entity.data.deathState directly (single source of truth)
+        // During death animation, we lock the player's broadcast position to their death location
+        // This prevents any position updates from reaching clients until respawn
+        let skipPositionBroadcast = false;
+        let deathPos: [number, number, number] | null = null;
+        if (entity.type === "player" && entity.data) {
+          const entityData = entity.data as {
+            deathState?: DeathState;
+            deathPosition?: [number, number, number];
+          };
 
-        // Send entityModified packet with position/rotation changes
-        // Call directly on network object to preserve 'this' context
-        // Non-null assertion safe because we checked network.send exists above
-        network.send!("entityModified", {
-          id: entityId,
-          changes: {
-            p: [pos.x, pos.y, pos.z],
-            q: rot ? [rot.x, rot.y, rot.z, rot.w] : undefined,
-            ...networkData, // Include all entity-specific data (health, aiState, etc.)
-          },
-        });
+          if (
+            entityData.deathState === DeathState.DYING ||
+            entityData.deathState === DeathState.DEAD
+          ) {
+            // Player is dead - freeze position to death location
+            if (entityData.deathPosition) {
+              deathPos = entityData.deathPosition;
+            }
+            skipPositionBroadcast = true;
+          }
+        }
+
+        // Send entityModified packet
+        // For dead players, skip position/rotation to keep them at death location on all clients
+        if (skipPositionBroadcast) {
+          // Dead player: Only send non-position data (emote, health, etc.)
+          // This ensures death animation plays at death location
+          network.send!("entityModified", {
+            id: entityId,
+            changes: {
+              ...networkData, // Emote, health, combat state, etc.
+            },
+          });
+        } else {
+          // Normal entity: Send full update with position
+          network.send!("entityModified", {
+            id: entityId,
+            changes: {
+              p: [pos.x, pos.y, pos.z],
+              q: rot ? [rot.x, rot.y, rot.z, rot.w] : undefined,
+              ...networkData,
+            },
+          });
+        }
       }
       // Entity not found - this is expected when:
       // - Items are picked up between marking dirty and sync

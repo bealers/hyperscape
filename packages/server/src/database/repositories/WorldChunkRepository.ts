@@ -231,4 +231,81 @@ export class WorldChunkRepository extends BaseRepository {
         ),
       );
   }
+
+  /**
+   * Clean up old chunk activity records
+   *
+   * Deletes chunk activity records older than the specified number of days.
+   * Used for maintenance to keep the database clean.
+   *
+   * @param daysOld - Delete activity records older than this many days
+   * @returns Number of records deleted
+   */
+  async cleanupOldChunkActivityAsync(daysOld: number): Promise<number> {
+    this.ensureDatabase();
+
+    const cutoffTime = Date.now() - daysOld * 24 * 60 * 60 * 1000;
+
+    // Delete activity records where exitTime is set and older than cutoff
+    const result = await this.db
+      .delete(schema.chunkActivity)
+      .where(
+        sql`${schema.chunkActivity.exitTime} IS NOT NULL AND ${schema.chunkActivity.exitTime} < ${cutoffTime}`,
+      );
+
+    // PostgreSQL returns rowCount for delete operations
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Get count of chunks
+   *
+   * Returns the total number of chunks in the database.
+   *
+   * @returns Total number of chunks
+   */
+  async getChunkCountAsync(): Promise<number> {
+    this.ensureDatabase();
+
+    const result = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.worldChunks);
+
+    return result[0]?.count ?? 0;
+  }
+
+  /**
+   * Get count of active chunks
+   *
+   * Returns the number of chunks with players currently in them.
+   *
+   * @returns Number of active chunks
+   */
+  async getActiveChunkCountAsync(): Promise<number> {
+    this.ensureDatabase();
+
+    const result = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.worldChunks)
+      .where(sql`${schema.worldChunks.playerCount} > 0`);
+
+    return result[0]?.count ?? 0;
+  }
+
+  /**
+   * Get count of total chunk activity records
+   *
+   * Returns the total number of chunk activity records.
+   *
+   * @returns Total number of activity records
+   */
+  async getTotalActivityRecordsAsync(): Promise<number> {
+    this.ensureDatabase();
+
+    const result = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.chunkActivity);
+
+    return result[0]?.count ?? 0;
+  }
 }

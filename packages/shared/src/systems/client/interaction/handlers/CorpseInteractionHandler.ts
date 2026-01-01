@@ -41,7 +41,6 @@ export class CorpseInteractionHandler extends BaseInteractionHandler {
     actions.push({
       id: "loot",
       label: `Loot ${target.name}`,
-      icon: "💀",
       enabled: true,
       priority: 1,
       handler: () => this.lootCorpse(target),
