@@ -118,6 +118,8 @@ import { vector3ToPxVec3 } from "../../utils/physics/PhysicsUtils";
 import { getSystem } from "../../utils/SystemUtils";
 import type { World } from "../../core/World";
 import { Entity } from "../Entity";
+import { COMBAT_CONSTANTS } from "../../constants/CombatConstants";
+import { ticksToMs } from "../../utils/game/CombatCalculations";
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -509,6 +511,7 @@ export class PlayerLocal extends Entity implements HotReloadable {
   aura: THREE.Group | null = null;
   nametag: Nametag | null = null;
   private _healthBarHandle: HealthBarHandle | null = null; // Separate health bar (HealthBars system)
+  private _healthBarVisibleUntil: number = 0; // Timestamp when health bar should hide (fallback timer)
   bubble: UI | null = null;
   bubbleBox: UIView | null = null;
   bubbleText: UIText | null = null;
@@ -852,9 +855,14 @@ export class PlayerLocal extends Entity implements HotReloadable {
       // Show/hide health bar based on combat state (RuneScape pattern)
       if (this._healthBarHandle) {
         if (newInCombat) {
+          // In combat - show health bar and set/extend timeout
           this._healthBarHandle.show();
+          this._healthBarVisibleUntil =
+            Date.now() + ticksToMs(COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS);
         } else {
+          // Combat ended - hide and clear timer
           this._healthBarHandle.hide();
+          this._healthBarVisibleUntil = 0;
         }
       }
     }
@@ -2183,6 +2191,15 @@ export class PlayerLocal extends Entity implements HotReloadable {
         healthBarMatrix.copy(this.base.matrixWorld);
         healthBarMatrix.elements[13] += 2.0; // Health bar at Y=2.0
         this._healthBarHandle.move(healthBarMatrix);
+      }
+
+      // Fallback: Hide health bar after combat timeout if server c:false was missed
+      // This handles edge cases where network packet is lost or getPlayer() fails on server
+      if (this._healthBarHandle && this._healthBarVisibleUntil > 0) {
+        if (Date.now() >= this._healthBarVisibleUntil) {
+          this._healthBarHandle.hide();
+          this._healthBarVisibleUntil = 0;
+        }
       }
     }
   }

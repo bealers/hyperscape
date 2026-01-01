@@ -69,6 +69,8 @@ import type {
   HealthBars as HealthBarsSystem,
   HealthBarHandle,
 } from "../../systems/client/HealthBars";
+import { COMBAT_CONSTANTS } from "../../constants/CombatConstants";
+import { ticksToMs } from "../../utils/game/CombatCalculations";
 
 interface AvatarWithInstance {
   instance: {
@@ -103,6 +105,7 @@ export class PlayerRemote extends Entity implements HotReloadable {
   aura!: Group;
   nametag!: Nametag;
   private _healthBarHandle: HealthBarHandle | null = null; // Separate health bar (HealthBars system)
+  private _healthBarVisibleUntil: number = 0; // Timestamp when health bar should hide (fallback timer)
   bubble!: UI;
   bubbleBox!: UIView;
   bubbleText!: UIText;
@@ -673,6 +676,15 @@ export class PlayerRemote extends Entity implements HotReloadable {
       healthBarMatrix.elements[13] += 2.0; // Health bar at Y=2.0
       this._healthBarHandle.move(healthBarMatrix);
     }
+
+    // Fallback: Hide health bar after combat timeout if server c:false was missed
+    // This handles edge cases where network packet is lost or getPlayer() fails on server
+    if (this._healthBarHandle && this._healthBarVisibleUntil > 0) {
+      if (Date.now() >= this._healthBarVisibleUntil) {
+        this._healthBarHandle.hide();
+        this._healthBarVisibleUntil = 0;
+      }
+    }
   }
 
   postLateUpdate(_delta: number): void {
@@ -805,9 +817,14 @@ export class PlayerRemote extends Entity implements HotReloadable {
       // Show/hide health bar via HealthBars system (RuneScape pattern)
       if (this._healthBarHandle) {
         if (newInCombat) {
+          // In combat - show health bar and set/extend timeout
           this._healthBarHandle.show();
+          this._healthBarVisibleUntil =
+            Date.now() + ticksToMs(COMBAT_CONSTANTS.COMBAT_TIMEOUT_TICKS);
         } else {
+          // Combat ended - hide and clear timer
           this._healthBarHandle.hide();
+          this._healthBarVisibleUntil = 0;
         }
       }
     }

@@ -332,7 +332,14 @@ export class CombatStateService {
       entityIdStr,
     ) as CombatPlayerEntity | null;
 
-    if (!playerEntity) return;
+    if (!playerEntity) {
+      // Log warning - client won't receive c:false and health bar may persist
+      // Client-side fallback timer will handle this case
+      console.warn(
+        `[CombatStateService] clearCombatStateFromEntity: player ${entityIdStr} not found, c:false will not be sent`,
+      );
+      return;
+    }
 
     // Clear combat property if it exists (legacy support)
     if (playerEntity.combat) {
