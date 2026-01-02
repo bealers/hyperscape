@@ -66,31 +66,6 @@ iframe[title*="privy"] {
               0 8px 32px rgba(0, 0, 0, 0.8) !important;
 }
 
-/* Mobile: Center popup and reduce size for better fit */
-@media (max-width: 768px) {
-  [data-privy-modal],
-  div[id*="privy-modal"],
-  div[class*="privy-modal"],
-  #privy-iframe-container,
-  #privy-dialog-container,
-  #privy-dialog-container iframe,
-  #privy-dialog-container iframe[id*="privy"],
-  #privy-modal,
-  iframe[title*="Privy"],
-  iframe[title*="privy"],
-  div[role="dialog"],
-  div[role="dialog"] > div {
-    max-width: 90vw !important;
-    max-height: 70vh !important;
-    width: 90vw !important;
-    height: auto !important;
-    position: fixed !important;
-    top: 10% !important;
-    left: 50% !important;
-    transform: translate(-50%, -50%) !important;
-    margin: 0 !important;
-  }
-}
 
 /* Target the modal backdrop overlay */
 div[id*="privy"][id*="backdrop"],
