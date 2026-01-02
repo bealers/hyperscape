@@ -50,6 +50,14 @@ export const AVATAR_OPTIONS: AvatarOption[] = [
     previewUrl: "http://localhost:8080/avatars/avatar-female-02.vrm",
     description: "Standard female humanoid avatar",
   },
+  {
+    id: "meebit-3672",
+    name: "Meebit #3672",
+    url: "asset://avatars/meebit-3672.vrm",
+    // Cache-buster added to bypass stale 404 cached before permissions fix
+    previewUrl: "http://localhost:8080/avatars/meebit-3672.vrm?v=1",
+    description: "Meebit 3672",
+  },
 ];
 
 /**

@@ -136,7 +136,12 @@ Content is defined in JSON manifests - no code changes required:
    packages/server/world/assets/avatars/your-avatar.vrm
    ```
 
-3. **Register in avatars.ts**
+3. **Fix file permissions** (if copied from external source)
+   ```bash
+   chmod 644 packages/server/world/assets/avatars/your-avatar.vrm
+   ```
+
+4. **Register in avatars.ts**
    ```typescript
    // packages/shared/src/data/avatars.ts
    export const AVATAR_OPTIONS: AvatarOption[] = [
@@ -151,11 +156,22 @@ Content is defined in JSON manifests - no code changes required:
    ];
    ```
 
-4. **Start the CDN and test**
+5. **Restart CDN and test**
    ```bash
-   bun run cdn:up
+   # Restart CDN to pick up new files
+   cd packages/server && docker compose restart cdn
+   
+   # Verify the file is served
+   curl -I http://localhost:8080/avatars/your-avatar.vrm
+   # Should return: HTTP/1.1 200 OK
+   
+   # Start dev server
    bun run dev
    ```
+
+**Troubleshooting**:
+- **404 Not Found**: Check file permissions (`chmod 644`) and restart CDN
+- **Preview not showing**: Check browser console for VRM loading errors
 
 **Technical Notes**:
 - VRM 1.0+ models are automatically rotated 180° (face -Z forward)

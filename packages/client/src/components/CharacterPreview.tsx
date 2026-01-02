@@ -133,10 +133,10 @@ export const CharacterPreview: React.FC<CharacterPreviewProps> = ({
 
         const vrm = gltf.userData.vrm as VRM;
 
-        // Cleanup previous VRM
+        // Cleanup previous VRM - just remove from scene (matches main game pattern)
+        // Note: Avoiding VRMUtils.deepDispose() as it causes WebGPU node disposal errors
         if (vrmRef.current) {
           scene.remove(vrmRef.current.scene);
-          VRMUtils.deepDispose(vrmRef.current.scene);
           // Also dispose of the previous mixer if it exists
           if (mixerRef.current) {
             mixerRef.current.stopAllAction();
@@ -199,7 +199,10 @@ export const CharacterPreview: React.FC<CharacterPreviewProps> = ({
         if (!isMounted) return;
 
         if (!waveGltf.animations?.[0] || !idleGltf.animations?.[0]) {
-          console.error("[CharacterPreview] Missing animations!");
+          console.warn(
+            "[CharacterPreview] Missing animations - showing model without animation",
+          );
+          vrm.scene.visible = true;
           return;
         }
 
@@ -224,7 +227,10 @@ export const CharacterPreview: React.FC<CharacterPreviewProps> = ({
         );
 
         if (!waveClip || !idleClip) {
-          console.error("[CharacterPreview] Failed to retarget animations!");
+          console.warn(
+            "[CharacterPreview] Failed to retarget animations - showing model without animation",
+          );
+          vrm.scene.visible = true;
           return;
         }
 
@@ -284,6 +290,10 @@ export const CharacterPreview: React.FC<CharacterPreviewProps> = ({
           "[CharacterPreview] Error loading VRM/Animations:",
           error,
         );
+        // Still show model even if animations fail
+        if (vrmRef.current) {
+          vrmRef.current.scene.visible = true;
+        }
       }
     };
 
@@ -378,9 +388,8 @@ export const CharacterPreview: React.FC<CharacterPreviewProps> = ({
         rendererRef.current = null;
         rendererInitializedRef.current = false;
       }
-      if (vrmRef.current) {
-        VRMUtils.deepDispose(vrmRef.current.scene);
-      }
+      // Note: Not using VRMUtils.deepDispose() - causes WebGPU node errors
+      // Scene removal + GC handles cleanup (matches main game pattern)
       if (mixerRef.current) {
         mixerRef.current.stopAllAction();
         mixerRef.current = null;
